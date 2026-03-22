@@ -1,0 +1,21 @@
+{
+  "name": "gci-order-hub",
+  "version": "1.0.0",
+  "description": "GCI Inc. order automation — order router, Walmart sync, CJ Dropshipping client",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "resend": "^4.0.0"
+  },
+  "devDependencies": {
+    "@vercel/node": "^3.0.0",
+    "typescript": "^5.4.0"
+  }
+}

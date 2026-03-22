@@ -1,0 +1,11 @@
+node_modules/
+.env.local
+.env
+.vercel/
+dist/
+*.js.map
+__pycache__/
+*.pyc
+.DS_Store
+data/*.csv
+!data/.gitkeep

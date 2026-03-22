@@ -1,0 +1,27 @@
+{
+  "functions": {
+    "api/order-router.ts":    { "maxDuration": 30  },
+    "api/authorize-order.ts": { "maxDuration": 30  },
+    "api/walmart-sync.ts":    { "maxDuration": 60  }
+  },
+  "rewrites": [
+    {
+      "source": "/((?!api/).*)",
+      "destination": "/index.html"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/walmart-sync",
+      "schedule": "0 9 * * *"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" }
+      ]
+    }
+  ]
+}
