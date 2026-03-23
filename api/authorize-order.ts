@@ -37,8 +37,8 @@ function verifyToken(data: string, sig: string): AuthToken | null {
   let ok = false;
   try {
     ok = crypto.timingSafeEqual(
-      Buffer.from(expected, 'hex'),
-      Buffer.from(sig,      'hex'),
+      new Uint8Array(Buffer.from(expected, 'hex')),
+      new Uint8Array(Buffer.from(sig,      'hex')),
     );
   } catch { return null; }
 

@@ -102,16 +102,16 @@ function extractInstallerMeta(order: ShopifyOrder): InstallerMeta {
 
 // ─── HMAC VERIFICATION ───────────────────────────────────────
 
-async function readBody(req: VercelRequest): Promise<Buffer> {
+async function readBody(req: VercelRequest): Promise<Uint8Array> {
   return new Promise((res, rej) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
+    const chunks: Uint8Array[] = [];
+    req.on('data', (c: Buffer) => chunks.push(new Uint8Array(c)));
     req.on('end',  ()          => res(Buffer.concat(chunks)));
     req.on('error', rej);
   });
 }
 
-function verifyShopifyHmac(rawBody: Buffer, header: string): boolean {
+function verifyShopifyHmac(rawBody: Uint8Array, header: string): boolean {
   if (!WEBHOOK_SECRET) {
     console.warn('⚠️  SHOPIFY_WEBHOOK_SECRET not set — HMAC check skipped');
     return true;
@@ -121,7 +121,7 @@ function verifyShopifyHmac(rawBody: Buffer, header: string): boolean {
     .update(rawBody)
     .digest('base64');
   try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(header));
+    return crypto.timingSafeEqual(new Uint8Array(Buffer.from(digest)), new Uint8Array(Buffer.from(header)));
   } catch {
     return false;
   }
@@ -152,11 +152,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   // Read raw body before JSON parse (needed for HMAC)
-  let rawBody: Buffer;
+  let rawBody: Uint8Array;
   let order:   ShopifyOrder;
   try {
     rawBody = await readBody(req);
-    order   = JSON.parse(rawBody.toString('utf-8')) as ShopifyOrder;
+    order   = JSON.parse(Buffer.from(rawBody).toString('utf-8')) as ShopifyOrder;
   } catch {
     return res.status(400).json({ error: 'Invalid JSON body' });
   }
