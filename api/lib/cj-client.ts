@@ -2,11 +2,9 @@
 // ─────────────────────────────────────────────────────────────
 // CJ Dropshipping API v2 client
 //
-// Auth strategy (in priority order):
-//   1. CJ_API_KEY  — static key from CJ developer portal (never expires)
-//   2. CJ_EMAIL + CJ_PASSWORD — email/password auth, token auto-refreshed
-//
-// Token is cached in-process and refreshed transparently before expiry.
+// Auth strategy:
+//   POST /authentication/getAccessToken  { apiKey: CJ_API_KEY }
+//   Tokens are cached in-process and refreshed transparently before expiry.
 //
 // API docs: https://developers.cjdropshipping.com/api2.0/v1/
 // ─────────────────────────────────────────────────────────────
@@ -15,34 +13,50 @@ const CJ_BASE = 'https://developers.cjdropshipping.com/api2.0/v1';
 
 // ─── TOKEN CACHE ─────────────────────────────────────────────
 
-let _token:    string | null = null;
-let _tokenExp: number        = 0;    // unix ms
+let _token:        string | null = null;
+let _tokenExp:     number        = 0;    // unix ms
+let _refreshToken: string | null = null;
+
+async function refreshAccessToken(): Promise<void> {
+  const res  = await fetch(`${CJ_BASE}/authentication/refreshAccessToken`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ refreshToken: _refreshToken }),
+  });
+  const data: any = await res.json();
+
+  if (!data.result || !data.data?.accessToken) {
+    throw new Error(`CJ token refresh failed: ${JSON.stringify(data.message ?? data)}`);
+  }
+
+  _token        = data.data.accessToken as string;
+  _refreshToken = (data.data.refreshToken as string) ?? _refreshToken;
+  _tokenExp     = Date.now() + 55 * 60 * 1000;
+  console.log('✅ CJ Dropshipping token refreshed via refresh token');
+}
 
 async function getAccessToken(): Promise<string> {
   if (_token && Date.now() < _tokenExp - 60_000) return _token;
 
-  // Option A — static API key
-  const apiKey = process.env.CJ_API_KEY || '';
-  if (apiKey) {
-    _token    = apiKey;
-    _tokenExp = Date.now() + 365 * 24 * 60 * 60 * 1000;
-    return _token;
+  // Attempt silent refresh if we already have a refresh token
+  if (_refreshToken) {
+    try {
+      await refreshAccessToken();
+      return _token!;
+    } catch {
+      // Fall through to full re-auth
+    }
   }
 
-  // Option B — email / password
-  const email    = process.env.CJ_EMAIL    || '';
-  const password = process.env.CJ_PASSWORD || '';
-  if (!email || !password) {
-    throw new Error(
-      'CJ Dropshipping credentials not set. ' +
-      'Provide CJ_API_KEY or both CJ_EMAIL and CJ_PASSWORD.',
-    );
+  const apiKey = process.env.CJ_API_KEY || '';
+  if (!apiKey) {
+    throw new Error('CJ_API_KEY environment variable is not set.');
   }
 
   const res  = await fetch(`${CJ_BASE}/authentication/getAccessToken`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ email, password }),
+    body:    JSON.stringify({ apiKey }),
   });
   const data: any = await res.json();
 
@@ -50,9 +64,10 @@ async function getAccessToken(): Promise<string> {
     throw new Error(`CJ auth failed: ${JSON.stringify(data.message ?? data)}`);
   }
 
-  _token    = data.data.accessToken as string;
-  _tokenExp = Date.now() + 55 * 60 * 1000; // CJ tokens last ~1h; refresh at 55m
-  console.log('✅ CJ Dropshipping token refreshed');
+  _token        = data.data.accessToken as string;
+  _refreshToken = (data.data.refreshToken as string) ?? null;
+  _tokenExp     = Date.now() + 55 * 60 * 1000; // CJ tokens last ~1h; refresh at 55m
+  console.log('✅ CJ Dropshipping token obtained');
   return _token!;
 }
 
