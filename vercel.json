@@ -1,4 +1,5 @@
 {
+  "outputDirectory": ".",
   "functions": {
     "api/order-router.ts":    { "maxDuration": 30  },
     "api/authorize-order.ts": { "maxDuration": 30  },
