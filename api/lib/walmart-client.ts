@@ -42,7 +42,7 @@ async function getToken(): Promise<string> {
       'Authorization':         `Basic ${credentials}`,
       'Content-Type':          'application/x-www-form-urlencoded',
       'WM_SVC.NAME':           'Walmart Marketplace',
-      'WM_QOS.CORRELATION_ID': `gci-${Date.now()}`,
+      'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
       'Accept':                'application/json',
     },
     body: 'grant_type=client_credentials',
