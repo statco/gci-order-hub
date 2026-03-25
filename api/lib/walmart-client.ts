@@ -1,9 +1,13 @@
 // api/lib/walmart-client.ts
 // ─────────────────────────────────────────────────────────────
-// Walmart Marketplace API client — Basic auth (Canada)
+// Walmart Marketplace API client — Canada V3
 //
-// Walmart Canada requires Basic auth (Base64 clientId:clientSecret)
-// on every request. There is no OAuth token flow for this market.
+// Auth strategy (tried in order per request):
+//   1. Bearer token via OAuth2 client-credentials flow
+//   2. Basic auth fallback (Base64 clientId:clientSecret)
+//
+// Both paths include the Canada-required headers:
+//   WM_TENANT_ID, WM_LOCALE_ID, WM_MARKET
 //
 // Env vars:
 //   WALMART_CLIENT_ID      — seller client ID
@@ -18,7 +22,9 @@ const WALMART_BASE = (
   process.env.WALMART_BASE_URL ?? 'https://marketplace.walmartapis.com'
 ).replace(/\/$/, '');
 
-function basicCredentials(): string {
+// ─── CREDENTIALS ─────────────────────────────────────────────
+
+function getCredentials(): { id: string; secret: string } {
   const id     = process.env.WALMART_CLIENT_ID     ?? '';
   const secret = process.env.WALMART_CLIENT_SECRET ?? '';
   if (!id || !secret) {
@@ -26,21 +32,107 @@ function basicCredentials(): string {
       'Walmart credentials not set. Provide WALMART_CLIENT_ID and WALMART_CLIENT_SECRET.',
     );
   }
+  return { id, secret };
+}
+
+function basicCredentials(): string {
+  const { id, secret } = getCredentials();
   return Buffer.from(`${id}:${secret}`).toString('base64');
 }
+
+// ─── TOKEN CACHE ─────────────────────────────────────────────
+
+let _token:    string | null = null;
+let _tokenExp: number        = 0;
+
+async function getToken(): Promise<string | null> {
+  if (_token && Date.now() < _tokenExp - 60_000) return _token;
+
+  try {
+    const correlationId = crypto.randomUUID();
+    const res = await fetch(`${WALMART_BASE}/v3/token`, {
+      method: 'POST',
+      headers: {
+        'Authorization':         `Basic ${basicCredentials()}`,
+        'Content-Type':          'application/x-www-form-urlencoded',
+        'WM_SVC.NAME':           'Walmart Marketplace',
+        'WM_QOS.CORRELATION_ID': correlationId,
+        'WM_MARKET':             process.env.WALMART_MARKET || 'CA',
+        'Accept':                'application/json',
+      },
+      body: 'grant_type=client_credentials',
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      console.warn('[Walmart auth] Token fetch failed HTTP', res.status, errBody.slice(0, 200));
+      return null;
+    }
+
+    const data: any = await res.json();
+    _token          = data.access_token as string;
+    const expiresIn = (data.expires_in as number) ?? 900;
+    _tokenExp       = Date.now() + expiresIn * 1000;
+    console.log(`✅ Walmart token refreshed, expires in ${expiresIn}s`);
+    return _token!;
+  } catch (err) {
+    console.warn('[Walmart auth] Token fetch threw:', err);
+    return null;
+  }
+}
+
+// ─── CANADA-REQUIRED HEADERS ─────────────────────────────────
+
+const CA_HEADERS = {
+  'WM_SVC.NAME':   'Walmart Marketplace',
+  'WM_MARKET':     process.env.WALMART_MARKET || 'CA',
+  'WM_TENANT_ID':  'WALMART.CA',
+  'WM_LOCALE_ID':  'en_CA',
+  'Accept':        'application/json',
+} as const;
 
 // ─── INTERNAL FETCH ───────────────────────────────────────────
 
 async function walmartFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const token         = await getToken();
+  const correlationId = crypto.randomUUID();
+
+  // Attempt 1: Bearer token (if available)
+  if (token) {
+    const res = await fetch(`${WALMART_BASE}${path}`, {
+      ...options,
+      headers: {
+        'Authorization':         `Bearer ${token}`,
+        'Content-Type':          'application/json',
+        'WM_QOS.CORRELATION_ID': correlationId,
+        ...CA_HEADERS,
+        ...(options.headers ?? {}),
+      },
+    });
+
+    if (res.status === 429) {
+      await new Promise(r => setTimeout(r, 2_000));
+      return walmartFetch<T>(path, options);
+    }
+    if (res.status === 204) return {} as T;
+    if (res.ok)             return res.json() as Promise<T>;
+
+    // 401/403 — fall through to Basic auth retry
+    if (res.status !== 401 && res.status !== 403) {
+      const body = await res.text();
+      throw new Error(`Walmart API ${res.status} on ${path}: ${body.slice(0, 300)}`);
+    }
+    console.warn(`[Walmart] Bearer auth got ${res.status}, retrying with Basic auth`);
+  }
+
+  // Attempt 2 (fallback): Basic auth
   const res = await fetch(`${WALMART_BASE}${path}`, {
     ...options,
     headers: {
       'Authorization':         `Basic ${basicCredentials()}`,
       'Content-Type':          'application/json',
-      'Accept':                'application/json',
-      'WM_SVC.NAME':           'Walmart Marketplace',
-      'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
-      'WM_MARKET':             process.env.WALMART_MARKET || 'CA',
+      'WM_QOS.CORRELATION_ID': correlationId,
+      ...CA_HEADERS,
       ...(options.headers ?? {}),
     },
   });
