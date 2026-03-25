@@ -35,22 +35,32 @@ async function getToken(): Promise<string> {
     );
   }
 
-  const credentials = Buffer.from(`${id}:${secret}`).toString('base64');
+  const credentials  = Buffer.from(`${id}:${secret}`).toString('base64');
+  const correlationId = crypto.randomUUID();
   const res = await fetch(`${WALMART_BASE}/v3/token`, {
     method: 'POST',
     headers: {
       'Authorization':         `Basic ${credentials}`,
       'Content-Type':          'application/x-www-form-urlencoded',
       'WM_SVC.NAME':           'Walmart Marketplace',
-      'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
+      'WM_QOS.CORRELATION_ID': correlationId,
+      'WM_MARKET':             process.env.WALMART_MARKET || 'CA',
       'Accept':                'application/json',
     },
     body: 'grant_type=client_credentials',
   });
 
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Walmart auth failed HTTP ${res.status}: ${body.slice(0, 200)}`);
+    const errorBody = await res.text();
+    console.error('[Walmart auth] HTTP', res.status, 'Body:', errorBody);
+    console.error('[Walmart auth] Request headers sent:', {
+      'Content-Type':          'application/x-www-form-urlencoded',
+      'WM_SVC.NAME':           'Walmart Marketplace',
+      'WM_QOS.CORRELATION_ID': correlationId,
+      'Accept':                'application/json',
+      'Authorization':         'Basic [REDACTED]',
+    });
+    throw new Error(`Walmart auth failed HTTP ${res.status}: ${errorBody.slice(0, 200)}`);
   }
 
   const data: any  = await res.json();
