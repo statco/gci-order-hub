@@ -145,9 +145,7 @@ async function sendEmail(p: NotifyPayload): Promise<void> {
           <table cellpadding="0" cellspacing="0" border="0">
             <tr>
               <td style="padding-right:14px; vertical-align:middle;">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 56" width="28" height="36">
-                  <polygon points="0,14 22,14 22,0 44,28 22,56 22,42 0,42" fill="#FFFFFF"/>
-                </svg>
+                <img src="https://gci-brain.vercel.app/gci-mark-white.png" width="22" height="28" alt="" style="display:block;" />
               </td>
               <td style="vertical-align:middle;">
                 <div style="font-family:'Arial Black',Arial,sans-serif; font-size:20px; font-weight:900; color:#FFFFFF; letter-spacing:1px; line-height:1;">GCI TIRES</div>
