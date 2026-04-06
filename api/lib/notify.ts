@@ -139,10 +139,27 @@ async function sendEmail(p: NotifyPayload): Promise<void> {
 <head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:20px;font-family:Arial,sans-serif;background:#f3f4f6;">
   <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1);">
-    <div style="background:#ef4444;padding:20px 28px;">
-      <h1 style="margin:0;color:#fff;font-size:20px;">GCI Order Alert — Action Required</h1>
-    </div>
+    <table width="100%" cellpadding="0" cellspacing="0" border="0">
+      <tr>
+        <td style="background-color:#B8192E; padding:20px 32px;">
+          <table cellpadding="0" cellspacing="0" border="0">
+            <tr>
+              <td style="padding-right:14px; vertical-align:middle;">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 56" width="28" height="36">
+                  <polygon points="0,14 22,14 22,0 44,28 22,56 22,42 0,42" fill="#FFFFFF"/>
+                </svg>
+              </td>
+              <td style="vertical-align:middle;">
+                <div style="font-family:'Arial Black',Arial,sans-serif; font-size:20px; font-weight:900; color:#FFFFFF; letter-spacing:1px; line-height:1;">GCI TIRES</div>
+                <div style="font-family:'Arial Narrow',Arial,sans-serif; font-size:11px; color:rgba(255,255,255,0.55); letter-spacing:4px; margin-top:3px;">gcitires.com</div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
     <div style="padding:24px 28px;">
+      <p style="margin:0 0 12px;font-size:18px;font-weight:bold;color:#111827;">Order Alert — Action Required</p>
       <p style="margin:0 0 4px;font-size:18px;font-weight:bold;color:#111827;">Order ${p.orderNumber}</p>
       <p style="margin:4px 0;color:#374151;"><strong>Supplier:</strong> ${supplierLabel}</p>
       <p style="margin:4px 0;color:#374151;"><strong>Customer:</strong> ${p.customerName}</p>
