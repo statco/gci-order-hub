@@ -152,55 +152,60 @@ export async function updateInventory(item: WalmartInventoryItem): Promise<void>
   });
 }
 
-/**
- * Bulk inventory feed — up to 1 000 items per call.
- * Returns the Walmart feed ID for status polling.
- */
-export async function bulkInventoryFeed(items: WalmartInventoryItem[]): Promise<string> {
-  const body = {
-    InventoryHeader: { version: '1.4' },
-    item: items.map(i => ({
-      sku:      i.sku,
-      quantity: { unit: 'EACH', amount: Math.max(0, i.quantity) },
-    })),
-  };
-
-  const data: any = await walmartFetch<any>('/v3/inventory', {
-    method: 'PUT',
-    body:   JSON.stringify(body),
-  });
-
-  const feedId = (data?.feedId ?? data?.FeedId ?? 'unknown') as string;
-  console.log(`✅ Walmart bulk inventory feed: feedId=${feedId}, items=${items.length}`);
-  return feedId;
+export async function bulkInventoryFeed(
+  items: WalmartInventoryItem[]
+): Promise<string> {
+  let success = 0;
+  let failed = 0;
+  for (const i of items) {
+    try {
+      await walmartFetch<any>('/v3/inventory', {
+        method: 'PUT',
+        body: JSON.stringify({
+          sku: i.sku,
+          quantity: { unit: 'EACH', amount: Math.max(0, i.quantity) },
+        }),
+      });
+      success++;
+      // small delay to avoid rate limiting
+      await new Promise(r => setTimeout(r, 50));
+    } catch (err: any) {
+      console.error(`❌ inventory failed for ${i.sku}: ${err.message}`);
+      failed++;
+    }
+  }
+  console.log(`✅ Walmart inventory: ${success} updated, ${failed} failed`);
+  return `inventory-done-${success}-${failed}`;
 }
 
-/**
- * Bulk price feed — up to 1 000 items per call.
- * Returns the Walmart feed ID for status polling.
- */
-export async function bulkPriceFeed(items: WalmartPriceItem[]): Promise<string> {
-  const body = {
-    PriceHeader: { version: '1.7' },
-    Price: items.map(i => ({
-      sku:     i.sku,
-      pricing: {
-        currentPrice: {
-          currency: 'CAD',
-          amount:   parseFloat(i.price.toFixed(2)),
-        },
-      },
-    })),
-  };
-
-  const data: any = await walmartFetch<any>('/v3/price', {
-    method: 'PUT',
-    body:   JSON.stringify(body),
-  });
-
-  const feedId = (data?.feedId ?? data?.FeedId ?? 'unknown') as string;
-  console.log(`✅ Walmart bulk price feed: feedId=${feedId}, items=${items.length}`);
-  return feedId;
+export async function bulkPriceFeed(
+  items: WalmartPriceItem[]
+): Promise<string> {
+  let success = 0;
+  let failed = 0;
+  for (const i of items) {
+    try {
+      await walmartFetch<any>('/v3/price', {
+        method: 'PUT',
+        body: JSON.stringify({
+          sku: i.sku,
+          pricing: {
+            currentPrice: {
+              currency: 'CAD',
+              amount: parseFloat(i.price.toFixed(2)),
+            },
+          },
+        }),
+      });
+      success++;
+      await new Promise(r => setTimeout(r, 50));
+    } catch (err: any) {
+      console.error(`❌ price failed for ${i.sku}: ${err.message}`);
+      failed++;
+    }
+  }
+  console.log(`✅ Walmart price: ${success} updated, ${failed} failed`);
+  return `price-done-${success}-${failed}`;
 }
 
 /**
