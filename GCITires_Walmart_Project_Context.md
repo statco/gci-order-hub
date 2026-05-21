@@ -13,7 +13,7 @@
 **Walmart Store Name:** GC Tires
 **Walmart Support Contact:** Amar (Walmart MP Support Team)
 
-**Goal:** Automate daily price and inventory sync from Shopify (gcitires.com) to Walmart Canada Marketplace for Cooper, Nexen, and Vredestein tire SKUs (~849 valid listings).
+**Goal:** Automate daily price and inventory sync from Shopify (gcitires.com) to Walmart Canada Marketplace for ~1,000 Cooper, Nexen, and Vredestein tire SKUs.
 
 ---
 
@@ -76,9 +76,8 @@
 6. Log success/failure counts
 ```
 
-**Current status:** Auth works, price/inventory calls reach Walmart correctly.
+**Current status:** Auth works, token obtained, price/inventory calls reach Walmart correctly.
 **Blocker:** `404.OFFER_SETUP.NOT_FOUND.100` — no tire listings exist yet on Walmart Canada.
-**Will resolve automatically** once item feed listings are confirmed live.
 
 ---
 
@@ -89,15 +88,34 @@
 - Body: `grant_type=client_credentials`
 - Token cached for 900 seconds
 
-### API Calls — Required Headers
+### API Calls (all endpoints)
+Headers required:
 ```
 WM_SEC.ACCESS_TOKEN: <bearer_token>
 WM_GLOBAL_VERSION: 3.1
 WM_MARKET: ca
 WM_SVC.NAME: Walmart Marketplace
-WM_QOS.CORRELATION_ID: <uuid via crypto.randomUUID()>
+WM_QOS.CORRELATION_ID: <uuid>
 Accept: application/json
 Content-Type: application/json
+```
+
+### Price Update (PUT /v3/price)
+```json
+{
+  "sku": "TIRE-205-55R16",
+  "pricing": {
+    "currentPrice": { "currency": "CAD", "amount": 189.99 }
+  }
+}
+```
+
+### Inventory Update (PUT /v3/inventory)
+```json
+{
+  "sku": "TIRE-205-55R16",
+  "quantity": { "unit": "EACH", "amount": 12 }
+}
 ```
 
 ---
@@ -107,7 +125,7 @@ Content-Type: application/json
 ### Products fetched from Shopify
 - Tag filter: `ct-sync`
 - Fields used: `id, title, vendor, tags, images, variants`
-- `body_html` intentionally excluded (too heavy, replaced by static description)
+- `body_html` intentionally excluded (too heavy for 996 products, not needed for listings)
 
 ### SKU format
 - Tires: `TIRE-XXXXXX` (e.g. `TIRE-160110025`)
@@ -116,6 +134,7 @@ Content-Type: application/json
 ### Title format
 - Pattern: `{Brand} {Model} {Size}` — e.g. `Vredestein Quatrac 215/55R17`
 - `vendor` field = brand (e.g. `Vredestein`, `Cooper`, `Nexen`)
+- Tire size embedded in title, parsed by regex
 
 ### Season/vehicle type detection (from Shopify tags)
 | Tag | Walmart value |
@@ -141,111 +160,91 @@ sellingPrice = floorPrice × MARKUP → rounded to .99
 
 ---
 
-## 8. Item Feed Implementation
+## 8. Item Feed Implementation (api/walmart-item-feed.ts)
 
-### Files (all in `statco/gci-order-hub`)
+### Files added (PRs #4–#7)
 | File | Purpose |
 |---|---|
-| `api/walmart-item-feed.ts` | Fetches Shopify products, filters brands, deduplicates SKUs, builds MP_ITEM_INTL feed, submits to Walmart |
+| `api/walmart-item-feed.ts` | Fetches Shopify products, builds feed, submits to Walmart |
 | `api/walmart-feed-status.ts` | Polls `GET /v3/feeds/{feedId}?includeDetails=true` |
 | `api/lib/tire-parser.ts` | Parses tire size, season, vehicle type from title/tags |
 
-### Feed Spec — MP_ITEM_INTL v3.16
-```
-feedType: MP_ITEM_INTL
-Header: version 3.16, processMode REPLACE, subset EXTERNAL,
-        sellingChannel marketplace, mart WALMART_CA
-productIdentifiers: { productIdType: "GTIN", productId: "CUSTOM" }
-Item structure: Orderable + Visible.Tires
-Required Orderable fields: sku, productIdentifiers, productName {en},
-  brand {en}, price, shippingWeight, productTaxCode (2038411),
-  shortDescription {en}, mainImageUrl, countryOfOriginAssembly[]
-Visible.Tires: tireSize, tireWidth, tireAspectRatio, wheelDiameter,
-  tireSeason, vehicleType, constructionType, vehicleClassDesignator
-```
+### Tire size parser
+- Standard sizes: regex `/\b(LT|P)?(\d{3})\/(\d{2,3})R(\d{2})\b/i` covers `215/55R17`, `LT265/70R17`
+- Flotation/compact sizes (`3513/R`, `3313/R`, etc.) — **not yet handled**, these 26 SKUs are currently skipped
 
-### Brand Allowlist (GTIN Exemption scope)
-```typescript
-const GTIN_EXEMPT_BRANDS = new Set(['Cooper', 'Nexen', 'Vredestein']);
-```
-Products with other vendors (Apollo, Michelin, Nitto, Toyo, GCI Tires, etc.)
-are skipped with reason `"Brand not in GTIN exemption: {vendor}"`.
+### 26 Skipped SKUs (flotation + one missing size)
+- Cooper Discoverer STT Pro, AT3 XLT, Rugged Trek, Evolution MT, Roadmaster RM300 — compact format e.g. `3513/R`
+- `TIRE-BBK90` — Bridgestone Blizzak WS90 — no size in title at all (fix in Shopify)
 
-### Tire Size Parser
-- Standard sizes: `/\b(LT|P)?(\d{3})\/(\d{2,3})R(\d{2})\b/i` → covers `215/55R17`, `LT265/70R17`
-- Flotation/compact sizes (`3513/R`, `3313/R`, etc.) — **not yet handled**, ~25 SKUs skipped
+### GTIN Exemption
+- **Approved** by Walmart on May 20, 2026 (6+ hours before first feed attempt)
+- Correct productIdentifier: `{ productIdType: "GTIN", productId: "CUSTOM" }`
+- Products with CUSTOM productId use SKU as primary identifier in Walmart's system
 
-### Known Skipped SKUs (161 total in last run)
-| Reason | Count | Examples |
-|---|---|---|
-| Brand not in exemption | 4 | Michelin, Nitto, Toyo, GCI Tires (Bridgestone WS90 has wrong vendor) |
-| Duplicate SKU in Shopify | ~132 | TIRE-166xxx, TIRE-160xxx series — same SKU on multiple products |
-| Flotation size unparseable | 25 | Cooper STT Pro, AT3 XLT, Rugged Trek, Evolution MT, Nexen MTX RM7 |
-
-### Brand → Country of Origin Mapping
-| Brand | Country |
-|---|---|
-| Vredestein | NL |
-| Nexen | KR |
-| Cooper | US |
-| Bridgestone | JP |
-| default | CN |
+### Description
+- Static template (no HTML fetch): `{vendor} {model} {fullSize} tire. Available at GCI Tires Canada.`
+- Example: `Vredestein Quatrac 215/55R17 tire. Available at GCI Tires Canada.`
 
 ---
 
-## 9. Current Status
+## 9. Current Status & Blockers
 
-### ✅ Fully Working
-- Global API auth (token via Basic auth, cached 900s)
-- Correct headers (`WM_SEC.ACCESS_TOKEN`, `WM_GLOBAL_VERSION: 3.1`, `WM_MARKET: ca`)
-- Shopify fetch (paginated, 996 products, fields optimized)
-- Brand allowlist filter (Cooper, Nexen, Vredestein only)
-- SKU deduplication
-- Feed schema correct (MP_ITEM_INTL v3.16 per `CA_MP_ITEM_INTL_SPEC.json`)
-- GTIN exemption approved and confirmed active by Amar
-- 849 items submitted successfully, feed accepted by Walmart
+### ✅ Done
+- Global API auth working (token obtained via Basic auth)
+- Correct headers confirmed and deployed
+- Per-item price/inventory sync working (pending listings)
+- Shopify fetch working: 984 TIRE- variants built into feed payload, 26 skipped
+- `walmart-item-feed.ts` submitting feeds successfully (feedId returned)
+- GTIN exemption approved; `productId: "CUSTOM"` deployed (PR #7)
+- `maxDuration` raised to 300s; `body_html` removed from fetch (PR #5)
 
-### ⏳ Waiting — Compliance Review Queue (ETA: May 22 evening)
-- All 849 SKUs show: *"This item is currently under compliance review
-  from your previous submission and cannot be resubmitted until the
-  review is complete, which may take up to 48 hours."*
-- **Root cause:** Earlier feeds (before brand filter) submitted ~800 non-exempt
-  brands (Apollo, Maxtrek, Minerva, Starfire, etc.) which triggered a
-  compliance lock on all those SKUs
-- **No code changes needed** — just wait for the 48h lock to expire
-- **Next action:** Refire feed on May 22 ~6 PM EST
+### 🔴 Active Blocker — Wrong Feed Type / Schema
+- All feed submissions return `feedStatus: ERROR, itemsTotal: 0`
+- Root cause: we are sending `feedType=MP_ITEM` (legacy US v3.2 format)
+- **Walmart Canada Global API requires `feedType=MP_ITEM_INTL`** with v4.X schema
+- Schema file needed: `CA_MP_ITEM_INTL_SPEC.json`
+- Download URL: `https://developer.walmart.com/file/mp/ca/CA_MP_ITEM_INTL_SPEC.json`
+- **Next action: Patrick to download and share `CA_MP_ITEM_INTL_SPEC.json`** so Claude can rewrite the feed payload to match the v4.X structure
 
-### 📋 Remaining Tasks (post-compliance clearance)
-1. **Refire feed** — `GET https://gci-order-hub.vercel.app/api/walmart-item-feed`
-2. **Verify listings live** — check Walmart Seller Center → Manage Items
-3. **Daily sync activates** — `/api/walmart-sync` cron will work once listings exist
-4. **Fix flotation tire parser** — add regex for `3513/R` format to recover 25 SKUs
-5. **Fix duplicate SKUs in Shopify** — 132 variants share SKUs, invisible to Walmart
-6. **Fix Bridgestone WS90 vendor** — change from "GCI Tires" to "Bridgestone" in Shopify (TIRE-BBK90)
-7. **Resolve CJ store API verification** — CJ live chat pending for gcitires.com
-8. **Expand GTIN exemption** — request Amar add more brands if needed (Maxtrek, Minerva, etc.)
+### ⏳ Remaining Steps (in order)
+1. **Get CA_MP_ITEM_INTL_SPEC.json** — download from Walmart developer portal and share
+2. **Rewrite `walmart-item-feed.ts`** — switch to `feedType=MP_ITEM_INTL`, rebuild payload per v4.X schema
+3. **Fix flotation tire parser** — add regex for compact sizes (`3513/R` etc.) to recover 25 skipped SKUs
+4. **Fix Shopify title for TIRE-BBK90** — add size to `Bridgestone Blizzak - WS90` title
+5. **Refire feed** — once schema is correct, submit and confirm `feedStatus: PROCESSED`
+6. **Verify listings live** — check Walmart Seller Center that tires appear as published
+7. **Daily sync will activate automatically** — `/api/walmart-sync` cron will work once listings exist
+8. **Resolve CJ store API verification** — CJ live chat pending for gcitires.com
 
 ---
 
-## 10. Key Technical Decisions
+## 10. Key Decisions Made
 
 | Decision | Rationale |
 |---|---|
-| Bulk feed (not per-item creation) | Per-item would timeout at 996 items; bulk is async |
-| `feedType=MP_ITEM_INTL` | Walmart Canada Global API requirement (not `MP_ITEM`) |
-| `productId: "CUSTOM"` | GTIN exemption requirement per Walmart docs |
+| Bulk feed (not per-item creation) | Per-item creation would timeout at 996 items; bulk feed is async |
 | `maxDuration: 300` for item feed | Shopify pagination of 996 products needs >60s |
-| Exclude `body_html` from Shopify fetch | Too heavy; static description template used instead |
-| `crypto.randomUUID()` not `uuid` package | `uuid` v14 is ESM-only, crashes Vercel CJS runtime |
-| `WM_MARKET: ca` (lowercase) | Global API requirement — uppercase `CA` causes 401 |
-| Remove `WM_TENANT_ID` / `WM_LOCALE_ID` | Not used in Global API |
-| `WM_SEC.ACCESS_TOKEN` header | Global API requirement — not `Authorization: Bearer` |
-| Brand allowlist filter | GTIN exemption scoped to Cooper, Nexen, Vredestein only |
+| Exclude `body_html` from Shopify fetch | Too heavy; use generated description instead |
+| Static description template | `{vendor} {model} {size} tire. Available at GCI Tires Canada.` |
 | Safety-zero qty < 4 | Avoid overselling low-stock items |
+| `WM_MARKET: ca` (lowercase) | Global API requirement — uppercase `CA` caused 401 |
+| Remove `WM_TENANT_ID` / `WM_LOCALE_ID` | Not used in Global API |
+| Bearer token via `WM_SEC.ACCESS_TOKEN` | Global API requirement — not `Authorization: Bearer` |
+| `productId: "CUSTOM"` | GTIN exemption requirement per Walmart docs |
 
 ---
 
-## 11. PR History (gci-order-hub)
+## 11. Known Issues / Watch List
+
+- `url.parse()` deprecation warning in logs — non-critical, cosmetic
+- Nuproz products on Walmart (4 published) use separate manual listings — not managed by this sync
+- 25 flotation/LT tire SKUs currently skipped due to compact size format (`3513/R`) — needs parser fix
+- `TIRE-BBK90` (Bridgestone Blizzak WS90) has no size in Shopify title — needs manual fix
+
+---
+
+## 12. PR History (gci-order-hub)
 
 | PR | Description | Status |
 |---|---|---|
@@ -253,24 +252,8 @@ are skipped with reason `"Brand not in GTIN exemption: {vendor}"`.
 | #3 | fix: replace inline SVG with hosted PNG in email header | Merged |
 | #4 | Add walmart-item-feed, walmart-feed-status, tire-parser | Merged |
 | #5 | Fix timeout: drop body_html, raise maxDuration to 300s | Merged |
-| #6 | Rebase/cleanup | Merged |
+| #6 | Rebase/cleanup of PR #4 branch | Merged |
 | #7 | Fix productId: GTIN_EXEMPT → CUSTOM | Merged |
-| #8 | Add project context doc | Merged |
-| #9 | Switch to MP_ITEM_INTL schema v3.16 | Merged |
-| #10 | Fix ERR_REQUIRE_ESM: uuid → crypto.randomUUID() | Merged |
-| direct | Deduplicate SKUs before feed submission | Merged to main |
-| direct | Add GTIN_EXEMPT_BRANDS allowlist filter | Merged to main |
-
----
-
-## 12. Known Shopify Data Issues (to fix)
-
-| Issue | SKUs affected | Fix |
-|---|---|---|
-| Duplicate TIRE- SKUs across multiple products | ~132 | Audit & reassign unique SKUs in Shopify |
-| Wrong vendor on Bridgestone WS90 | TIRE-BBK90 | Change vendor from "GCI Tires" to "Bridgestone" |
-| Missing size in title | TIRE-BBK90 | Add size to title e.g. "Bridgestone Blizzak WS90 225/55R17" |
-| Flotation sizes in compact format | 25 SKUs | Fix titles OR update tire-parser.ts regex |
 
 ---
 

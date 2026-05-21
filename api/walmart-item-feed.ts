@@ -1,14 +1,14 @@
 /**
  * api/walmart-item-feed.ts
  *
- * Creates Walmart Canada tire listings in bulk via the MP_ITEM feed.
+ * Creates Walmart Canada tire listings in bulk via the MP_ITEM_INTL feed.
  * Fetches all Shopify products tagged 'ct-sync', parses tire attributes,
  * and submits a single asynchronous feed to Walmart.
  *
  * POST /api/walmart-item-feed
  *
  * Returns:
- *   { success, feedId, submitted, skipped, skippedSkus }
+ *   { success, feedId, submitted, skipped, skippedItems }
  *
  * Check feed processing status at: GET /api/walmart-feed-status?feedId=<feedId>
  *
@@ -18,14 +18,12 @@
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { v4 as uuidv4 } from 'uuid';
+
 import { getWalmartToken } from './lib/walmart-client.js';
 import {
   parseTireSize,
   getSeasonFromTags,
   getVehicleTypeFromTags,
-  sanitizeDescription,
-  type ParsedTire,
   type SeasonClassification,
   type VehicleType,
 } from './lib/tire-parser.js';
@@ -48,39 +46,37 @@ interface ShopifyProduct {
   id: number;
   title: string;
   vendor: string;
-  body_html: string;
   tags: string;
   images: ShopifyImage[];
   variants: ShopifyVariant[];
 }
 
 interface WalmartFeedItem {
-  Item: {
+  Orderable: {
     sku: string;
     productIdentifiers: {
       productIdType: string;
       productId: string;
     };
-    MPOffer: {
-      price: number;
-      currency: string;
-      shippingWeight: { value: number; unit: string };
-    };
-    MPProduct: {
-      productName: string;
-      brand: string;
-      shortDescription: string;
-      mainImageUrl: string;
-      category: {
-        AutomotiveTires: {
-          tireSectionWidth: string;
-          tireAspectRatio: string;
-          tireConstructionType: string;
-          tireRimDiameter: string;
-          tireSeasonClassification: SeasonClassification;
-          tireVehicleType: VehicleType;
-        };
-      };
+    productName: { en: string };
+    brand: { en: string };
+    price: number;
+    ShippingWeight: { measure: number; unit: 'lb' };
+    productTaxCode: number;
+    shortDescription: { en: string };
+    mainImageUrl: string;
+    countryOfOriginAssembly: string[];
+  };
+  Visible: {
+    Tires: {
+      tireSize: string;
+      tireWidth?: number;
+      tireAspectRatio?: number;
+      wheelDiameter?: { measure: number; unit: 'in' };
+      tireSeason?: { en: string };
+      vehicleType?: { en: string };
+      vehicleClassDesignator?: { en: string };
+      constructionType?: { en: string };
     };
   };
 }
@@ -99,7 +95,7 @@ async function fetchShopifyProducts(): Promise<ShopifyProduct[]> {
   const products: ShopifyProduct[] = [];
   let nextUrl: string | null =
     `https://${SHOPIFY_DOMAIN}/admin/api/2024-01/products.json` +
-    `?limit=250&tag=ct-sync&fields=id,title,vendor,body_html,tags,images,variants`;
+    `?limit=250&tag=ct-sync&fields=id,title,vendor,tags,images,variants`;
 
   while (nextUrl) {
     const res: Response = await fetch(nextUrl, {
@@ -124,15 +120,43 @@ async function fetchShopifyProducts(): Promise<ShopifyProduct[]> {
 
 // ─── Feed Item Builder ────────────────────────────────────────────────────────
 
-/**
- * Estimates shipping weight by vehicle type.
- * Used for Walmart shipping cost calculation — not customer-facing.
- */
+const GTIN_EXEMPT_BRANDS = new Set(['Cooper', 'Nexen', 'Vredestein']);
+
+// Best-effort country-of-origin by brand; update as sourcing changes.
+function countryOfOrigin(vendor: string): string {
+  const v = vendor.toLowerCase();
+  if (v === 'vredestein')  return 'NL - Netherlands';
+  if (v === 'nexen')       return 'KR - Korea, South';
+  if (v === 'cooper')      return 'US - United States';
+  if (v === 'bridgestone') return 'JP - Japan';
+  return 'CN - China';
+}
+
+function seasonLabel(s: SeasonClassification): string {
+  const map: Record<SeasonClassification, string> = {
+    ALL_SEASON:   'All-Season',
+    ALL_WEATHER:  'All-Weather',
+    WINTER:       'Winter',
+    SUMMER:       'Summer',
+    ALL_TERRAIN:  'All-Terrain',
+  };
+  return map[s];
+}
+
+function vehicleTypeLabel(v: VehicleType): string {
+  const map: Record<VehicleType, string> = {
+    PASSENGER_CAR: 'Car',
+    LIGHT_TRUCK:   'Pickup Truck',
+    SUV_CROSSOVER: 'SUV',
+  };
+  return map[v];
+}
+
 function estimateShippingWeightLb(vehicleType: VehicleType): number {
   switch (vehicleType) {
-    case 'LIGHT_TRUCK': return 40;
+    case 'LIGHT_TRUCK':   return 40;
     case 'SUV_CROSSOVER': return 35;
-    default:             return 25; // PASSENGER_CAR
+    default:              return 25; // PASSENGER_CAR
   }
 }
 
@@ -140,8 +164,7 @@ function buildFeedItem(
   product: ShopifyProduct,
   variant: ShopifyVariant
 ): { item: WalmartFeedItem | null; skipReason?: string } {
-  // Parse tire size from title
-  const parsed: ParsedTire | null = parseTireSize(product.title);
+  const parsed = parseTireSize(product.title);
   if (!parsed) {
     return { item: null, skipReason: `Could not parse tire size from title: "${product.title}"` };
   }
@@ -160,38 +183,38 @@ function buildFeedItem(
 
   const season = getSeasonFromTags(product.tags);
   const vehicleType = getVehicleTypeFromTags(product.tags, parsed);
-  const description = sanitizeDescription(product.body_html);
+  const description = `${product.vendor} ${parsed.model} ${parsed.fullSize} tire. Available at GCI Tires Canada.`;
 
   const item: WalmartFeedItem = {
-    Item: {
+    Orderable: {
       sku: variant.sku,
       productIdentifiers: {
         productIdType: 'GTIN',
-        productId: 'GTIN_EXEMPT',
+        productId: 'CUSTOM',
       },
-      MPOffer: {
-        price,
-        currency: 'CAD',
-        shippingWeight: {
-          value: estimateShippingWeightLb(vehicleType),
-          unit: 'LB',
-        },
+      productName: { en: product.title },
+      brand:        { en: product.vendor },
+      price,
+      ShippingWeight: {
+        measure: estimateShippingWeightLb(vehicleType),
+        unit: 'lb',
       },
-      MPProduct: {
-        productName: product.title,
-        brand: product.vendor,
-        shortDescription: description,
-        mainImageUrl: imageUrl,
-        category: {
-          AutomotiveTires: {
-            tireSectionWidth: parsed.sectionWidth,
-            tireAspectRatio: parsed.aspectRatio,
-            tireConstructionType: parsed.constructionType,
-            tireRimDiameter: parsed.rimDiameter,
-            tireSeasonClassification: season,
-            tireVehicleType: vehicleType,
-          },
-        },
+      // General merchandise tax code — fully taxable under CA HST/GST
+      productTaxCode: 2038411,
+      shortDescription: { en: description },
+      mainImageUrl: imageUrl,
+      countryOfOriginAssembly: [countryOfOrigin(product.vendor)],
+    },
+    Visible: {
+      Tires: {
+        tireSize:       parsed.fullSize,
+        tireWidth:      parseInt(parsed.sectionWidth, 10),
+        tireAspectRatio: parseInt(parsed.aspectRatio, 10),
+        wheelDiameter:  { measure: parseInt(parsed.rimDiameter, 10), unit: 'in' },
+        tireSeason:     { en: seasonLabel(season) },
+        vehicleType:    { en: vehicleTypeLabel(vehicleType) },
+        constructionType: { en: 'Radial' },
+        ...(parsed.prefix ? { vehicleClassDesignator: { en: parsed.prefix } } : {}),
       },
     },
   };
@@ -218,10 +241,25 @@ export default async function handler(
     // ── Step 2: Build feed items ────────────────────────────────────────────
     const feedItems: WalmartFeedItem[] = [];
     const skipped: SkippedItem[] = [];
+    const seenSkus = new Set<string>();
 
     for (const product of allProducts) {
+      if (!GTIN_EXEMPT_BRANDS.has(product.vendor)) {
+        for (const variant of product.variants) {
+          if (variant.sku?.startsWith('TIRE-')) {
+            skipped.push({ sku: variant.sku, reason: `Brand not in GTIN exemption: ${product.vendor}` });
+          }
+        }
+        continue;
+      }
+
       for (const variant of product.variants) {
         if (!variant.sku?.startsWith('TIRE-')) continue;
+
+        if (seenSkus.has(variant.sku)) {
+          skipped.push({ sku: variant.sku, reason: 'Duplicate SKU skipped' });
+          continue;
+        }
 
         const { item, skipReason } = buildFeedItem(product, variant);
 
@@ -230,6 +268,7 @@ export default async function handler(
           continue;
         }
 
+        seenSkus.add(variant.sku);
         feedItems.push(item);
       }
     }
@@ -248,36 +287,40 @@ export default async function handler(
       });
     }
 
-    // ── Step 3: Submit bulk feed to Walmart ─────────────────────────────────
+    // ── Step 3: Submit MP_ITEM_INTL feed to Walmart ─────────────────────────
     const token = await getWalmartToken();
-    const correlationId = uuidv4();
+    const correlationId = crypto.randomUUID();
 
     const feedPayload = {
       MPItemFeedHeader: {
-        version: '4.7',
-        requestId: correlationId,
-        requestBatchSize: feedItems.length,
-        mart: 'WALMART_CA',
+        requestId:     correlationId,
+        version:       '3.16',
+        processMode:   'REPLACE',
+        subset:        'EXTERNAL',
+        mart:          'WALMART_CA',
+        sellingChannel: 'marketplace',
+        subCategory:   'tires',
+        locale:        ['en', 'fr'],
       },
       MPItem: feedItems,
     };
 
     console.log(
-      `[walmart-item-feed] Submitting feed with ${feedItems.length} items...`
+      `[walmart-item-feed] Submitting MP_ITEM_INTL feed with ${feedItems.length} items...`
     );
 
     const walmartRes = await fetch(
-      `${process.env.WALMART_BASE_URL}/v3/feeds?feedType=MP_ITEM`,
+      `${process.env.WALMART_BASE_URL}/v3/feeds?feedType=MP_ITEM_INTL`,
       {
         method: 'POST',
         headers: {
-          'WM_SEC.ACCESS_TOKEN': token,
-          'WM_GLOBAL_VERSION': '3.1',
-          'WM_MARKET': 'ca',
-          'WM_SVC.NAME': 'Walmart Marketplace',
+          'WM_SEC.ACCESS_TOKEN':   token,
+          'WM_GLOBAL_VERSION':     '3.1',
+          'WM_MARKET':             'ca',
+          'WM_SVC.NAME':           'Walmart Marketplace',
           'WM_QOS.CORRELATION_ID': correlationId,
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
+          Accept:                  'application/json',
+          'Content-Type':          'application/json',
         },
         body: JSON.stringify(feedPayload),
       }
@@ -306,7 +349,7 @@ export default async function handler(
       message: `Feed submitted successfully. Poll /api/walmart-feed-status?feedId=${feedId} to track progress.`,
       submitted: feedItems.length,
       skipped: skipped.length,
-      skippedItems: skipped, // full list for debugging
+      skippedItems: skipped,
     });
 
   } catch (error: unknown) {

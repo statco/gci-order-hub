@@ -20,7 +20,7 @@
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { v4 as uuidv4 } from 'uuid';
+
 import { getWalmartToken } from './lib/walmart-client.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ export default async function handler(
           'WM_GLOBAL_VERSION': '3.1',
           'WM_MARKET': 'ca',
           'WM_SVC.NAME': 'Walmart Marketplace',
-          'WM_QOS.CORRELATION_ID': uuidv4(),
+          'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
           Accept: 'application/json',
         },
       }
