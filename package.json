@@ -12,10 +12,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "resend": "^4.0.0"
+    "resend": "^4.0.0",
+    "uuid": "^14.0.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
+    "@types/uuid": "^10.0.0",
     "@vercel/node": "^3.0.0",
     "typescript": "^5.4.0"
   }

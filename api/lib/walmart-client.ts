@@ -215,6 +215,9 @@ export async function getFeedStatus(feedId: string): Promise<any> {
   return walmartFetch<any>(`/v3/feeds/${encodeURIComponent(feedId)}?includeDetails=true`);
 }
 
+/** Re-exported for callers that need a raw token for custom fetch calls. */
+export const getWalmartToken = getToken;
+
 /**
  * Chunk an array for Walmart's 1 000-item feed limit.
  */
