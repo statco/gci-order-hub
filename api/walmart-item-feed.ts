@@ -165,7 +165,7 @@ function buildFeedItem(
       sku: variant.sku,
       productIdentifiers: {
         productIdType: 'GTIN',
-        productId: 'GTIN_EXEMPT',
+        productId: 'CUSTOM',
       },
       MPOffer: {
         price,
