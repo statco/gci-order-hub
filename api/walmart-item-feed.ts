@@ -18,7 +18,7 @@
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { v4 as uuidv4 } from 'uuid';
+
 import { getWalmartToken } from './lib/walmart-client.js';
 import {
   parseTireSize,
@@ -271,7 +271,7 @@ export default async function handler(
 
     // ── Step 3: Submit MP_ITEM_INTL feed to Walmart ─────────────────────────
     const token = await getWalmartToken();
-    const correlationId = uuidv4();
+    const correlationId = crypto.randomUUID();
 
     const feedPayload = {
       MPItemFeedHeader: {
