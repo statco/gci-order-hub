@@ -24,7 +24,6 @@ import {
   parseTireSize,
   getSeasonFromTags,
   getVehicleTypeFromTags,
-  sanitizeDescription,
   type ParsedTire,
   type SeasonClassification,
   type VehicleType,
@@ -48,7 +47,6 @@ interface ShopifyProduct {
   id: number;
   title: string;
   vendor: string;
-  body_html: string;
   tags: string;
   images: ShopifyImage[];
   variants: ShopifyVariant[];
@@ -99,7 +97,7 @@ async function fetchShopifyProducts(): Promise<ShopifyProduct[]> {
   const products: ShopifyProduct[] = [];
   let nextUrl: string | null =
     `https://${SHOPIFY_DOMAIN}/admin/api/2024-01/products.json` +
-    `?limit=250&tag=ct-sync&fields=id,title,vendor,body_html,tags,images,variants`;
+    `?limit=250&tag=ct-sync&fields=id,title,vendor,tags,images,variants`;
 
   while (nextUrl) {
     const res: Response = await fetch(nextUrl, {
@@ -160,7 +158,7 @@ function buildFeedItem(
 
   const season = getSeasonFromTags(product.tags);
   const vehicleType = getVehicleTypeFromTags(product.tags, parsed);
-  const description = sanitizeDescription(product.body_html);
+  const description = `${product.vendor} ${parsed.model} ${parsed.fullSize} tire. Available at GCI Tires Canada.`;
 
   const item: WalmartFeedItem = {
     Item: {
