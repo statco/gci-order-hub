@@ -3,7 +3,9 @@
   "functions": {
     "api/order-router.ts":    { "maxDuration": 30  },
     "api/authorize-order.ts": { "maxDuration": 30  },
-    "api/walmart-sync.ts":    { "maxDuration": 60  }
+    "api/walmart-sync.ts":    { "maxDuration": 60  },
+    "api/walmart-item-feed.ts":   { "maxDuration": 60 },
+    "api/walmart-feed-status.ts": { "maxDuration": 10 }
   },
   "rewrites": [
     {
