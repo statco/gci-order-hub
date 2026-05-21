@@ -239,10 +239,16 @@ export default async function handler(
     // ── Step 2: Build feed items ────────────────────────────────────────────
     const feedItems: WalmartFeedItem[] = [];
     const skipped: SkippedItem[] = [];
+    const seenSkus = new Set<string>();
 
     for (const product of allProducts) {
       for (const variant of product.variants) {
         if (!variant.sku?.startsWith('TIRE-')) continue;
+
+        if (seenSkus.has(variant.sku)) {
+          skipped.push({ sku: variant.sku, reason: 'Duplicate SKU skipped' });
+          continue;
+        }
 
         const { item, skipReason } = buildFeedItem(product, variant);
 
@@ -251,6 +257,7 @@ export default async function handler(
           continue;
         }
 
+        seenSkus.add(variant.sku);
         feedItems.push(item);
       }
     }
