@@ -28,9 +28,9 @@ import {
   type WalmartInventoryItem,
 } from './lib/walmart-client.js';
 
-export const config = { maxDuration: 60 };
+export const config = { maxDuration: 300 };
 
-// ─── SHOPIFY CONFIG ───────────────────────────────────────────
+// ─── SHOPIFY CONFIG ─────────────────────────────────────────────
 
 const SHOPIFY_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN    ?? '';
 const SHOPIFY_TOKEN  = process.env.SHOPIFY_ADMIN_API_TOKEN ?? '';
@@ -42,7 +42,7 @@ const CT_SYNC_TAG      = 'ct-sync';
 const LOW_STOCK_CUTOFF = 4;     // qty below this → Walmart qty = 0
 const WALMART_CHUNK    = 1_000; // Walmart feed max items per call
 
-// ─── SHOPIFY HELPERS ──────────────────────────────────────────
+// ─── SHOPIFY HELPERS ────────────────────────────────────────────
 
 function delay(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -97,7 +97,7 @@ async function fetchTireVariants(): Promise<SyncItem[]> {
   return items;
 }
 
-// ─── MAIN HANDLER ─────────────────────────────────────────────
+// ─── MAIN HANDLER ───────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET' && req.method !== 'POST') {
@@ -113,7 +113,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   console.log(`🛒 Walmart sync starting${isDry ? ' [DRY RUN]' : ''}…`);
 
-  // ── Fetch Shopify data ────────────────────────────────────────
+  // ── Fetch Shopify data ────────────────────────────────────────────
   let items: SyncItem[];
   try {
     items = await fetchTireVariants();
@@ -146,7 +146,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   }
 
-  // ── Push to Walmart ───────────────────────────────────────────
+  // ── Push to Walmart ──────────────────────────────────────────────
   const priceItems:     WalmartPriceItem[]     = items.map(i => ({ sku: i.sku, price: i.price }));
   const inventoryItems: WalmartInventoryItem[] = items.map(i => ({ sku: i.sku, quantity: i.walmartQty }));
 
