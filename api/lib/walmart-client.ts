@@ -77,33 +77,47 @@ async function getToken(): Promise<string> {
 
 // ─── INTERNAL FETCH ───────────────────────────────────────────
 
-async function walmartFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = await getToken();
+function buildHeaders(token: string, extra: HeadersInit = {}): Record<string, string> {
+  return {
+    'WM_SEC.ACCESS_TOKEN':   token,
+    'WM_GLOBAL_VERSION':     '3.1',
+    'WM_MARKET':             'ca',
+    'WM_SVC.NAME':           'Walmart Marketplace',
+    'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
+    'Content-Type':          'application/json',
+    'Accept':                'application/json',
+    ...(extra as Record<string, string>),
+  };
+}
 
-  const res = await fetch(`${WALMART_BASE}${path}`, {
+/**
+ * Low-level fetch that returns raw status + body text instead of throwing.
+ * Handles 429 retry automatically. Used by bulk functions for full logging.
+ */
+async function walmartFetchRaw(
+  path: string,
+  options: RequestInit = {},
+): Promise<{ status: number; ok: boolean; body: string }> {
+  const token = await getToken();
+  const res   = await fetch(`${WALMART_BASE}${path}`, {
     ...options,
-    headers: {
-      'WM_SEC.ACCESS_TOKEN':   token,
-      'WM_GLOBAL_VERSION':     '3.1',
-      'WM_MARKET':             'ca',
-      'WM_SVC.NAME':           'Walmart Marketplace',
-      'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
-      'Content-Type':          'application/json',
-      'Accept':                'application/json',
-      ...(options.headers ?? {}),
-    },
+    headers: buildHeaders(token, options.headers as HeadersInit),
   });
 
   if (res.status === 429) {
     await new Promise(r => setTimeout(r, 2_000));
-    return walmartFetch<T>(path, options);
+    return walmartFetchRaw(path, options);
   }
-  if (res.status === 204) return {} as T;
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Walmart API ${res.status} on ${path}: ${body.slice(0, 300)}`);
-  }
-  return res.json() as Promise<T>;
+
+  const body = res.status === 204 ? '' : await res.text();
+  return { status: res.status, ok: res.ok, body };
+}
+
+async function walmartFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const { status, ok, body } = await walmartFetchRaw(path, options);
+  if (!ok) throw new Error(`Walmart API ${status} on ${path}: ${body.slice(0, 300)}`);
+  if (!body) return {} as T;
+  return JSON.parse(body) as T;
 }
 
 // ─── PUBLIC TYPES ─────────────────────────────────────────────
@@ -157,56 +171,72 @@ export async function updateInventory(item: WalmartInventoryItem): Promise<void>
   });
 }
 
-export async function bulkInventoryFeed(
-  items: WalmartInventoryItem[]
-): Promise<BulkFeedResult> {
-  let success = 0;
-  let failed  = 0;
-  for (const i of items) {
-    try {
-      await walmartFetch<any>('/v3/inventory', {
-        method: 'PUT',
-        body: JSON.stringify({
-          sku: i.sku,
-          quantity: { unit: 'EACH', amount: Math.max(0, i.quantity) },
-        }),
-      });
-      success++;
-    } catch (err: any) {
-      console.error(`❌ inventory failed for ${i.sku}: ${err.message}`);
-      failed++;
-    }
-  }
-  console.log(`✅ Walmart inventory: ${success} updated, ${failed} failed`);
-  return { success, failed };
-}
-
 export async function bulkPriceFeed(
   items: WalmartPriceItem[]
 ): Promise<BulkFeedResult> {
-  let success = 0;
-  let failed  = 0;
+  let success          = 0;
+  let failed           = 0;
+  let firstSuccessLogged = false;
+
   for (const i of items) {
-    try {
-      await walmartFetch<any>('/v3/price', {
-        method: 'PUT',
-        body: JSON.stringify({
-          sku: i.sku,
-          pricing: {
-            currentPrice: {
-              currency: 'CAD',
-              amount: parseFloat(i.price.toFixed(2)),
-            },
+    const { status, ok, body } = await walmartFetchRaw('/v3/price', {
+      method: 'PUT',
+      body: JSON.stringify({
+        sku: i.sku,
+        pricing: {
+          currentPrice: {
+            currency: 'CAD',
+            amount: parseFloat(i.price.toFixed(2)),
           },
-        }),
-      });
+        },
+      }),
+    });
+
+    if (ok) {
+      if (!firstSuccessLogged) {
+        console.log(`[price] first success SKU ${i.sku} status ${status}:`, body);
+        firstSuccessLogged = true;
+      }
       success++;
-    } catch (err: any) {
-      console.error(`❌ price failed for ${i.sku}: ${err.message}`);
+    } else {
+      console.error(`[price] SKU ${i.sku} failed ${status}:`, body);
       failed++;
     }
   }
+
   console.log(`✅ Walmart price: ${success} updated, ${failed} failed`);
+  return { success, failed };
+}
+
+export async function bulkInventoryFeed(
+  items: WalmartInventoryItem[]
+): Promise<BulkFeedResult> {
+  let success          = 0;
+  let failed           = 0;
+  let firstSuccessLogged = false;
+
+  for (const i of items) {
+    const { status, ok, body } = await walmartFetchRaw('/v3/inventory', {
+      method: 'PUT',
+      body: JSON.stringify({
+        sku: i.sku,
+        quantity: { unit: 'EACH', amount: Math.max(0, i.quantity) },
+      }),
+    });
+
+    if (ok) {
+      if (!firstSuccessLogged) {
+        console.log(`[inventory] first success SKU ${i.sku} status ${status}:`, body);
+        firstSuccessLogged = true;
+      }
+      success++;
+    } else {
+      console.error(`[inventory] SKU ${i.sku} failed ${status}:`, body);
+      failed++;
+    }
+  }
+
+  console.log(`✅ Walmart inventory: ${success} updated, ${failed} failed`);
   return { success, failed };
 }
 
