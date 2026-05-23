@@ -1,11 +1,11 @@
 {
   "outputDirectory": ".",
   "functions": {
-    "api/order-router.ts":    { "maxDuration": 30  },
-    "api/authorize-order.ts": { "maxDuration": 30  },
-    "api/walmart-sync.ts":    { "maxDuration": 300 },
-    "api/walmart-item-feed.ts":   { "maxDuration": 300 },
-    "api/walmart-feed-status.ts": { "maxDuration": 10 }
+    "api/order-router":    { "maxDuration": 30  },
+    "api/authorize-order": { "maxDuration": 30  },
+    "api/walmart-sync":    { "maxDuration": 300 },
+    "api/walmart-item-feed":   { "maxDuration": 300 },
+    "api/walmart-feed-status": { "maxDuration": 10 }
   },
   "rewrites": [
     {

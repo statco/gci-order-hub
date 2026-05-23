@@ -167,8 +167,6 @@ export async function bulkInventoryFeed(
         }),
       });
       success++;
-      // small delay to avoid rate limiting
-      await new Promise(r => setTimeout(r, 50));
     } catch (err: any) {
       console.error(`❌ inventory failed for ${i.sku}: ${err.message}`);
       failed++;
@@ -198,7 +196,6 @@ export async function bulkPriceFeed(
         }),
       });
       success++;
-      await new Promise(r => setTimeout(r, 50));
     } catch (err: any) {
       console.error(`❌ price failed for ${i.sku}: ${err.message}`);
       failed++;
