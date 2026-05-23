@@ -130,7 +130,7 @@ function buildTelegramMessage(orders: WalmartOrder[], ackedIds: Set<string>): st
 
 // ── Handler ────────────────────────────────────────────────────────────────
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(_req: VercelRequest, res: VercelResponse) {
   try {
     const token = await getWalmartToken();
     const orders = await fetchCreatedOrders(token);
