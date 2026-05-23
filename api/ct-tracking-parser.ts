@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
-import pdf from 'pdf-parse';
-import { getOrderIdByPoNumber, updateSheetRowByOrderId } from './lib/sheets-client';
+import pdfParse from 'pdf-parse';
+import { getOrderIdByPoNumber } from './lib/sheets-client';
 
 export const maxDuration = 300;
 
@@ -133,7 +133,7 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
         const pdfBuffer = Buffer.from(base64Data, 'base64');
 
         // Parse PDF text
-        const pdfData = await pdf(pdfBuffer);
+        const pdfData = await pdfParse(pdfBuffer);
         const text = pdfData.text;
         console.log(`[ct-parser] PDF text extracted, length: ${text.length}`);
 
