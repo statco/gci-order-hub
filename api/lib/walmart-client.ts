@@ -118,6 +118,11 @@ export interface WalmartInventoryItem {
   quantity: number;  // 0 to suppress listing
 }
 
+export interface BulkFeedResult {
+  success: number;
+  failed:  number;
+}
+
 // ─── PUBLIC METHODS ───────────────────────────────────────────
 
 /**
@@ -154,9 +159,9 @@ export async function updateInventory(item: WalmartInventoryItem): Promise<void>
 
 export async function bulkInventoryFeed(
   items: WalmartInventoryItem[]
-): Promise<string> {
+): Promise<BulkFeedResult> {
   let success = 0;
-  let failed = 0;
+  let failed  = 0;
   for (const i of items) {
     try {
       await walmartFetch<any>('/v3/inventory', {
@@ -173,14 +178,14 @@ export async function bulkInventoryFeed(
     }
   }
   console.log(`✅ Walmart inventory: ${success} updated, ${failed} failed`);
-  return `inventory-done-${success}-${failed}`;
+  return { success, failed };
 }
 
 export async function bulkPriceFeed(
   items: WalmartPriceItem[]
-): Promise<string> {
+): Promise<BulkFeedResult> {
   let success = 0;
-  let failed = 0;
+  let failed  = 0;
   for (const i of items) {
     try {
       await walmartFetch<any>('/v3/price', {
@@ -202,7 +207,32 @@ export async function bulkPriceFeed(
     }
   }
   console.log(`✅ Walmart price: ${success} updated, ${failed} failed`);
-  return `price-done-${success}-${failed}`;
+  return { success, failed };
+}
+
+/**
+ * Fetch all SKUs that are currently listed on Walmart by paginating
+ * GET /v3/items via nextCursor. Returns a Set for O(1) lookup.
+ */
+export async function fetchListedSkus(): Promise<Set<string>> {
+  const skus = new Set<string>();
+  let nextCursor: string | null = null;
+  let page = 0;
+
+  do {
+    const url = `/v3/items?limit=20${nextCursor ? `&nextCursor=${encodeURIComponent(nextCursor)}` : ''}`;
+    const data: any = await walmartFetch<any>(url);
+    const itemList: any[] = data?.ItemResponse ?? [];
+    for (const item of itemList) {
+      const sku = (item.sku ?? '') as string;
+      if (sku) skus.add(sku);
+    }
+    nextCursor = (data?.nextCursor as string) || null;
+    page++;
+    console.log(`  Walmart items page ${page}: ${itemList.length} items, total so far: ${skus.size}${nextCursor ? '' : ' (done)'}`);
+  } while (nextCursor);
+
+  return skus;
 }
 
 /**
