@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getWalmartToken } from './lib/walmart-client';
-import { getSheetOrderIds, updateSheetRowByOrderId } from './lib/sheets-client';
+import { updateSheetRowByOrderId } from './lib/sheets-client'; // removed unused getSheetOrderIds
 
 export const maxDuration = 60;
 
@@ -20,9 +20,22 @@ const CARRIER_MAP: Record<string, string> = {
   dhl: 'DHL',
 };
 
+const TRACKING_URL_MAP: Record<string, string> = {
+  PUROLATOR: 'https://www.purolator.com/en/shipping/tracker?pin=',
+  UPS: 'https://www.ups.com/track?tracknum=',
+  FEDEX: 'https://www.fedex.com/fedextrack/?trknbr=',
+  CANADA_POST: 'https://www.canadapost-postescanada.ca/track-reperage/en#/details/',
+  DHL: 'https://www.dhl.com/en/express/tracking.html?AWB=',
+};
+
 function normalizeCarrier(raw: string): string {
   const key = raw.toLowerCase().trim();
   return CARRIER_MAP[key] ?? raw.toUpperCase();
+}
+
+function getTrackingUrl(carrier: string, trackingNumber: string): string {
+  const base = TRACKING_URL_MAP[carrier] ?? 'https://www.google.com/search?q=';
+  return `${base}${trackingNumber}`;
 }
 
 // ── Walmart helpers ────────────────────────────────────────────────────────
@@ -74,10 +87,10 @@ async function markShipped(
                 statusQuantity: { unitOfMeasurement: 'EACH', amount: '1' },
                 trackingInfo: {
                   shipDateTime: new Date().toISOString(),
-                  carrierName: { otherCarrier: null, carrier },
+                  carrierName: { carrier },
                   methodCode: 'Standard',
                   trackingNumber,
-                  trackingURL: `https://www.purolator.com/en/shipping/tracker?pin=${trackingNumber}`,
+                  trackingURL: getTrackingUrl(carrier, trackingNumber),
                 },
               },
             ],
@@ -113,9 +126,7 @@ async function sendTelegram(message: string): Promise<void> {
 // ── Handler ────────────────────────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Accept both GET (manual/parser) and POST (dashboard)
   const params = req.method === 'POST' ? req.body : req.query;
-
   const { orderId, trackingNumber, carrier = 'PUROLATOR' } = params;
 
   if (!orderId || !trackingNumber) {
