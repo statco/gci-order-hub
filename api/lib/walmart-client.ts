@@ -246,7 +246,7 @@ export async function bulkInventoryFeed(
 }
 
 /**
- * Fetch all SKUs that are currently listed on Walmart by paginating
+ * Fetch all published+active SKUs listed on Walmart by paginating
  * GET /v3/items via nextCursor. Returns a Set for O(1) lookup.
  */
 export async function fetchListedSkus(): Promise<Set<string>> {
@@ -255,8 +255,9 @@ export async function fetchListedSkus(): Promise<Set<string>> {
   let page = 0;
 
   do {
-    const url = `/v3/items?limit=20${nextCursor ? `&nextCursor=${encodeURIComponent(nextCursor)}` : ''}`;
-    const data: any = await walmartFetch<any>(url);
+    const cursor = nextCursor ? `&nextCursor=${encodeURIComponent(nextCursor)}` : '';
+    const url    = `/v3/items?limit=20&lifecycleStatus=ACTIVE&publishedStatus=PUBLISHED${cursor}`;
+    const data: any   = await walmartFetch<any>(url);
     const itemList: any[] = data?.ItemResponse ?? [];
     for (const item of itemList) {
       const sku = (item.sku ?? '') as string;
