@@ -1,6 +1,6 @@
 import { google } from 'googleapis';
 
-const SHEET_TAB = 'Sheet1';
+const SHEET_TAB = 'GCI Tires — Walmart Order Log';
 
 function getAuth() {
   const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON!);

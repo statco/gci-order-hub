@@ -28,7 +28,7 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
 
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: 'Sheet1!A:N',
+      range: 'GCI Tires — Walmart Order Log!A:N',
     });
 
     const rows = response.data.values ?? [];
