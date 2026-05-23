@@ -163,7 +163,7 @@ export async function updatePrice(item: WalmartPriceItem): Promise<void> {
  * SAFETY: pass qty=0 explicitly when Shopify stock is below threshold.
  */
 export async function updateInventory(item: WalmartInventoryItem): Promise<void> {
-  await walmartFetch<any>('/v3/inventory', {
+  await walmartFetch<any>(`/v3/inventory?sku=${encodeURIComponent(item.sku)}`, {
     method: 'PUT',
     body:   JSON.stringify({
       sku:      item.sku,
@@ -218,13 +218,16 @@ export async function bulkInventoryFeed(
   let firstSuccessLogged = false;
 
   for (const i of items) {
-    const { status, ok, body } = await walmartFetchRaw('/v3/inventory', {
-      method: 'PUT',
-      body: JSON.stringify({
-        sku: i.sku,
-        quantity: { unit: 'EACH', amount: Math.max(0, i.quantity) },
-      }),
-    });
+    const { status, ok, body } = await walmartFetchRaw(
+      `/v3/inventory?sku=${encodeURIComponent(i.sku)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          sku: i.sku,
+          quantity: { unit: 'EACH', amount: Math.max(0, i.quantity) },
+        }),
+      },
+    );
 
     if (ok) {
       if (!firstSuccessLogged) {
