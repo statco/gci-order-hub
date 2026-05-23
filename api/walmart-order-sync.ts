@@ -55,7 +55,7 @@ function walmartHeaders(token: string): Record<string, string> {
 }
 
 async function fetchCreatedOrders(token: string): Promise<WalmartOrder[]> {
-  const url = `${WALMART_BASE_URL}/v3/orders?orderStatus=Created&limit=200`;
+  const url = `${WALMART_BASE_URL}/v3/orders/released?limit=200`;
   const res = await fetch(url, { headers: walmartHeaders(token) });
   if (!res.ok) throw new Error(`Walmart orders fetch failed: ${res.status} ${await res.text()}`);
   const data = await res.json();
