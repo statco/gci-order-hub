@@ -13,12 +13,11 @@
   },
   "dependencies": {
     "googleapis": "^172.0.0",
-    "pdf-parse": "^2.4.5",
+    "pdf2json": "^4.0.3",
     "resend": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
-    "@types/pdf-parse": "^1.1.5",
     "@vercel/node": "^3.0.0",
     "typescript": "^5.4.0"
   }
