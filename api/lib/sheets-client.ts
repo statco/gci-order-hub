@@ -42,7 +42,7 @@ export async function appendSheetRows(
 
 export async function updateSheetRow(
   sheetId: string,
-  rowIndex: number, // 1-based, accounting for header
+  rowIndex: number,
   updates: Partial<{
     status: string;
     tracking_number: string;
@@ -54,7 +54,6 @@ export async function updateSheetRow(
   const auth = getAuth();
   const sheets = google.sheets({ version: 'v4', auth });
 
-  // Column map (1-based): status=H, tracking=I, carrier=J, shipped_at=K, notes=M
   const columnMap: Record<string, string> = {
     status: 'H',
     tracking_number: 'I',
@@ -70,9 +69,31 @@ export async function updateSheetRow(
 
     await sheets.spreadsheets.values.update({
       spreadsheetId: sheetId,
-      range: `${SHEET_TAB}!${col}${rowIndex + 1}`, // +1 for header
+      range: `${SHEET_TAB}!${col}${rowIndex + 1}`,
       valueInputOption: 'RAW',
       requestBody: { values: [[value]] },
     });
   }
 }
+
+export async function updateSheetRowByOrderId(
+  sheetId: string,
+  orderId: string,
+  updates: Partial<{
+    status: string;
+    tracking_number: string;
+    carrier: string;
+    shipped_at: string;
+    notes: string;
+  }>
+): Promise<void> {
+  const auth = getAuth();
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `${SHEET_TAB}!A:A`,
+  });
+
+  const rows = response.data.values ?? [];
+  const mat
