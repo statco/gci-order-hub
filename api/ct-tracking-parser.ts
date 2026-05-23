@@ -1,7 +1,8 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
-const pdfParse = require('pdf-parse') as (buffer: Buffer) => Promise<{ text: string }>;
 import { getOrderIdByPoNumber } from './lib/sheets-client';
+
+const PDFParser = require('pdf2json');
 
 export const maxDuration = 300;
 
@@ -38,6 +39,22 @@ async function sendTelegram(message: string): Promise<void> {
 }
 
 // ── PDF parser ─────────────────────────────────────────────────────────────
+
+function extractPdfText(pdfBuffer: Buffer): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const parser = new PDFParser();
+    parser.on('pdfParser_dataReady', (data: any) => {
+      const pages = data?.Pages ?? [];
+      const extracted = pages
+        .flatMap((page: any) => page.Texts ?? [])
+        .map((t: any) => decodeURIComponent(t.R?.[0]?.T ?? ''))
+        .join(' ');
+      resolve(extracted);
+    });
+    parser.on('pdfParser_dataError', (err: any) => reject(err));
+    parser.parseBuffer(pdfBuffer);
+  });
+}
 
 interface ParsedInvoice {
   poNumber: string | null;
@@ -133,8 +150,7 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
         const pdfBuffer = Buffer.from(base64Data, 'base64');
 
         // Parse PDF text
-        const pdfData = await pdfParse(pdfBuffer);
-        const text = pdfData.text;
+        const text = await extractPdfText(pdfBuffer);
         console.log(`[ct-parser] PDF text extracted, length: ${text.length}`);
 
         const { poNumber, trackingNumber, carrier } = parseInvoicePdf(text);
