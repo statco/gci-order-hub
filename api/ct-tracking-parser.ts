@@ -218,4 +218,4 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     await sendTelegram(`⚠️ <b>ct-tracking-parser FATAL ERROR</b>\n${err.message}`).catch(() => {});
     return res.status(500).json({ error: err.message });
   }
-}
+}// pdf2json
