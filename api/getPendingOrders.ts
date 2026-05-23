@@ -1,4 +1,3 @@
-cat > api/getPendingOrders.ts << 'EOF'
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
 
@@ -66,5 +65,3 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     return res.status(500).json({ error: err.message });
   }
 }
-EOF
-git add -A && git commit -m "feat: add getPendingOrders endpoint" && git push
