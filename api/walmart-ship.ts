@@ -1,60 +1,75 @@
+// api/walmart-ship.ts
+// ─────────────────────────────────────────────────────────────
+// POST /api/walmart-ship
+//
+// Marks a Walmart order as shipped and updates the Google Sheet + Telegram.
+//
+// Body / query params:
+//   orderId        — Walmart purchase order number
+//   trackingNumber — carrier tracking number
+//   carrier        — carrier name (default: PUROLATOR)
+// ─────────────────────────────────────────────────────────────
+
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getWalmartToken } from './lib/walmart-client';
-import { updateSheetRowByOrderId } from './lib/sheets-client'; // removed unused getSheetOrderIds
+import { getWalmartToken } from './lib/walmart-client.js';
+import { updateSheetRowByOrderId } from './lib/sheets-client.js';
 
-export const maxDuration = 60;
+export const config = { maxDuration: 60 };
 
-const WALMART_BASE_URL = process.env.WALMART_BASE_URL!;
-const SHEET_ID = process.env.WALMART_ORDER_LOG_SHEET_ID!;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
+const WALMART_BASE_URL    = process.env.WALMART_BASE_URL!;
+const SHEET_ID            = process.env.WALMART_ORDER_LOG_SHEET_ID!;
+const TELEGRAM_BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN!;
+const TELEGRAM_CHAT_ID    = process.env.TELEGRAM_CHAT_ID!;
 
-// ── Carrier map ────────────────────────────────────────────────────────────
+// ── Carrier map ─────────────────────────────────────────────────────────
 
 const CARRIER_MAP: Record<string, string> = {
-  purolator: 'PUROLATOR',
-  ups: 'UPS',
-  fedex: 'FEDEX',
+  purolator:     'PUROLATOR',
+  ups:           'UPS',
+  fedex:         'FEDEX',
   'canada post': 'CANADA_POST',
-  canadapost: 'CANADA_POST',
-  dhl: 'DHL',
+  canadapost:    'CANADA_POST',
+  dhl:           'DHL',
+  gls:           'OTHER',
+  '*gls':        'OTHER',   // CT invoice format
 };
 
-const TRACKING_URL_MAP: Record<string, string> = {
-  PUROLATOR: 'https://www.purolator.com/en/shipping/tracker?pin=',
-  UPS: 'https://www.ups.com/track?tracknum=',
-  FEDEX: 'https://www.fedex.com/fedextrack/?trknbr=',
-  CANADA_POST: 'https://www.canadapost-postescanada.ca/track-reperage/en#/details/',
-  DHL: 'https://www.dhl.com/en/express/tracking.html?AWB=',
+const TRACKING_URL_MAP: Record<string, (tracking: string) => string> = {
+  PUROLATOR:   (t) => `https://www.purolator.com/en/shipping/tracker?pin=${t}`,
+  UPS:         (t) => `https://www.ups.com/track?tracknum=${t}`,
+  FEDEX:       (t) => `https://www.fedex.com/fedextrack/?trknbr=${t}`,
+  CANADA_POST: (t) => `https://www.canadapost-postescanada.ca/track-reperage/en#/details/${t}`,
+  DHL:         (t) => `https://www.dhl.com/en/express/tracking.html?AWB=${t}`,
+  OTHER:       (t) => `https://gls-group.com/CA/en/parcel-tracking/?match=${t}`,
 };
 
 function normalizeCarrier(raw: string): string {
-  const key = raw.toLowerCase().trim();
+  const key = raw.trim().toLowerCase();
   return CARRIER_MAP[key] ?? raw.toUpperCase();
 }
 
 function getTrackingUrl(carrier: string, trackingNumber: string): string {
-  const base = TRACKING_URL_MAP[carrier] ?? 'https://www.google.com/search?q=';
-  return `${base}${trackingNumber}`;
+  const fn = TRACKING_URL_MAP[carrier] ?? TRACKING_URL_MAP['OTHER'];
+  return fn(trackingNumber);
 }
 
-// ── Walmart helpers ────────────────────────────────────────────────────────
+// ── Walmart helpers ───────────────────────────────────────────────────
 
 function walmartHeaders(token: string): Record<string, string> {
   return {
-    'WM_SEC.ACCESS_TOKEN': token,
-    'WM_GLOBAL_VERSION': '3.1',
-    'WM_MARKET': 'ca',
-    'WM_SVC.NAME': 'Walmart Marketplace',
+    'WM_SEC.ACCESS_TOKEN':   token,
+    'WM_GLOBAL_VERSION':     '3.1',
+    'WM_MARKET':             'ca',
+    'WM_SVC.NAME':           'Walmart Marketplace',
     'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
-    'Accept': 'application/json',
-    'Content-Type': 'application/json',
+    'Accept':                'application/json',
+    'Content-Type':          'application/json',
   };
 }
 
 async function fetchOrderLines(
   token: string,
-  orderId: string
+  orderId: string,
 ): Promise<Array<{ lineNumber: string; sku: string }>> {
   const res = await fetch(`${WALMART_BASE_URL}/v3/orders/${orderId}`, {
     headers: walmartHeaders(token),
@@ -64,7 +79,7 @@ async function fetchOrderLines(
   const lines = data?.order?.orderLines?.orderLine ?? [];
   return lines.map((line: any) => ({
     lineNumber: line.lineNumber,
-    sku: line.item?.sku ?? '',
+    sku:        line.item?.sku ?? '',
   }));
 }
 
@@ -73,7 +88,7 @@ async function markShipped(
   orderId: string,
   lines: Array<{ lineNumber: string; sku: string }>,
   trackingNumber: string,
-  carrier: string
+  carrier: string,
 ): Promise<void> {
   const payload = {
     orderShipment: {
@@ -86,11 +101,11 @@ async function markShipped(
                 status: 'Shipped',
                 statusQuantity: { unitOfMeasurement: 'EACH', amount: '1' },
                 trackingInfo: {
-                  shipDateTime: new Date().toISOString(),
-                  carrierName: { carrier },
-                  methodCode: 'Standard',
+                  shipDateTime:  new Date().toISOString(),
+                  carrierName:   { carrier },
+                  methodCode:    'Standard',
                   trackingNumber,
-                  trackingURL: getTrackingUrl(carrier, trackingNumber),
+                  trackingURL:   getTrackingUrl(carrier, trackingNumber),
                 },
               },
             ],
@@ -101,29 +116,29 @@ async function markShipped(
   };
 
   const res = await fetch(`${WALMART_BASE_URL}/v3/orders/${orderId}/shipping`, {
-    method: 'POST',
+    method:  'POST',
     headers: walmartHeaders(token),
-    body: JSON.stringify(payload),
+    body:    JSON.stringify(payload),
   });
 
   if (!res.ok) throw new Error(`Walmart ship failed: ${res.status} ${await res.text()}`);
 }
 
-// ── Telegram ───────────────────────────────────────────────────────────────
+// ── Telegram ───────────────────────────────────────────────────────────
 
 async function sendTelegram(message: string): Promise<void> {
   await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
+    method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      chat_id: TELEGRAM_CHAT_ID,
-      text: message,
+      chat_id:    TELEGRAM_CHAT_ID,
+      text:       message,
       parse_mode: 'HTML',
     }),
   });
 }
 
-// ── Handler ────────────────────────────────────────────────────────────────
+// ── Handler ──────────────────────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const params = req.method === 'POST' ? req.body : req.query;
@@ -150,10 +165,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // 3. Update Sheet row
     await updateSheetRowByOrderId(SHEET_ID, orderId as string, {
-      status: 'SHIPPED',
+      status:          'SHIPPED',
       tracking_number: trackingNumber as string,
-      carrier: normalizedCarrier,
-      shipped_at: new Date().toISOString(),
+      carrier:         normalizedCarrier,
+      shipped_at:      new Date().toISOString(),
     });
     console.log(`[walmart-ship] Sheet updated for order ${orderId}`);
 
@@ -162,14 +177,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       `✅ <b>Order Shipped</b>\n` +
       `📦 Order: <code>${orderId}</code>\n` +
       `🚚 Carrier: ${normalizedCarrier}\n` +
-      `🔢 Tracking: <code>${trackingNumber}</code>`
+      `🔢 Tracking: <code>${trackingNumber}</code>`,
     );
 
     return res.status(200).json({
-      success: true,
+      success:      true,
       orderId,
       trackingNumber,
-      carrier: normalizedCarrier,
+      carrier:      normalizedCarrier,
       linesShipped: lines.length,
     });
   } catch (err: any) {
