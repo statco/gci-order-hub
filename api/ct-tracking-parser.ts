@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
-import pdfParse from 'pdf-parse';
+const pdfParse = require('pdf-parse') as (buffer: Buffer) => Promise<{ text: string }>;
 import { getOrderIdByPoNumber } from './lib/sheets-client';
 
 export const maxDuration = 300;
