@@ -96,4 +96,37 @@ export async function updateSheetRowByOrderId(
   });
 
   const rows = response.data.values ?? [];
-  const mat
+  const matchingRows: number[] = [];
+  rows.forEach((row, index) => {
+    if (index === 0) return;
+    if (row[0] === orderId) matchingRows.push(index + 1);
+  });
+
+  if (matchingRows.length === 0) {
+    console.warn(`[sheets] No rows found for orderId ${orderId}`);
+    return;
+  }
+
+  const columnMap: Record<string, string> = {
+    status: 'H',
+    tracking_number: 'I',
+    carrier: 'J',
+    shipped_at: 'K',
+    notes: 'M',
+  };
+
+  for (const rowIndex of matchingRows) {
+    for (const [field, value] of Object.entries(updates)) {
+      if (value === undefined) continue;
+      const col = columnMap[field];
+      if (!col) continue;
+
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId,
+        range: `${SHEET_TAB}!${col}${rowIndex}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [[value]] },
+      });
+    }
+  }
+}
