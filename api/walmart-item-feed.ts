@@ -118,7 +118,7 @@ async function fetchShopifyProducts(): Promise<ShopifyProduct[]> {
   return products;
 }
 
-// ─── Feed Item Builder ────────────────────────────────────────────────────────────────────
+// ─── Feed Item Builder ──────────────────────────────────────────────────────────────────
 
 const GTIN_EXEMPT_BRANDS = new Set(['Cooper', 'Nexen', 'Vredestein']);
 
@@ -222,7 +222,7 @@ function buildFeedItem(
   return { item };
 }
 
-// ─── Handler ─────────────────────────────────────────────────────────────────────────
+// ─── Handler ────────────────────────────────────────────────────────────────────────
 
 export default async function handler(
   req: VercelRequest,
@@ -241,7 +241,8 @@ export default async function handler(
     // ── Step 2: Build feed items ──────────────────────────────────────────────
     const feedItems: WalmartFeedItem[] = [];
     const skipped: SkippedItem[] = [];
-    const seenSkus = new Set<string>();
+    // Maps sku → productId of the variant currently kept in feedItems for that SKU.
+    const seenSkus = new Map<string, number>();
 
     for (const product of allProducts) {
       if (!GTIN_EXEMPT_BRANDS.has(product.vendor)) {
@@ -256,8 +257,23 @@ export default async function handler(
       for (const variant of product.variants) {
         if (!variant.sku?.startsWith('TIRE-')) continue;
 
-        if (seenSkus.has(variant.sku)) {
-          skipped.push({ sku: variant.sku, reason: 'Duplicate SKU skipped' });
+        const keptProductId = seenSkus.get(variant.sku);
+
+        if (keptProductId !== undefined) {
+          if (product.id < keptProductId) {
+            // Lower productId found — this is the canonical original; replace the existing feed item
+            const { item, skipReason } = buildFeedItem(product, variant);
+            if (!item || skipReason) {
+              skipped.push({ sku: variant.sku, reason: skipReason ?? 'Unknown' });
+              continue;
+            }
+            const idx = feedItems.findIndex(fi => fi.Orderable.sku === variant.sku);
+            if (idx !== -1) feedItems.splice(idx, 1, item);
+            skipped.push({ sku: variant.sku, reason: `productId ${keptProductId} replaced by lower productId ${product.id}` });
+            seenSkus.set(variant.sku, product.id);
+          } else {
+            skipped.push({ sku: variant.sku, reason: 'Duplicate SKU skipped' });
+          }
           continue;
         }
 
@@ -268,7 +284,7 @@ export default async function handler(
           continue;
         }
 
-        seenSkus.add(variant.sku);
+        seenSkus.set(variant.sku, product.id);
         feedItems.push(item);
       }
     }
