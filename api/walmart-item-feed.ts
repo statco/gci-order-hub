@@ -28,7 +28,7 @@ import {
   type VehicleType,
 } from './lib/tire-parser.js';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Types ─────────────────────────────────────────────────────────────────────────
 
 interface ShopifyVariant {
   id: number;
@@ -86,7 +86,7 @@ interface SkippedItem {
   reason: string;
 }
 
-// ─── Shopify ──────────────────────────────────────────────────────────────────
+// ─── Shopify ────────────────────────────────────────────────────────────────────────
 
 async function fetchShopifyProducts(): Promise<ShopifyProduct[]> {
   const SHOPIFY_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN!;
@@ -95,7 +95,7 @@ async function fetchShopifyProducts(): Promise<ShopifyProduct[]> {
   const products: ShopifyProduct[] = [];
   let nextUrl: string | null =
     `https://${SHOPIFY_DOMAIN}/admin/api/2024-01/products.json` +
-    `?limit=250&tag=ct-sync&fields=id,title,vendor,tags,images,variants`;
+    `?limit=250&tag=ct-sync&status=active&fields=id,title,vendor,tags,images,variants`;
 
   while (nextUrl) {
     const res: Response = await fetch(nextUrl, {
@@ -118,7 +118,7 @@ async function fetchShopifyProducts(): Promise<ShopifyProduct[]> {
   return products;
 }
 
-// ─── Feed Item Builder ────────────────────────────────────────────────────────
+// ─── Feed Item Builder ────────────────────────────────────────────────────────────────────
 
 const GTIN_EXEMPT_BRANDS = new Set(['Cooper', 'Nexen', 'Vredestein']);
 
@@ -222,7 +222,7 @@ function buildFeedItem(
   return { item };
 }
 
-// ─── Handler ──────────────────────────────────────────────────────────────────
+// ─── Handler ─────────────────────────────────────────────────────────────────────────
 
 export default async function handler(
   req: VercelRequest,
@@ -233,12 +233,12 @@ export default async function handler(
   }
 
   try {
-    // ── Step 1: Fetch Shopify products ──────────────────────────────────────
+    // ── Step 1: Fetch Shopify products ─────────────────────────────────────────
     console.log('[walmart-item-feed] Fetching Shopify products...');
     const allProducts = await fetchShopifyProducts();
     console.log(`[walmart-item-feed] Fetched ${allProducts.length} products`);
 
-    // ── Step 2: Build feed items ────────────────────────────────────────────
+    // ── Step 2: Build feed items ──────────────────────────────────────────────
     const feedItems: WalmartFeedItem[] = [];
     const skipped: SkippedItem[] = [];
     const seenSkus = new Set<string>();
