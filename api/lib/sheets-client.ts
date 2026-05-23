@@ -33,7 +33,7 @@ export async function appendSheetRows(
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: `${SHEET_TAB}!A:M`,
+    range: `${SHEET_TAB}!A:N`,
     valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
     requestBody: { values: rows },
@@ -129,4 +129,53 @@ export async function updateSheetRowByOrderId(
       });
     }
   }
+}
+
+// ── PO Number helpers ──────────────────────────────────────────────────────
+
+export async function getNextPoNumber(sheetId: string): Promise<string> {
+  const auth = getAuth();
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `${SHEET_TAB}!N:N`,
+  });
+
+  const values = response.data.values ?? [];
+  // Extract numeric parts from existing GCI#### entries
+  const numbers = values
+    .slice(1)
+    .map((row) => row[0])
+    .filter((v) => v && /^GCI\d+$/.test(v))
+    .map((v) => parseInt(v.replace('GCI', ''), 10));
+
+  const max = numbers.length > 0 ? Math.max(...numbers) : 0;
+  const next = max + 1;
+  return `GCI${String(next).padStart(4, '0')}`;
+}
+
+export async function getOrderIdByPoNumber(
+  sheetId: string,
+  poNumber: string
+): Promise<string | null> {
+  const auth = getAuth();
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  // Fetch columns A (order_id) and N (po_number)
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `${SHEET_TAB}!A:N`,
+  });
+
+  const rows = response.data.values ?? [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const po = row[13]; // column N (0-indexed)
+    if (po === poNumber) {
+      return row[0] ?? null; // column A = order_id
+    }
+  }
+
+  return null;
 }
