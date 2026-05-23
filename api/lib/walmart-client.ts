@@ -147,12 +147,13 @@ export async function updatePrice(item: WalmartPriceItem): Promise<void> {
     method: 'PUT',
     body:   JSON.stringify({
       sku:     item.sku,
-      pricing: {
+      pricing: [{
+        currentPriceType: 'BASE',
         currentPrice: {
           currency: 'CAD',
           amount:   parseFloat(item.price.toFixed(2)),
         },
-      },
+      }],
     }),
   });
 }
@@ -174,8 +175,8 @@ export async function updateInventory(item: WalmartInventoryItem): Promise<void>
 export async function bulkPriceFeed(
   items: WalmartPriceItem[]
 ): Promise<BulkFeedResult> {
-  let success          = 0;
-  let failed           = 0;
+  let success            = 0;
+  let failed             = 0;
   let firstSuccessLogged = false;
 
   for (const i of items) {
@@ -183,12 +184,13 @@ export async function bulkPriceFeed(
       method: 'PUT',
       body: JSON.stringify({
         sku: i.sku,
-        pricing: {
+        pricing: [{
+          currentPriceType: 'BASE',
           currentPrice: {
             currency: 'CAD',
             amount: parseFloat(i.price.toFixed(2)),
           },
-        },
+        }],
       }),
     });
 
@@ -211,8 +213,8 @@ export async function bulkPriceFeed(
 export async function bulkInventoryFeed(
   items: WalmartInventoryItem[]
 ): Promise<BulkFeedResult> {
-  let success          = 0;
-  let failed           = 0;
+  let success            = 0;
+  let failed             = 0;
   let firstSuccessLogged = false;
 
   for (const i of items) {
