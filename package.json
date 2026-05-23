@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "googleapis": "^172.0.0",
     "resend": "^4.0.0"
   },
   "devDependencies": {
