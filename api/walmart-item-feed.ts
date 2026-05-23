@@ -95,7 +95,7 @@ async function fetchShopifyProducts(): Promise<ShopifyProduct[]> {
   const products: ShopifyProduct[] = [];
   let nextUrl: string | null =
     `https://${SHOPIFY_DOMAIN}/admin/api/2024-01/products.json` +
-    `?limit=250&tag=ct-sync&status=active&fields=id,title,vendor,tags,images,variants`;
+    `?limit=250&tag=ct-sync&fields=id,title,vendor,tags,images,variants`;
 
   while (nextUrl) {
     const res: Response = await fetch(nextUrl, {
