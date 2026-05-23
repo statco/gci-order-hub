@@ -55,13 +55,20 @@ function walmartHeaders(token: string): Record<string, string> {
 }
 
 async function fetchCreatedOrders(token: string): Promise<WalmartOrder[]> {
-  const url = `${WALMART_BASE_URL}/v3/orders/released?limit=200`;
+  // Fetch orders from last 24 hours, filter Created status in code
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const url = `${WALMART_BASE_URL}/v3/orders?createdStartDate=${encodeURIComponent(since)}&limit=200`;
   const res = await fetch(url, { headers: walmartHeaders(token) });
   if (!res.ok) throw new Error(`Walmart orders fetch failed: ${res.status} ${await res.text()}`);
   const data = await res.json();
-  return data?.list?.elements?.order ?? [];
+  const allOrders: WalmartOrder[] = data?.list?.elements?.order ?? [];
+  // Filter to only Created status orders
+  return allOrders.filter((o) =>
+    o.orderLines?.orderLine?.some((line: any) =>
+      line.orderLineStatuses?.orderLineStatus?.some((s: any) => s.status === 'Created')
+    )
+  );
 }
-
 async function acknowledgeOrder(token: string, orderId: string): Promise<boolean> {
   const res = await fetch(`${WALMART_BASE_URL}/v3/orders/${orderId}/acknowledge`, {
     method: 'POST',
