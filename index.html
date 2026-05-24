@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GCI Order Hub</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:Arial,sans-serif;background:#f3f4f6;padding:40px 20px;color:#111827}
+    .container{max-width:720px;margin:0 auto}
+    header{margin-bottom:32px}
+    header h1{font-size:26px;font-weight:700;color:#111827}
+    header p{color:#6b7280;margin-top:6px;font-size:15px}
+    .badge{display:inline-block;background:#10b981;color:#fff;font-size:12px;
+           font-weight:600;padding:2px 10px;border-radius:999px;margin-left:10px;
+           vertical-align:middle}
+    section{background:#fff;border-radius:12px;padding:24px;
+            box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:24px}
+    section h2{font-size:14px;font-weight:600;text-transform:uppercase;
+               letter-spacing:.06em;color:#6b7280;margin-bottom:16px}
+    table{width:100%;border-collapse:collapse;font-size:14px}
+    th{text-align:left;padding:8px 12px;background:#f9fafb;
+       border-bottom:1px solid #e5e7eb;color:#374151;font-weight:600}
+    td{padding:8px 12px;border-bottom:1px solid #f3f4f6;vertical-align:top}
+    tr:last-child td{border-bottom:none}
+    code{background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:13px;color:#1d4ed8}
+    .method{display:inline-block;font-size:11px;font-weight:700;padding:2px 7px;
+            border-radius:4px;margin-right:4px}
+    .post{background:#fef3c7;color:#92400e}
+    .get{background:#d1fae5;color:#065f46}
+    .note{font-size:13px;color:#6b7280;margin-top:4px}
+    footer{text-align:center;font-size:13px;color:#9ca3af;margin-top:8px}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>GCI Order Hub <span class="badge">LIVE</span></h1>
+      <p>Serverless order automation — Shopify &rarr; Canada Tire / CJ Dropshipping / Walmart</p>
+    </header>
+
+    <section>
+      <h2>Shopify Webhook Endpoints</h2>
+      <table>
+        <tr>
+          <th>Endpoint</th>
+          <th>Description</th>
+        </tr>
+        <tr>
+          <td><span class="method post">POST</span><code>/api/order-router</code></td>
+          <td>Receives <em>orders/paid</em> webhook; routes TIRE- items to Canada Tire PO and NUPROZ- items to CJ Dropshipping. Sends Telegram + email notifications.</td>
+        </tr>
+        <tr>
+          <td><span class="method get">GET</span><span class="method post">POST</span><code>/api/authorize-order</code></td>
+          <td>HMAC-signed authorize link clicked from notifications. Confirms TIRE POs or auto-submits NUPROZ orders to CJ Dropshipping.</td>
+        </tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Walmart Marketplace</h2>
+      <table>
+        <tr>
+          <th>Endpoint</th>
+          <th>Description</th>
+        </tr>
+        <tr>
+          <td><span class="method get">GET</span><span class="method post">POST</span><code>/api/walmart-sync</code></td>
+          <td>Syncs TIRE- prices and inventory from Shopify to Walmart. Runs daily at 09:00 UTC via cron. Supports <code>?dry=true</code> and <code>?mode=listed</code>.</td>
+        </tr>
+        <tr>
+          <td><span class="method get">GET</span><span class="method post">POST</span><code>/api/walmart-order-sync</code></td>
+          <td>Polls Walmart for new Created orders, acknowledges them, logs to Google Sheet, and sends Telegram alert. Runs every 15 min via cron.</td>
+        </tr>
+        <tr>
+          <td><span class="method post">POST</span><code>/api/walmart-ship</code></td>
+          <td>Marks a Walmart order as shipped. Accepts <code>orderId</code>, <code>trackingNumber</code>, <code>carrier</code>. Updates Google Sheet and sends Telegram confirmation.</td>
+        </tr>
+        <tr>
+          <td><span class="method get">GET</span><span class="method post">POST</span><code>/api/walmart-item-feed</code></td>
+          <td>Submits a bulk MP_ITEM_INTL feed to list TIRE- products on Walmart Canada. Returns a <code>feedId</code> to poll.</td>
+        </tr>
+        <tr>
+          <td><span class="method get">GET</span><code>/api/walmart-feed-status</code></td>
+          <td>Checks the processing status of a previously submitted Walmart feed. Requires <code>?feedId=&lt;id&gt;</code>.</td>
+        </tr>
+        <tr>
+          <td><span class="method get">GET</span><code>/api/getPendingOrders</code></td>
+          <td>Returns all Walmart orders with status <code>PENDING_CT</code> from the Google Sheet, grouped by order ID.</td>
+        </tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>CT Tracking</h2>
+      <table>
+        <tr>
+          <th>Endpoint</th>
+          <th>Description</th>
+        </tr>
+        <tr>
+          <td><span class="method post">POST</span><code>/api/ct-tracking-parser</code></td>
+          <td>Parses a Canada Tire shipping confirmation PDF (base64 or multipart) and extracts tracking numbers and carrier info.</td>
+        </tr>
+      </table>
+    </section>
+
+    <footer>GCI Inc. &mdash; internal tooling &mdash; not for public use</footer>
+  </div>
+</body>
+</html>

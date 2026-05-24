@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
 
-export const maxDuration = 30;
+export const config = { maxDuration: 30 };
 
 const SHEET_ID = process.env.WALMART_ORDER_LOG_SHEET_ID!;
 

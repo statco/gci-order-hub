@@ -1,8 +1,8 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getWalmartToken } from './lib/walmart-client';
-import { getSheetOrderIds, appendSheetRows } from './lib/sheets-client';
+import { getWalmartToken } from './lib/walmart-client.js';
+import { getSheetOrderIds, appendSheetRows } from './lib/sheets-client.js';
 
-export const maxDuration = 300;
+export const config = { maxDuration: 300 };
 
 const WALMART_BASE_URL = process.env.WALMART_BASE_URL!;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
@@ -40,7 +40,7 @@ interface WalmartOrder {
   orderLines: { orderLine: OrderLine[] };
 }
 
-// ── Walmart helpers ────────────────────────────────────────────────────────
+// ── Walmart helpers ────────────────────────────────────────────────────────────────
 
 function walmartHeaders(token: string): Record<string, string> {
   return {
@@ -77,7 +77,7 @@ async function acknowledgeOrder(token: string, orderId: string): Promise<boolean
   return res.ok;
 }
 
-// ── Formatters ─────────────────────────────────────────────────────────────
+// ── Formatters ───────────────────────────────────────────────────────────────────
 
 function formatAddress(addr: PostalAddress): string {
   return [addr.address1, addr.address2, addr.city, addr.state, addr.postalCode, addr.country]
@@ -90,7 +90,7 @@ function getLinePrice(line: OrderLine): number {
   return productCharge?.chargeAmount?.amount ?? 0;
 }
 
-// ── Telegram ───────────────────────────────────────────────────────────────
+// ── Telegram ───────────────────────────────────────────────────────────────────
 
 async function sendTelegram(message: string): Promise<void> {
   await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
