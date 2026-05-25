@@ -244,8 +244,6 @@ export default async function handler(
 
     for (const product of allProducts) {
       for (const variant of product.variants) {
-        if (!variant.sku?.startsWith('TIRE-')) continue;
-
         const keptProductId = seenSkus.get(variant.sku);
 
         if (keptProductId !== undefined) {

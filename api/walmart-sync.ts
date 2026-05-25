@@ -41,7 +41,6 @@ const SHOPIFY_TOKEN  = process.env.SHOPIFY_ADMIN_API_TOKEN ?? '';
 const API_VERSION    = '2024-01';
 const SHOPIFY_BASE   = `https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}`;
 
-const TIRE_PREFIX      = 'TIRE-';
 const CT_SYNC_TAG      = 'ct-sync';
 const LOW_STOCK_CUTOFF = 4;     // qty below this → Walmart qty = 0
 const WALMART_CHUNK    = 1_000; // Walmart feed max items per call
@@ -81,7 +80,6 @@ async function fetchTireVariants(): Promise<SyncItem[]> {
     for (const p of products) {
       for (const v of p.variants) {
         const sku = ((v.sku as string) ?? '').toUpperCase();
-        if (!sku.startsWith(TIRE_PREFIX)) continue;
 
         const shopifyQty = Math.max(0, (v.inventory_quantity as number) ?? 0);
         items.push({
@@ -130,7 +128,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   if (items.length === 0) {
-    return res.status(200).json({ ok: true, message: 'No TIRE- variants found', synced: 0 });
+    return res.status(200).json({ ok: true, message: 'No variants found', synced: 0 });
   }
 
   // ── mode=listed: filter to only Walmart-listed SKUs ──────────────
