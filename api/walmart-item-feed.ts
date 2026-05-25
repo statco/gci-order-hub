@@ -120,8 +120,6 @@ async function fetchShopifyProducts(): Promise<ShopifyProduct[]> {
 
 // ─── Feed Item Builder ──────────────────────────────────────────────────────────────────
 
-const GTIN_EXEMPT_BRANDS = new Set(['Cooper', 'Nexen', 'Vredestein']);
-
 // Best-effort country-of-origin by brand; update as sourcing changes.
 function countryOfOrigin(vendor: string): string {
   const v = vendor.toLowerCase();
@@ -245,15 +243,6 @@ export default async function handler(
     const seenSkus = new Map<string, number>();
 
     for (const product of allProducts) {
-      if (!GTIN_EXEMPT_BRANDS.has(product.vendor)) {
-        for (const variant of product.variants) {
-          if (variant.sku?.startsWith('TIRE-')) {
-            skipped.push({ sku: variant.sku, reason: `Brand not in GTIN exemption: ${product.vendor}` });
-          }
-        }
-        continue;
-      }
-
       for (const variant of product.variants) {
         if (!variant.sku?.startsWith('TIRE-')) continue;
 
