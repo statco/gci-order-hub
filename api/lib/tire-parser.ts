@@ -31,10 +31,24 @@ export type VehicleType =
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /**
- * Matches standard tire sizes like: 215/55R17, LT265/70R17, P205/65R15
+ * FORMAT 3: Standard metric tire sizes: 215/55R17, LT265/70R17, P205/65R15
+ * The /i flag handles lowercase 'r' (e.g. 310/r15) — no separate regex needed.
  * Groups: [1] prefix (LT/P optional), [2] section width, [3] aspect ratio, [4] rim diameter
  */
 const TIRE_SIZE_REGEX = /\b(LT|P)?(\d{3})\/(\d{2,3})R(\d{2})\b/i;
+
+/**
+ * FORMAT 1: Cross-section flotation sizes: 31X10.50R15, 33X12.50R15
+ * Groups: [1] overall diameter (in), [2] section width (in, may have decimal), [3] rim diameter (in)
+ */
+const FLOTATION_REGEX = /\b(\d{2})X(\d{2}(?:\.\d+)?)R(\d{2})\b/i;
+
+/**
+ * FORMAT 2: Compact flotation sizes: 3513/R, 3313/R
+ * Groups: [1] section width (in, 2 digits), [2] rim diameter (in, 2 digits)
+ * Flotation sizes are always light truck — prefix is hardcoded LT.
+ */
+const COMPACT_FLOTATION_REGEX = /\b(\d{2})(\d{2})\/R\b/i;
 
 /**
  * Shopify tag → Walmart season classification.
@@ -61,21 +75,77 @@ const SEASON_PRIORITY: SeasonClassification[] = [
  * Title format expected: "{Brand} {Model} {Size}"
  * Example: "Vredestein Quatrac 215/55R17" → model = "Quatrac", size = "215/55R17"
  *
- * @returns ParsedTire | null if no size found (non-tire product, bad title, etc.)
+ * Tries three formats in order:
+ *   1. Cross-section flotation: 31X10.50R15
+ *   2. Compact flotation: 3513/R
+ *   3. Standard metric: 215/55R17 (also handles lowercase r via /i flag)
+ *
+ * @returns ParsedTire | null if no size found
  */
 export function parseTireSize(title: string): ParsedTire | null {
+  function extractModel(fullMatch: string): string {
+    const brandEnd = title.indexOf(' ') + 1;  // skip first word (brand)
+    const sizeStart = title.indexOf(fullMatch);
+    return title.slice(brandEnd, sizeStart).trim() || 'Unknown';
+  }
+
+  // FORMAT 1: Cross-section flotation, e.g. 31X10.50R15
+  const flotationMatch = title.match(FLOTATION_REGEX);
+  if (flotationMatch) {
+    const [fullMatch, overallDiameter, sectionWidthInches, rimDiameterStr] = flotationMatch;
+    const sectionWidthFloat = parseFloat(sectionWidthInches);
+    const rimDiameterInt    = parseInt(rimDiameterStr, 10);
+    const width       = Math.round(sectionWidthFloat * 25.4);
+    const aspectRatio = Math.round(
+      ((parseInt(overallDiameter, 10) - rimDiameterInt) / 2 / sectionWidthFloat) * 100,
+    );
+    const matchIdx    = flotationMatch.index ?? 0;
+    const prefix: 'LT' | null = title.slice(0, matchIdx).toUpperCase().includes('LT')
+      ? 'LT'
+      : null;
+
+    return {
+      prefix,
+      sectionWidth:     String(width),
+      aspectRatio:      String(aspectRatio),
+      constructionType: 'R',
+      rimDiameter:      String(rimDiameterInt),
+      model:            extractModel(fullMatch),
+      fullSize:         fullMatch,
+    };
+  }
+
+  // FORMAT 2: Compact flotation, e.g. 3513/R, 3313/R
+  const compactMatch = title.match(COMPACT_FLOTATION_REGEX);
+  if (compactMatch) {
+    const [fullMatch, widthInchesStr, rimDiameterStr] = compactMatch;
+    const width       = Math.round(parseInt(widthInchesStr, 10) * 25.4);
+    const rimDiameter = parseInt(rimDiameterStr, 10);
+
+    return {
+      prefix:           'LT',  // flotation sizes are always light truck
+      sectionWidth:     String(width),
+      aspectRatio:      '0',   // not applicable for flotation; Walmart accepts 0
+      constructionType: 'R',
+      rimDiameter:      String(rimDiameter),
+      model:            extractModel(fullMatch),
+      fullSize:         fullMatch,
+    };
+  }
+
+  // FORMAT 3: Standard metric, e.g. 215/55R17, LT265/70R17, P205/65R15
+  // The /i flag on TIRE_SIZE_REGEX already handles lowercase 'r' (e.g. 310/r15).
   const match = title.match(TIRE_SIZE_REGEX);
-  if (!match) return null;
+  if (!match) {
+    console.warn(`[tire-parser] No size pattern matched: "${title}"`);
+    return null;
+  }
 
   const [fullMatch, rawPrefix, sectionWidth, aspectRatio, rimDiameter] = match;
-  const prefix = rawPrefix
-    ? (rawPrefix.toUpperCase() as 'P' | 'LT')
-    : null;
-
-  // Model = everything after the first word (brand) up to the size string
-  const brandEnd = title.indexOf(' ') + 1;           // skip brand (first word)
+  const prefix = rawPrefix ? (rawPrefix.toUpperCase() as 'P' | 'LT') : null;
+  const brandEnd  = title.indexOf(' ') + 1;
   const sizeStart = title.indexOf(fullMatch);
-  const model = title.slice(brandEnd, sizeStart).trim();
+  const model     = title.slice(brandEnd, sizeStart).trim();
 
   return {
     prefix,
