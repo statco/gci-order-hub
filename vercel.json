@@ -25,6 +25,10 @@
     {
       "path": "/api/walmart-order-sync",
       "schedule": "*/15 * * * *"
+    },
+    {
+      "path": "/api/ct-tracking-parser",
+      "schedule": "*/30 * * * *"
     }
   ],
   "headers": [
