@@ -32,7 +32,7 @@ import {
 
 interface ShopifyVariant {
   id: number;
-  sku: string;
+  sku: string | null;
   price: string;
   inventory_quantity: number;
 }
@@ -82,7 +82,8 @@ interface WalmartFeedItem {
 }
 
 interface SkippedItem {
-  sku: string;
+  sku: string | null;
+  productTitle?: string;
   reason: string;
 }
 
@@ -185,7 +186,7 @@ function buildFeedItem(
 
   const item: WalmartFeedItem = {
     Orderable: {
-      sku: variant.sku,
+      sku: variant.sku!,  // null-guarded in handler before buildFeedItem is called
       productIdentifiers: {
         productIdType: 'GTIN',
         productId: 'CUSTOM',
@@ -244,6 +245,11 @@ export default async function handler(
 
     for (const product of allProducts) {
       for (const variant of product.variants) {
+        if (!variant.sku) {
+          skipped.push({ sku: null, productTitle: product.title, reason: 'Null SKU' });
+          continue;
+        }
+
         const keptProductId = seenSkus.get(variant.sku);
 
         if (keptProductId !== undefined) {
