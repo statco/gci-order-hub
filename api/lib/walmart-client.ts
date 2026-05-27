@@ -18,7 +18,7 @@ const WALMART_BASE = (
   process.env.WALMART_BASE_URL ?? 'https://marketplace.walmartapis.com'
 ).replace(/\/$/, '');
 
-// ─── CREDENTIALS ─────────────────────────────────────────────
+// ─── CREDENTIALS ───────────────────────────────────────────────
 
 function basicCredentials(): string {
   const id     = process.env.WALMART_CLIENT_ID     ?? '';
@@ -31,7 +31,7 @@ function basicCredentials(): string {
   return Buffer.from(`${id}:${secret}`).toString('base64');
 }
 
-// ─── TOKEN CACHE ─────────────────────────────────────────────
+// ─── TOKEN CACHE ───────────────────────────────────────────────
 
 let _token:    string | null = null;
 let _tokenExp: number        = 0;
@@ -75,7 +75,7 @@ async function getToken(): Promise<string> {
   return _token!;
 }
 
-// ─── INTERNAL FETCH ───────────────────────────────────────────
+// ─── INTERNAL FETCH ──────────────────────────────────────────────
 
 function buildHeaders(token: string, extra: HeadersInit = {}): Record<string, string> {
   return {
@@ -120,7 +120,7 @@ async function walmartFetch<T>(path: string, options: RequestInit = {}): Promise
   return JSON.parse(body) as T;
 }
 
-// ─── PUBLIC TYPES ─────────────────────────────────────────────
+// ─── PUBLIC TYPES ───────────────────────────────────────────────
 
 export interface WalmartPriceItem {
   sku:   string;
@@ -137,7 +137,7 @@ export interface BulkFeedResult {
   failed:  number;
 }
 
-// ─── PUBLIC METHODS ───────────────────────────────────────────
+// ─── PUBLIC METHODS ───────────────────────────────────────────────
 
 /**
  * Update price for a single SKU.
@@ -256,7 +256,7 @@ export async function fetchListedSkus(): Promise<Set<string>> {
 
   do {
     const cursor = nextCursor ? `&nextCursor=${encodeURIComponent(nextCursor)}` : '';
-    const url    = `/v3/items?limit=20&lifecycleStatus=ACTIVE&publishedStatus=PUBLISHED${cursor}`;
+    const url    = `/v3/items?limit=200&lifecycleStatus=ACTIVE&publishedStatus=PUBLISHED${cursor}`;
     const data: any   = await walmartFetch<any>(url);
     const itemList: any[] = data?.ItemResponse ?? [];
     for (const item of itemList) {
