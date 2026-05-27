@@ -1,25 +1,39 @@
 /**
  * api/walmart-listed-count.ts
  *
- * Diagnostic endpoint — calls fetchListedSkus() and returns the total
- * count so we can verify it matches Seller Center (expected: ~2,724).
+ * Diagnostic endpoint — probes the raw /v3/items response to identify
+ * the correct pagination field name, then calls fetchListedSkus() to
+ * get the full count (expected: ~2,724 matching Seller Center).
  *
  * GET /api/walmart-listed-count
  *
  * Returns:
- *   { totalFetched, sampleSkus }
+ *   { rawPageKeys, rawPageSample, totalFetched, sampleSkus }
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { fetchListedSkus } from './lib/walmart-client.js';
+import { walmartFetch, fetchListedSkus } from './lib/walmart-client.js';
 
 export const config = { maxDuration: 300 };
 
 export default async function handler(_req: VercelRequest, res: VercelResponse) {
   try {
-    const skus = await fetchListedSkus();
+    // Probe the first page directly so we can see the actual field names
+    // Walmart returns for pagination before running the full paginated fetch.
+    const testRes = await walmartFetch<any>(
+      '/v3/items?limit=5&publishedStatus=PUBLISHED&lifecycleStatus=ACTIVE'
+    );
+    const rawPageKeys   = Object.keys(testRes ?? {});
+    const rawPageSample = JSON.stringify(testRes).slice(0, 500);
+    console.log('Raw items response keys:', JSON.stringify(rawPageKeys));
+    console.log('Raw items response sample:', rawPageSample);
+
+    const skus     = await fetchListedSkus();
     const skuArray = [...skus];
+
     return res.status(200).json({
+      rawPageKeys,
+      rawPageSample,
       totalFetched: skuArray.length,
       sampleSkus:   skuArray.slice(0, 5),
     });

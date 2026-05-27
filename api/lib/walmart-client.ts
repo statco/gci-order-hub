@@ -113,7 +113,8 @@ async function walmartFetchRaw(
   return { status: res.status, ok: res.ok, body };
 }
 
-async function walmartFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+// Exported so diagnostic endpoints can probe raw responses.
+export async function walmartFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   const { status, ok, body } = await walmartFetchRaw(path, options);
   if (!ok) throw new Error(`Walmart API ${status} on ${path}: ${body.slice(0, 300)}`);
   if (!body) return {} as T;
@@ -247,7 +248,9 @@ export async function bulkInventoryFeed(
 
 /**
  * Fetch all published+active SKUs listed on Walmart by paginating
- * GET /v3/items via nextCursor. Returns a Set for O(1) lookup.
+ * GET /v3/items. Tries all known cursor field names so the correct one
+ * is discovered from logs even if the API spelling changes.
+ * Returns a Set for O(1) lookup.
  */
 export async function fetchListedSkus(): Promise<Set<string>> {
   const skus = new Set<string>();
@@ -255,17 +258,38 @@ export async function fetchListedSkus(): Promise<Set<string>> {
   let page = 0;
 
   do {
-    const cursor = nextCursor ? `&nextCursor=${encodeURIComponent(nextCursor)}` : '';
-    const url    = `/v3/items?limit=200&lifecycleStatus=ACTIVE&publishedStatus=PUBLISHED${cursor}`;
+    const cursorParam = nextCursor ? `&nextCursor=${encodeURIComponent(nextCursor)}` : '';
+    const url         = `/v3/items?limit=200&lifecycleStatus=ACTIVE&publishedStatus=PUBLISHED${cursorParam}`;
     const data: any   = await walmartFetch<any>(url);
+
+    // Log all top-level keys on page 1 so we can verify field names.
+    if (page === 0) {
+      console.log('[fetchListedSkus] page 1 response keys:', JSON.stringify(Object.keys(data ?? {})));
+    }
+
     const itemList: any[] = data?.ItemResponse ?? [];
     for (const item of itemList) {
       const sku = (item.sku ?? '') as string;
       if (sku) skus.add(sku);
     }
-    nextCursor = (data?.nextCursor as string) || null;
+
+    // Try every known cursor field name — whichever is non-empty wins.
+    nextCursor =
+      (data?.nextCursor    as string) ||
+      (data?.next_cursor   as string) ||
+      (data?.nextPage      as string) ||
+      (data?.next_page     as string) ||
+      '';
+    nextCursor = nextCursor || null;
+
     page++;
-    console.log(`  Walmart items page ${page}: ${itemList.length} items, total so far: ${skus.size}${nextCursor ? '' : ' (done)'}`);
+    console.log(
+      `  Walmart items page ${page}: ${itemList.length} items, total so far: ${
+        skus.size
+      }${
+        nextCursor ? ` (cursor: ${nextCursor.slice(0, 20)}…)` : ' (done)'
+      }`
+    );
   } while (nextCursor);
 
   return skus;
