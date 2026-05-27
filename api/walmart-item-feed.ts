@@ -243,14 +243,26 @@ export default async function handler(
     // Maps sku → productId of the variant currently kept in feedItems for that SKU.
     const seenSkus = new Map<string, number>();
 
+    // Pre-pass: collect base SKUs that have a TIRE- prefixed counterpart.
+    // Only these bare SKUs should be skipped — others (Nexen, Minerva, etc.) have
+    // no TIRE- version and must be submitted as-is.
+    const tirePrefixedBaseSkus = new Set<string>();
+    for (const p of allProducts) {
+      for (const v of p.variants) {
+        if (v.sku?.startsWith('TIRE-')) {
+          tirePrefixedBaseSkus.add(v.sku.slice(5)); // e.g. "TIRE-160114025" → "160114025"
+        }
+      }
+    }
+
     for (const product of allProducts) {
       for (const variant of product.variants) {
         if (!variant.sku) {
           skipped.push({ sku: null, productTitle: product.title, reason: 'Null SKU' });
           continue;
         }
-        if (!variant.sku.startsWith('TIRE-')) {
-          skipped.push({ sku: variant.sku, productTitle: product.title, reason: 'Non-TIRE- SKU (bare legacy SKU)' });
+        if (!variant.sku.startsWith('TIRE-') && tirePrefixedBaseSkus.has(variant.sku)) {
+          skipped.push({ sku: variant.sku, productTitle: product.title, reason: 'Non-TIRE- SKU (TIRE- version exists)' });
           continue;
         }
 
