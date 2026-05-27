@@ -249,6 +249,10 @@ export default async function handler(
           skipped.push({ sku: null, productTitle: product.title, reason: 'Null SKU' });
           continue;
         }
+        if (!variant.sku.startsWith('TIRE-')) {
+          skipped.push({ sku: variant.sku, productTitle: product.title, reason: 'Non-TIRE- SKU (bare legacy SKU)' });
+          continue;
+        }
 
         const keptProductId = seenSkus.get(variant.sku);
 
