@@ -18,18 +18,17 @@
     }
   ],
   "crons": [
-    {
-      "path": "/api/walmart-sync",
-      "schedule": "0 9 * * *"
-    },
-    {
-      "path": "/api/walmart-order-sync",
-      "schedule": "*/15 * * * *"
-    },
-    {
-      "path": "/api/ct-tracking-parser",
-      "schedule": "*/30 * * * *"
-    }
+    { "path": "/api/walmart-sync?mode=listed&offset=0&limit=300",    "schedule": "0 9 * * *"  },
+    { "path": "/api/walmart-sync?mode=listed&offset=300&limit=300",  "schedule": "5 9 * * *"  },
+    { "path": "/api/walmart-sync?mode=listed&offset=600&limit=300",  "schedule": "10 9 * * *" },
+    { "path": "/api/walmart-sync?mode=listed&offset=900&limit=300",  "schedule": "15 9 * * *" },
+    { "path": "/api/walmart-sync?mode=listed&offset=1200&limit=300", "schedule": "20 9 * * *" },
+    { "path": "/api/walmart-sync?mode=listed&offset=1500&limit=300", "schedule": "25 9 * * *" },
+    { "path": "/api/walmart-sync?mode=listed&offset=1800&limit=300", "schedule": "30 9 * * *" },
+    { "path": "/api/walmart-sync?mode=listed&offset=2100&limit=300", "schedule": "35 9 * * *" },
+    { "path": "/api/walmart-sync?mode=listed&offset=2400&limit=300", "schedule": "40 9 * * *" },
+    { "path": "/api/walmart-order-sync",                             "schedule": "*/15 * * * *" },
+    { "path": "/api/ct-tracking-parser",                             "schedule": "*/30 * * * *" }
   ],
   "headers": [
     {
