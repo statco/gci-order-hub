@@ -1,10 +1,10 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
-import { getOrderIdByPoNumber } from './lib/sheets-client';
+import { getOrderIdByPoNumber } from './lib/sheets-client.js';
 
 const PDFParser = require('pdf2json');
 
-export const maxDuration = 300;
+export const config = { maxDuration: 60 };
 
 const SHEET_ID = process.env.WALMART_ORDER_LOG_SHEET_ID!;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
@@ -13,7 +13,7 @@ const SHIP_ENDPOINT = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}/api/walmart-ship`
   : 'https://gci-order-hub.vercel.app/api/walmart-ship';
 
-// ── Gmail auth ─────────────────────────────────────────────────────────────
+// ── Gmail auth ────────────────────────────────────────────────────────────
 
 function getGmailClient() {
   const auth = new google.auth.OAuth2(
@@ -64,7 +64,7 @@ interface ParsedInvoice {
 
 function parseInvoicePdf(text: string): ParsedInvoice {
   // PO # — e.g. "GCI0003"
-  const poMatch = text.match(/PO\s*#[\s:]*([A-Z]{2,4}\d{3,6})/i);
+  const poMatch = text.match(/PO\s*#[\s:]*([ A-Z]{2,4}\d{3,6})/i);
   const poNumber = poMatch ? poMatch[1].toUpperCase() : null;
 
   // Tracking Number — labeled field in CT invoice
@@ -88,7 +88,7 @@ function parseInvoicePdf(text: string): ParsedInvoice {
   return { poNumber, trackingNumber, carrier };
 }
 
-// ── Main handler ───────────────────────────────────────────────────────────
+// ── Main handler ─────────────────────────────────────────────────────────────
 
 export default async function handler(_req: VercelRequest, res: VercelResponse) {
   try {
@@ -218,4 +218,4 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     await sendTelegram(`⚠️ <b>ct-tracking-parser FATAL ERROR</b>\n${err.message}`).catch(() => {});
     return res.status(500).json({ error: err.message });
   }
-}// pdf2json
+}

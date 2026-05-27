@@ -18,7 +18,7 @@ const WALMART_BASE = (
   process.env.WALMART_BASE_URL ?? 'https://marketplace.walmartapis.com'
 ).replace(/\/$/, '');
 
-// ─── CREDENTIALS ─────────────────────────────────────────────
+// ─── CREDENTIALS ───────────────────────────────────────────────
 
 function basicCredentials(): string {
   const id     = process.env.WALMART_CLIENT_ID     ?? '';
@@ -31,7 +31,7 @@ function basicCredentials(): string {
   return Buffer.from(`${id}:${secret}`).toString('base64');
 }
 
-// ─── TOKEN CACHE ─────────────────────────────────────────────
+// ─── TOKEN CACHE ───────────────────────────────────────────────
 
 let _token:    string | null = null;
 let _tokenExp: number        = 0;
@@ -75,7 +75,7 @@ async function getToken(): Promise<string> {
   return _token!;
 }
 
-// ─── INTERNAL FETCH ───────────────────────────────────────────
+// ─── INTERNAL FETCH ──────────────────────────────────────────────
 
 function buildHeaders(token: string, extra: HeadersInit = {}): Record<string, string> {
   return {
@@ -113,14 +113,15 @@ async function walmartFetchRaw(
   return { status: res.status, ok: res.ok, body };
 }
 
-async function walmartFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+// Exported so diagnostic endpoints can probe raw responses.
+export async function walmartFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   const { status, ok, body } = await walmartFetchRaw(path, options);
   if (!ok) throw new Error(`Walmart API ${status} on ${path}: ${body.slice(0, 300)}`);
   if (!body) return {} as T;
   return JSON.parse(body) as T;
 }
 
-// ─── PUBLIC TYPES ─────────────────────────────────────────────
+// ─── PUBLIC TYPES ───────────────────────────────────────────────
 
 export interface WalmartPriceItem {
   sku:   string;
@@ -137,7 +138,7 @@ export interface BulkFeedResult {
   failed:  number;
 }
 
-// ─── PUBLIC METHODS ───────────────────────────────────────────
+// ─── PUBLIC METHODS ───────────────────────────────────────────────
 
 /**
  * Update price for a single SKU.
@@ -246,28 +247,41 @@ export async function bulkInventoryFeed(
 }
 
 /**
- * Fetch all published+active SKUs listed on Walmart by paginating
- * GET /v3/items via nextCursor. Returns a Set for O(1) lookup.
+ * Fetch all published+active SKUs listed on Walmart using offset-based
+ * pagination. Page 1 provides totalItems; subsequent pages increment
+ * offset by 200 until all SKUs are collected.
+ * Returns a Set for O(1) lookup.
  */
 export async function fetchListedSkus(): Promise<Set<string>> {
-  const skus = new Set<string>();
-  let nextCursor: string | null = null;
-  let page = 0;
+  const skus       = new Set<string>();
+  const PAGE_SIZE  = 200;
+  let offset       = 0;
+  let totalItems   = Infinity;  // will be set from first response
+  let page         = 0;
 
-  do {
-    const cursor = nextCursor ? `&nextCursor=${encodeURIComponent(nextCursor)}` : '';
-    const url    = `/v3/items?limit=20&lifecycleStatus=ACTIVE&publishedStatus=PUBLISHED${cursor}`;
+  while (offset < totalItems) {
+    const url    = `/v3/items?limit=${PAGE_SIZE}&offset=${offset}&publishedStatus=PUBLISHED&lifecycleStatus=ACTIVE`;
     const data: any   = await walmartFetch<any>(url);
     const itemList: any[] = data?.ItemResponse ?? [];
+
+    if (page === 0) {
+      totalItems = (data?.totalItems as number) ?? itemList.length;
+      console.log(`[fetchListedSkus] totalItems reported by Walmart: ${totalItems}`);
+    }
+
     for (const item of itemList) {
       const sku = (item.sku ?? '') as string;
       if (sku) skus.add(sku);
     }
-    nextCursor = (data?.nextCursor as string) || null;
-    page++;
-    console.log(`  Walmart items page ${page}: ${itemList.length} items, total so far: ${skus.size}${nextCursor ? '' : ' (done)'}`);
-  } while (nextCursor);
 
+    page++;
+    console.log(`  Walmart items page ${page}: ${itemList.length} items (offset ${offset}), total so far: ${skus.size}`);
+
+    if (itemList.length === 0) break;  // guard against empty pages
+    offset += PAGE_SIZE;
+  }
+
+  console.log(`[fetchListedSkus] done: ${skus.size} unique SKUs fetched (totalItems=${totalItems})`);
   return skus;
 }
 

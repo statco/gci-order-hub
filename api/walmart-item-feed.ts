@@ -32,7 +32,7 @@ import {
 
 interface ShopifyVariant {
   id: number;
-  sku: string;
+  sku: string | null;
   price: string;
   inventory_quantity: number;
 }
@@ -82,7 +82,8 @@ interface WalmartFeedItem {
 }
 
 interface SkippedItem {
-  sku: string;
+  sku: string | null;
+  productTitle?: string;
   reason: string;
 }
 
@@ -119,8 +120,6 @@ async function fetchShopifyProducts(): Promise<ShopifyProduct[]> {
 }
 
 // ─── Feed Item Builder ──────────────────────────────────────────────────────────────────
-
-const GTIN_EXEMPT_BRANDS = new Set(['Cooper', 'Nexen', 'Vredestein']);
 
 // Best-effort country-of-origin by brand; update as sourcing changes.
 function countryOfOrigin(vendor: string): string {
@@ -187,7 +186,7 @@ function buildFeedItem(
 
   const item: WalmartFeedItem = {
     Orderable: {
-      sku: variant.sku,
+      sku: variant.sku!,  // null-guarded in handler before buildFeedItem is called
       productIdentifiers: {
         productIdType: 'GTIN',
         productId: 'CUSTOM',
@@ -245,17 +244,11 @@ export default async function handler(
     const seenSkus = new Map<string, number>();
 
     for (const product of allProducts) {
-      if (!GTIN_EXEMPT_BRANDS.has(product.vendor)) {
-        for (const variant of product.variants) {
-          if (variant.sku?.startsWith('TIRE-')) {
-            skipped.push({ sku: variant.sku, reason: `Brand not in GTIN exemption: ${product.vendor}` });
-          }
-        }
-        continue;
-      }
-
       for (const variant of product.variants) {
-        if (!variant.sku?.startsWith('TIRE-')) continue;
+        if (!variant.sku) {
+          skipped.push({ sku: null, productTitle: product.title, reason: 'Null SKU' });
+          continue;
+        }
 
         const keptProductId = seenSkus.get(variant.sku);
 

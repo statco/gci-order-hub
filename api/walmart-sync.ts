@@ -1,18 +1,22 @@
 // api/walmart-sync.ts
 // ─────────────────────────────────────────────────────────────
-// GET /api/walmart-sync   — Vercel cron trigger (0 9 * * *)
+// GET /api/walmart-sync   — Vercel cron trigger
 // POST /api/walmart-sync  — Manual trigger
 //
-// Reads all TIRE- variants from Shopify (gcitires.com) and pushes
+// Reads all ct-sync variants from Shopify (gcitires.com) and pushes
 // updated price + quantity to Walmart Marketplace.
 //
 // Safety switch:
 //   Shopify qty < 4  →  Walmart qty = 0  (prevents overselling)
 //
 // Query params:
-//   ?dry=true        — preview without writing to Walmart
-//   ?mode=listed     — only sync SKUs currently listed on Walmart
-//                      (fetches /v3/items to build allowed-SKU set)
+//   ?dry=true              — preview without writing to Walmart
+//   ?mode=listed           — only sync SKUs currently listed on Walmart
+//                            (fetches /v3/items to build allowed-SKU set)
+//   ?mode=audit            — compare Walmart vs Shopify SKUs, no writes
+//   ?offset=N&limit=M      — when mode=listed, slice the Walmart SKU list
+//                            to [offset, offset+limit) so large catalogues
+//                            can be processed in time-bounded chunks
 //
 // Env vars:
 //   SHOPIFY_STORE_DOMAIN        — e.g. gcitires.myshopify.com
@@ -30,7 +34,7 @@ import {
   chunkArray,
   type WalmartPriceItem,
   type WalmartInventoryItem,
-} from './lib/walmart-client.js';
+} from './lib/walmart-client';
 
 export const config = { maxDuration: 300 };
 
@@ -41,7 +45,6 @@ const SHOPIFY_TOKEN  = process.env.SHOPIFY_ADMIN_API_TOKEN ?? '';
 const API_VERSION    = '2024-01';
 const SHOPIFY_BASE   = `https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}`;
 
-const TIRE_PREFIX      = 'TIRE-';
 const CT_SYNC_TAG      = 'ct-sync';
 const LOW_STOCK_CUTOFF = 4;     // qty below this → Walmart qty = 0
 const WALMART_CHUNK    = 1_000; // Walmart feed max items per call
@@ -81,7 +84,6 @@ async function fetchTireVariants(): Promise<SyncItem[]> {
     for (const p of products) {
       for (const v of p.variants) {
         const sku = ((v.sku as string) ?? '').toUpperCase();
-        if (!sku.startsWith(TIRE_PREFIX)) continue;
 
         const shopifyQty = Math.max(0, (v.inventory_quantity as number) ?? 0);
         items.push({
@@ -101,7 +103,7 @@ async function fetchTireVariants(): Promise<SyncItem[]> {
   return items;
 }
 
-// ─── MAIN HANDLER ───────────────────────────────────────────────
+// ─── MAIN HANDLER ─────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET' && req.method !== 'POST') {
@@ -112,13 +114,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: 'Shopify credentials not configured' });
   }
 
-  const isDry = req.query.dry  === 'true';
-  const mode  = (req.query.mode as string) ?? '';
-  const start = Date.now();
+  const isDry       = req.query.dry === 'true';
+  const mode        = (req.query.mode as string) ?? '';
+  const offsetParam = parseInt((req.query.offset as string) ?? '0', 10) || 0;
+  const limitParam  = req.query.limit ? parseInt(req.query.limit as string, 10) : null;
+  const start       = Date.now();
 
-  console.log(`🛒 Walmart sync starting${isDry ? ' [DRY RUN]' : ''}${mode ? ` [mode=${mode}]` : ''}…`);
+  console.log(
+    `🛒 Walmart sync starting${
+      isDry ? ' [DRY RUN]' : ''
+    }${
+      mode ? ` [mode=${mode}]` : ''
+    }${
+      limitParam !== null ? ` [offset=${offsetParam} limit=${limitParam}]` : ''
+    }…`
+  );
 
-  // ── Fetch Shopify data ────────────────────────────────────────────
+  // ── Fetch Shopify data ────────────────────────────────────────────────
   let items: SyncItem[];
   try {
     const shopifyStart = Date.now();
@@ -129,20 +141,57 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: 'Shopify fetch failed', details: err.message });
   }
 
-  if (items.length === 0) {
-    return res.status(200).json({ ok: true, message: 'No TIRE- variants found', synced: 0 });
+  // ── mode=audit: compare Walmart vs Shopify SKUs, no writes ───────────
+  if (mode === 'audit') {
+    let listedSkus: Set<string>;
+    try {
+      console.log('🔍 Fetching Walmart-listed SKUs for audit…');
+      listedSkus = await fetchListedSkus();
+    } catch (err: any) {
+      console.error('❌ Walmart items fetch failed:', err.message);
+      return res.status(500).json({ error: 'Walmart items fetch failed', details: err.message });
+    }
+
+    const shopifySkus = new Set(items.map(i => i.sku).filter(Boolean));
+    const matched     = [...listedSkus].filter(s => shopifySkus.has(s)).length;
+
+    return res.status(200).json({
+      walmartTotal:      listedSkus.size,
+      shopifyTotal:      shopifySkus.size,
+      matched,
+      unmatchedWalmart:  [...listedSkus].filter(s => !shopifySkus.has(s)).slice(0, 20),
+      unmatchedShopify:  [...shopifySkus].filter(s => !listedSkus.has(s)).slice(0, 20),
+    });
   }
 
-  // ── mode=listed: filter to only Walmart-listed SKUs ──────────────
+  if (items.length === 0) {
+    return res.status(200).json({ ok: true, message: 'No variants found', synced: 0 });
+  }
+
+  // ── mode=listed: filter to only Walmart-listed SKUs ──────────────────
   let listedSkuCount: number | undefined;
+  let totalListed = 0;
+
   if (mode === 'listed') {
     try {
       console.log('🔍 Fetching Walmart-listed SKUs…');
-      const listedSkus = await fetchListedSkus();
-      const before     = items.length;
-      items            = items.filter(i => listedSkus.has(i.sku));
-      listedSkuCount   = listedSkus.size;
-      console.log(`🔍 listed filter: ${items.length}/${before} Shopify variants matched ${listedSkus.size} Walmart listings`);
+      const listedSkus      = await fetchListedSkus();
+      const listedSkusArray = [...listedSkus];
+      totalListed           = listedSkusArray.length;
+      listedSkuCount        = totalListed;
+
+      const skusToProcess: Set<string> = limitParam !== null
+        ? new Set(listedSkusArray.slice(offsetParam, offsetParam + limitParam))
+        : listedSkus;
+
+      const before = items.length;
+      items = items.filter(i => skusToProcess.has(i.sku));
+      console.log(
+        `🔍 listed filter: ${items.length}/${before} Shopify variants matched` +
+        (limitParam !== null
+          ? ` (chunk [${offsetParam}–${offsetParam + limitParam}) of ${totalListed} Walmart listings)`
+          : ` ${totalListed} Walmart listings`)
+      );
     } catch (err: any) {
       console.error('❌ Walmart items fetch failed:', err.message);
       return res.status(500).json({ error: 'Walmart items fetch failed', details: err.message });
@@ -152,7 +201,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const safetyZeroed = items.filter(i => i.shopifyQty > 0 && i.walmartQty === 0).length;
   console.log(`🛡️  Safety-zeroed: ${safetyZeroed} items (qty < ${LOW_STOCK_CUTOFF})`);
 
-  // ── Dry run ───────────────────────────────────────────────────────
+  // ── Dry run ───────────────────────────────────────────────────
   if (isDry) {
     return res.status(200).json({
       dryRun:       true,
@@ -168,7 +217,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   }
 
-  // ── Push to Walmart ───────────────────────────────────────────────
+  // ── Push to Walmart ──────────────────────────────────────────────
   const priceItems:     WalmartPriceItem[]     = items.map(i => ({ sku: i.sku, price: i.price }));
   const inventoryItems: WalmartInventoryItem[] = items.map(i => ({ sku: i.sku, quantity: i.walmartQty }));
 
@@ -202,21 +251,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     await delay(500);
   }
 
-  const walmartSecs  = ((Date.now() - walmartStart) / 1000).toFixed(1);
-  const totalSuccess = totalPriceSuccess + totalInventorySuccess;
-  const totalFailed  = totalPriceFailed  + totalInventoryFailed;
-  console.log(`Walmart calls complete: ${totalSuccess} succeeded, ${totalFailed} failed in ${walmartSecs}s`);
+  const walmartSecs = ((Date.now() - walmartStart) / 1000).toFixed(1);
+  console.log(`Walmart calls complete: ${totalPriceSuccess + totalInventorySuccess} succeeded, ${totalPriceFailed + totalInventoryFailed} failed in ${walmartSecs}s`);
 
-  const durationMs = Date.now() - start;
+  const durationMs      = Date.now() - start;
+  const priceResult     = { success: totalPriceSuccess,     failed: totalPriceFailed };
+  const inventoryResult = { success: totalInventorySuccess, failed: totalInventoryFailed };
   console.log(`✅ Walmart sync done in ${durationMs}ms`);
 
+  // ── Chunked response ───────────────────────────────────────────────
+  if (limitParam !== null) {
+    const nextOffset = offsetParam + limitParam < totalListed ? offsetParam + limitParam : null;
+    return res.status(errors.length > 0 ? 207 : 200).json({
+      ok:             errors.length === 0,
+      processed:      items.length,
+      offset:         offsetParam,
+      limit:          limitParam,
+      nextOffset,
+      done:           nextOffset === null,
+      priceResult,
+      inventoryResult,
+      durationMs,
+      ...(errors.length ? { errors } : {}),
+    });
+  }
+
+  // ── Full-catalogue response ──────────────────────────────────────────
   return res.status(errors.length > 0 ? 207 : 200).json({
     ok:              errors.length === 0,
     totalVariants:   items.length,
     safetyZeroed,
     ...(listedSkuCount !== undefined ? { listedSkuCount } : {}),
-    priceResult:     { success: totalPriceSuccess,     failed: totalPriceFailed },
-    inventoryResult: { success: totalInventorySuccess, failed: totalInventoryFailed },
+    priceResult,
+    inventoryResult,
     durationMs,
     ...(errors.length ? { errors } : {}),
   });
