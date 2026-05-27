@@ -43,45 +43,52 @@
 
 ## 3. Vercel Environment Variables (gci-order-hub)
 
-| Variable | Value / Notes |
-|---|---|
-| `WALMART_CLIENT_ID` | Canada marketplace client ID |
-| `WALMART_CLIENT_SECRET` | Canada marketplace secret |
-| `WALMART_BASE_URL` | `https://marketplace.walmartapis.com` |
-| `WALMART_MARKET` | `ca` (lowercase — required) |
-| `SHOPIFY_STORE_DOMAIN` | `gcitires.myshopify.com` |
-| `SHOPIFY_ADMIN_API_TOKEN` | Shopify admin token (`shpat_...`) |
-| `SHOPIFY_WEBHOOK_SECRET` | Webhook verification secret |
-| `ORDER_ROUTER_SECRET` | HMAC auth for order routing |
-| `APP_BASE_URL` | Base URL for authorize links (auto-detected from `VERCEL_URL` in prod) |
-| `TELEGRAM_BOT_TOKEN` | Notification bot |
-| `TELEGRAM_CHAT_ID` | Notification target |
-| `RESEND_API_KEY` | Email fallback via Resend |
-| `NOTIFY_EMAIL_TO` | Email alert recipient |
-| `NOTIFY_EMAIL_FROM` | Verified Resend sender identity |
-| `WALMART_ORDER_LOG_SHEET_ID` | Google Sheets ID for Walmart order log |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Stringified service account JSON for Sheets API |
-| `CJ_API_KEY` | CJ Dropshipping (inactive — Nuproz discontinued) |
+| Variable | Used in | Notes |
+|---|---|---|
+| `WALMART_CLIENT_ID` | walmart-client.ts | Canada marketplace client ID |
+| `WALMART_CLIENT_SECRET` | walmart-client.ts | Canada marketplace secret |
+| `WALMART_BASE_URL` | walmart-client.ts + others | `https://marketplace.walmartapis.com` |
+| `WALMART_MARKET` | all Walmart calls | `ca` (lowercase — required) |
+| `SHOPIFY_STORE_DOMAIN` | walmart-sync, walmart-item-feed | `gcitires.myshopify.com` |
+| `SHOPIFY_ADMIN_API_TOKEN` | walmart-sync, walmart-item-feed | Shopify admin token (`shpat_...`) |
+| `SHOPIFY_WEBHOOK_SECRET` | order-router | Webhook verification |
+| `ORDER_ROUTER_SECRET` | order-router, authorize-order | HMAC auth |
+| `APP_BASE_URL` | order-router | Base URL for HMAC links |
+| `TELEGRAM_BOT_TOKEN` | notify, walmart-order-sync, walmart-ship, ct-tracking-parser | |
+| `TELEGRAM_CHAT_ID` | notify, walmart-order-sync, walmart-ship, ct-tracking-parser | |
+| `RESEND_API_KEY` | notify | Email fallback |
+| `NOTIFY_EMAIL_TO` | notify | |
+| `NOTIFY_EMAIL_FROM` | notify | |
+| `CJ_API_KEY` | cj-client | Discontinued — no active code paths use it |
+| `WALMART_ORDER_LOG_SHEET_ID` | walmart-order-sync, walmart-ship, getPendingOrders, ct-tracking-parser | Google Sheet ID |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | sheets-client, getPendingOrders | Full service account JSON stringified |
+| `GMAIL_CLIENT_ID` | ct-tracking-parser | Gmail OAuth — confirm set in Vercel |
+| `GMAIL_CLIENT_SECRET` | ct-tracking-parser | Gmail OAuth — confirm set in Vercel |
+| `GMAIL_REFRESH_TOKEN` | ct-tracking-parser | Gmail OAuth — confirm set in Vercel |
+| `VERCEL_URL` | order-router, ct-tracking-parser | Auto-injected by Vercel |
 
 ---
 
 ## 4. API Endpoints (gci-order-hub.vercel.app)
 
-| Endpoint | Method | Purpose | maxDuration |
-|---|---|---|---|
-| `/api/walmart-sync` | GET/POST | Push price+inventory for published SKUs | 300s |
-| `/api/walmart-order-sync` | GET/POST | Poll Walmart for new orders, acknowledge, log to Sheet, Telegram alert | 300s |
-| `/api/walmart-item-feed` | GET/POST | Submit bulk MP_ITEM_INTL feed | 300s |
-| `/api/walmart-feed-status` | GET | Poll feed status by feedId | 10s |
-| `/api/walmart-ship` | POST | Mark order shipped on Walmart, update Sheet, send Telegram | 60s |
-| `/api/order-router` | POST | Shopify webhook — routes paid orders | 30s |
-| `/api/authorize-order` | GET | HMAC-signed payment link generator | 30s |
-| `/api/getPendingOrders` | GET | Fetch PENDING_CT orders from Google Sheet | 30s |
-| `/api/ct-tracking-parser` | POST | Parse Canada Tire shipping PDF for tracking info | 60s |
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/walmart-sync` | GET | Push price+inventory for published SKUs |
+| `/api/walmart-item-feed` | GET/POST | Submit bulk MP_ITEM_INTL feed |
+| `/api/walmart-feed-status` | GET | Poll feed status by feedId |
+| `/api/walmart-order-sync` | GET (cron) | Poll Walmart orders, acknowledge, log to Sheet |
+| `/api/walmart-ship` | POST | Mark order shipped on Walmart, update Sheet |
+| `/api/order-router` | POST | Shopify webhook — routes paid orders |
+| `/api/authorize-order` | GET | HMAC-signed payment link generator |
+| `/api/getPendingOrders` | GET | Fetch PENDING_CT orders from Sheet |
+| `/api/ct-tracking-parser` | GET (cron) | Poll Gmail for CT invoices, extract tracking, call walmart-ship |
 
-**Crons:**
-- `walmart-sync`: daily 4 AM EST (`0 9 * * *` UTC) in `mode=listed`
-- `walmart-order-sync`: every 15 min (`*/15 * * * *`)
+**Crons (vercel.json):**
+| Path | Schedule | Purpose |
+|---|---|---|
+| `/api/walmart-sync` | `0 9 * * *` (4 AM EST) | Daily price+inventory push |
+| `/api/walmart-order-sync` | `*/15 * * * *` | Poll Walmart for new orders |
+| `/api/ct-tracking-parser` | `*/30 * * * *` | Parse CT tracking emails (added PR #14) |
 
 ---
 
@@ -121,7 +128,52 @@ GET /api/walmart-sync?mode=listed
 
 ---
 
-## 6. Walmart API Configuration (api/lib/walmart-client.ts)
+## 6. Walmart Order Routing (api/walmart-order-sync.ts)
+
+### Status: ✅ Fully built and verified (May 25, 2026)
+
+### Full Flow
+```
+Vercel cron (every 15 min) → /api/walmart-order-sync
+        ↓
+GET /v3/orders?status=Created (last 24h)
+        ↓
+Dedup vs Google Sheet (skip already-logged orders)
+        ↓
+For each new order:
+  ├── POST /v3/orders/{id}/acknowledge (required within 4hrs)
+  ├── Append rows to Google Sheet (tab: GCI Tires — Walmart Order Log)
+  └── Send batched Telegram alert
+        ↓
+Manual: Patrick confirms CT order
+        ↓
+CT ships → emails invoice PDF to info@gcitires.ca
+        ↓
+/api/ct-tracking-parser (every 30 min)
+  ├── Poll Gmail for unread emails from info@cdatire.com (subject: Invoice CS + PDF)
+  ├── Extract PO# + tracking + carrier via pdf2json
+  ├── Look up Walmart order ID from Sheet by PO#
+  └── POST /api/walmart-ship { orderId, trackingNumber, carrier }
+        ↓
+/api/walmart-ship
+  ├── GET /v3/orders/{id} (fetch order lines)
+  ├── POST /v3/orders/{id}/shipping (mark shipped)
+  ├── Update Sheet → status: SHIPPED
+  └── Send Telegram confirmation
+```
+
+### Key constraint
+Walmart requires order acknowledgement within 4 hours. The 15-min cron ensures this is met.
+
+### Google Sheet structure (tab: GCI Tires — Walmart Order Log)
+Columns: order_id, created_at, customer_name, customer_address, status, walmart_ack, po_number, skus[], price, qty, carrier, tracking (col L = ack result)
+
+### Carrier normalization (walmart-ship.ts)
+Supports: purolator, ups, fedex, canada post, dhl, gls → Walmart carrier codes + tracking URL per carrier.
+
+---
+
+## 7. Walmart API Configuration (api/lib/walmart-client.ts)
 
 ### Token Request
 - `POST /v3/token` with `Authorization: Basic Base64(clientId:clientSecret)`
@@ -146,13 +198,14 @@ Content-Type: application/json
 
 ---
 
-## 7. Shopify Data Structure
+## 8. Shopify Data Structure
 
 ### Products
 - Tag filter: `ct-sync` (applied automatically by `shopifySync.ts` to all new products)
-- All 2,070 active tire products already have `ct-sync` tag
+- All active tire products have `ct-sync` tag
 - Fields fetched: `id, title, vendor, tags, images, variants`
 - No SKU prefix filter — all variants eligible regardless of prefix
+- **Note:** 500+ archived products had `ct-sync` tag removed May 25 via bulk action — these no longer appear in the Featured Tires collection
 
 ### SKU Formats
 - Legacy: `TIRE-XXXXXX` (prefixed by historical `fixSkus.ts` run)
@@ -179,9 +232,6 @@ function calculatePrice(cost: number): number {
 ```
 Shopify prices are read directly by the Walmart feed — no separate Walmart pricing calculation.
 
-**Old formula** (bulkPriceUpdate.ts — no longer used for new products):
-- `WALMART_FEE = 0.025` (2.5%), `TARGET_MARGIN = 0.14`, `MARKUP = 1.08`
-
 ### Season/Vehicle Type (from Shopify tags)
 | Tag | Walmart value |
 |---|---|
@@ -196,7 +246,7 @@ Shopify prices are read directly by the Walmart feed — no separate Walmart pri
 
 ---
 
-## 8. Item Feed Implementation (api/walmart-item-feed.ts)
+## 9. Item Feed Implementation (api/walmart-item-feed.ts)
 
 ### Feed Spec — MP_ITEM_INTL v3.16
 ```
@@ -212,17 +262,17 @@ Item structure: Orderable + Visible.Tires
 - **Skipped:** 274 (flotation sizes + nulls + duplicates)
 - **Succeeded:** 848+ (still processing)
 - **Failed:** 1,962 — Amar monitoring, will resolve compliance issues
+- **Next run:** will recover ~40 previously skipped flotation SKUs (PR #15)
 
 ### No Brand Filter
-All brands are now eligible (GTIN exemption covers full account).
-Previously restricted to Cooper/Nexen/Vredestein — removed May 25.
+All brands eligible — GTIN exemption covers full account (approved by Amar May 2026).
 
 ### No SKU Prefix Filter
 `TIRE-` prefix check removed May 25 — all variant SKUs eligible.
 
 ### Deduplication
 - `Map<sku, productId>` — lowest productId wins (oldest/canonical)
-- Some null SKUs exist in catalogue — logged but skipped gracefully
+- Null SKUs logged with `{ sku: null, productTitle: product.title, reason: 'Null SKU' }` (PR #15)
 
 ### Brand → Country of Origin
 | Brand | Country |
@@ -232,14 +282,53 @@ Previously restricted to Cooper/Nexen/Vredestein — removed May 25.
 | Cooper | US |
 | default | CN |
 
-### Tire Size Parser
-- Standard: `/\b(LT|P)?(\d{3})\/(\d{2,3})R(\d{2})\b/i`
-- **Not yet handled:** flotation (`3513/R`, `3313/R`), `31X10.50R15`, `310/r` lowercase
-- ~40+ SKUs currently skipped due to unparseable sizes
+---
+
+## 10. Tire Size Parser (api/lib/tire-parser.ts) — Updated PR #15
+
+### Supported Formats (in match order)
+
+**FORMAT 1 — Cross-section flotation** e.g. `31X10.50R15`
+```
+Regex: /\b(\d{2})X(\d{2}(?:\.\d+)?)R(\d{2})\b/i
+width = Math.round(sectionWidthInches × 25.4)
+aspectRatio = Math.round(((overallDiameter - rimDiameter) / 2 / sectionWidthInches) × 100)
+prefix = 'LT' if title contains 'LT' before match
+```
+
+**FORMAT 2 — Compact flotation** e.g. `3513/R`, `3313/R`
+```
+Regex: /\b(\d{2})(\d{2})\/R\b/i
+width = Math.round(widthInches × 25.4)
+aspectRatio = 0 (not applicable, Walmart accepts 0)
+prefix = 'LT' (always light truck)
+```
+
+**FORMAT 3 — Standard metric** e.g. `215/55R17`, `LT265/70R17`, `P205/65R15`, `310/r15`
+```
+Regex: /\b(LT|P)?(\d{3})\/(\d{2,3})R(\d{2})\b/i
+/i flag handles lowercase 'r' — no separate pattern needed
+```
+
+Unknown formats log: `[tire-parser] No size pattern matched: "{title}"`
 
 ---
 
-## 9. Current Status
+## 11. Shopify Featured Tires Collection (305891082288)
+
+**Conditions** (all must match):
+| Field | Operator | Value |
+|---|---|---|
+| Tag | is equal to | ct-sync |
+| Tag | is not equal to | sold-out |
+| Tag | is not equal to | Out of stock |
+| Inventory stock | is greater than | 1 |
+
+**Note:** "Product status = Active" is not available as a Shopify smart collection condition. Instead, `ct-sync` tag was bulk-removed from all 500+ archived products on May 25, 2026. The collection now contains only active products. `shopifySync.ts` will not re-add `ct-sync` to archived products.
+
+---
+
+## 12. Current Status
 
 ### ✅ Fully Working
 - Global API auth ✅
@@ -249,89 +338,30 @@ Previously restricted to Cooper/Nexen/Vredestein — removed May 25.
 - Daily 4 AM cron ✅
 - Full catalogue feed (2,812 SKUs submitted) ✅
 - GTIN exemption: all brands approved ✅
-- Root URL status page (gci-order-hub.vercel.app) ✅
-- Walmart order sync cron (every 15 min) ✅
-- Order acknowledgement + Google Sheets logging ✅
-- Walmart ship endpoint ✅
-- CT tracking PDF parser ✅
-- getPendingOrders endpoint ✅
+- Order polling cron (every 15 min) ✅
+- Walmart order acknowledge ✅
+- Google Sheets logging ✅
+- Telegram + email notifications ✅
+- `walmart-ship.ts` — mark shipped + update Sheet ✅
+- `ct-tracking-parser.ts` — Gmail poll + PDF parse + auto-ship ✅ (bugs fixed PR #14)
+- Flotation tire parser (31X10.50R15, 3513/R formats) ✅ (PR #15)
+- Null SKU logging with product title ✅ (PR #15)
+- Featured Tires collection — archived products removed ✅
 
 ### 🔴 Active Issues
 1. **1,962 feed items failing** — Amar monitoring and resolving compliance flags
-2. **~40 SKUs skipped** — flotation/non-standard tire sizes not parseable
-3. **20 persistent duplicate TIRE- SKUs** — Cooper Endeavor/Procontrol pairs, archived in Shopify but still in ct-sync smart collection. Feed dedup handles correctly.
+2. **No real Walmart tire orders received yet** — order routing untested with live data
 
 ### ⏳ Next Steps
 1. **Await Amar** — compliance resolution on 1,962 failed items
-2. **Enroll items in Flash deals** — Seller Center action (manual)
-3. **Fix flotation tire parser** — add regex for `3513/R`, `31X10.50R15` formats
-4. **Fix null SKU logging** — show product title in skipped log when SKU is null
-5. **Fix Shopify smart collection** — exclude archived products from ct-sync
+2. **Refire item feed** once compliance clears — expect higher success count (~40 flotation SKUs now parseable)
+3. **Enroll items in Flash deals** — manual Seller Center action
+4. **Verify Gmail OAuth creds** — confirm `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN` are set in Vercel gci-order-hub
+5. **Fix Bridgestone WS90 vendor** — change from "GCI Tires" to "Bridgestone" on TIRE-BBK90 in Shopify
 
 ---
 
-## 10. Walmart Order Routing (gci-order-hub)
-
-### Status: ✅ Fully built and deployed
-
-All order routing infrastructure is live. The full flow runs automatically:
-
-```
-Vercel cron (every 15 min) → GET /api/walmart-order-sync
-        ↓
-GET /v3/orders?status=Created (Walmart CA, last 24h)
-        ↓
-For each new order (deduped against Google Sheet):
-  ├── Acknowledge on Walmart (required within 4hrs) ✅
-  ├── Append row to Google Sheet (status: PENDING_CT) ✅
-  └── Send Telegram alert with order details ✅
-```
-
-```
-When CT ships:
-POST /api/walmart-ship { orderId, trackingNumber, carrier }
-  ├── Fetch order lines from Walmart
-  ├── POST /v3/orders/{id}/shipping (mark shipped) ✅
-  ├── Update Google Sheet row (status: SHIPPED) ✅
-  └── Send Telegram confirmation ✅
-```
-
-```
-POST /api/ct-tracking-parser
-  └── Parse Canada Tire shipping PDF → extract tracking + carrier ✅
-```
-
-### Google Sheet Schema (tab: `GCI Tires — Walmart Order Log`)
-| Col | Field | Notes |
-|---|---|---|
-| A | order_id | Walmart purchaseOrderId |
-| B | created_at | ISO timestamp |
-| C | sku | Line item SKU |
-| D | qty | Quantity |
-| E | customer_name | From shipping address |
-| F | customer_address | Full formatted address |
-| G | price | Line price CAD |
-| H | status | `PENDING_CT` → `SHIPPED` |
-| I | tracking_number | Filled on ship |
-| J | carrier | Normalized carrier code |
-| K | shipped_at | ISO timestamp |
-| L | walmart_ack | `TRUE`/`FALSE` |
-| M | notes | |
-| N | po_number | `GCI####` auto-generated |
-
-### Carrier Normalization
-| Input | Walmart code |
-|---|---|
-| purolator | `PUROLATOR` |
-| ups | `UPS` |
-| fedex | `FEDEX` |
-| canada post / canadapost | `CANADA_POST` |
-| dhl | `DHL` |
-| gls / *gls | `OTHER` |
-
----
-
-## 11. Key Technical Decisions
+## 13. Key Technical Decisions
 
 | Decision | Rationale |
 |---|---|
@@ -347,21 +377,23 @@ POST /api/ct-tracking-parser
 | Lowest productId wins on dedup | Oldest = canonical listing |
 | Tiered pricing (×2.10/×1.72/×1.58) | Replaces old WALMART_FEE formula |
 | Safety-zero qty < 4 | Avoid overselling |
-| `export const config = { maxDuration }` | Correct Vercel export syntax — bare `export const maxDuration` is silently ignored |
-| `.js` extensions on all local imports | ESM convention required by `@vercel/node` |
+| Acknowledge embedded in order-sync | No separate endpoint needed; fires before Sheet log |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Full service account JSON stringified into single env var |
+| ct-sync bulk untag (not collection rule) | Shopify smart collections don't support Product Status condition |
+| ct-tracking-parser cron every 30 min | Balance between tracking freshness and Gmail API quota |
 
 ---
 
-## 12. PR / Commit History (gci-order-hub)
+## 14. PR / Commit History (gci-order-hub)
 
-| Commit / PR | Description |
+| PR | Description |
 |---|---|
 | PR #4 | Add walmart-item-feed, walmart-feed-status, tire-parser |
 | PR #5 | Fix timeout: drop body_html, raise maxDuration |
 | PR #7 | Fix productId: GTIN_EXEMPT → CUSTOM |
 | PR #9 | Switch to MP_ITEM_INTL schema v3.16 |
 | PR #10 | Fix ESM: uuid → crypto.randomUUID() |
-| PR #13 | Fix root 404 (add index.html); fix `maxDuration` export syntax in walmart-order-sync + getPendingOrders; add missing .js import extensions; add walmart-order-sync, getPendingOrders, ct-tracking-parser to vercel.json functions; add WALMART_ORDER_LOG_SHEET_ID + GOOGLE_SERVICE_ACCOUNT_JSON to .env.local.example |
+| PR #13 | Fix root 404, maxDuration exports, vercel.json |
 | direct | Dedup by lowest productId |
 | direct | Brand allowlist (later removed) |
 | direct | 300s timeout + remove 50ms delays |
@@ -372,8 +404,10 @@ POST /api/ct-tracking-parser
 | direct | Remove TIRE- prefix filter |
 | direct | Remove brand allowlist |
 | direct | getPendingOrders + CT tracking parser + PO# + Sheets |
+| **PR #14** | **Fix ct-tracking-parser: .js import, config syntax, .env.local.example, add 30-min cron** |
+| **PR #15** | **Add flotation tire parser (31X10.50R15, 3513/R) + null SKU productTitle logging** |
 
-## 13. PR / Commit History (gci-brain)
+## 15. PR / Commit History (gci-brain)
 
 | PR | Description |
 |---|---|
@@ -383,7 +417,7 @@ POST /api/ct-tracking-parser
 
 ---
 
-## 14. gci-brain Internal Tools (/brain)
+## 16. gci-brain Internal Tools (/brain)
 
 | Tool | Route | Purpose |
 |---|---|---|
@@ -404,19 +438,20 @@ POST /api/ct-tracking-parser
 
 ---
 
-## 15. Known Issues / Tech Debt
+## 17. Known Issues / Tech Debt
 
 | Issue | Detail | Fix |
 |---|---|---|
-| Flotation size parser | `3513/R`, `3313/R`, `31X10.50R15`, `310/r` not parsed | Update tire-parser.ts regex |
-| Null SKU logging | Variants with null SKU show `sku: null` in skippedItems | Log product title instead |
-| 20 persistent TIRE- dupes | Cooper Endeavor/Procontrol pairs in ct-sync smart collection despite archived status | Fix smart collection rule to exclude archived |
-| Legacy TIRE- secondary-index | shopifySync.ts ~line 301 | Remove once TIRE- products retired |
+| 1,962 feed items failing | Compliance flags — Amar monitoring | Await Amar, refire feed |
+| Gmail OAuth creds unverified | GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN may not be set in Vercel | Verify in Vercel dashboard |
 | Bridgestone WS90 wrong vendor | TIRE-BBK90 has vendor "GCI Tires" | Change to "Bridgestone" in Shopify |
+| Legacy TIRE- secondary-index | shopifySync.ts ~line 301 | Remove once TIRE- products retired |
+| Flash deal enrollment | Manual Seller Center action pending | Patrick to action in Seller Center |
+| Order routing untested live | No real Walmart tire orders received yet | Will validate on first order |
 
 ---
 
-## 16. Contact References
+## 18. Contact References
 
 | Name | Role | Contact |
 |---|---|---|
