@@ -62,7 +62,7 @@ export default async function handler(
     return res.status(405).json({ error: 'GET only' });
   }
 
-  const { feedId } = req.query;
+  const feedId = req.query.feedId as string | undefined;
 
   if (!feedId || typeof feedId !== 'string') {
     return res.status(400).json({
@@ -127,7 +127,7 @@ export default async function handler(
     }
 
     const response: FeedStatusResponse = {
-      feedId,
+      feedId: feedId as string,
       feedStatus: data.feedStatus ?? 'UNKNOWN',
       itemsTotal: data.itemsTotal ?? 0,
       itemsSucceeded: data.itemsSucceeded ?? 0,
