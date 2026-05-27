@@ -247,51 +247,41 @@ export async function bulkInventoryFeed(
 }
 
 /**
- * Fetch all published+active SKUs listed on Walmart by paginating
- * GET /v3/items. Tries all known cursor field names so the correct one
- * is discovered from logs even if the API spelling changes.
+ * Fetch all published+active SKUs listed on Walmart using offset-based
+ * pagination. Page 1 provides totalItems; subsequent pages increment
+ * offset by 200 until all SKUs are collected.
  * Returns a Set for O(1) lookup.
  */
 export async function fetchListedSkus(): Promise<Set<string>> {
-  const skus = new Set<string>();
-  let nextCursor: string | null = null;
-  let page = 0;
+  const skus       = new Set<string>();
+  const PAGE_SIZE  = 200;
+  let offset       = 0;
+  let totalItems   = Infinity;  // will be set from first response
+  let page         = 0;
 
-  do {
-    const cursorParam = nextCursor ? `&nextCursor=${encodeURIComponent(nextCursor)}` : '';
-    const url         = `/v3/items?limit=200&lifecycleStatus=ACTIVE&publishedStatus=PUBLISHED${cursorParam}`;
+  while (offset < totalItems) {
+    const url    = `/v3/items?limit=${PAGE_SIZE}&offset=${offset}&publishedStatus=PUBLISHED&lifecycleStatus=ACTIVE`;
     const data: any   = await walmartFetch<any>(url);
+    const itemList: any[] = data?.ItemResponse ?? [];
 
-    // Log all top-level keys on page 1 so we can verify field names.
     if (page === 0) {
-      console.log('[fetchListedSkus] page 1 response keys:', JSON.stringify(Object.keys(data ?? {})));
+      totalItems = (data?.totalItems as number) ?? itemList.length;
+      console.log(`[fetchListedSkus] totalItems reported by Walmart: ${totalItems}`);
     }
 
-    const itemList: any[] = data?.ItemResponse ?? [];
     for (const item of itemList) {
       const sku = (item.sku ?? '') as string;
       if (sku) skus.add(sku);
     }
 
-    // Try every known cursor field name — whichever is non-empty wins.
-    nextCursor =
-      (data?.nextCursor    as string) ||
-      (data?.next_cursor   as string) ||
-      (data?.nextPage      as string) ||
-      (data?.next_page     as string) ||
-      '';
-    nextCursor = nextCursor || null;
-
     page++;
-    console.log(
-      `  Walmart items page ${page}: ${itemList.length} items, total so far: ${
-        skus.size
-      }${
-        nextCursor ? ` (cursor: ${nextCursor.slice(0, 20)}…)` : ' (done)'
-      }`
-    );
-  } while (nextCursor);
+    console.log(`  Walmart items page ${page}: ${itemList.length} items (offset ${offset}), total so far: ${skus.size}`);
 
+    if (itemList.length === 0) break;  // guard against empty pages
+    offset += PAGE_SIZE;
+  }
+
+  console.log(`[fetchListedSkus] done: ${skus.size} unique SKUs fetched (totalItems=${totalItems})`);
   return skus;
 }
 
