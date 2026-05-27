@@ -1,9 +1,9 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getWalmartToken } from './lib/walmart-client.js';
+import { getWalmartToken } from './lib/walmart-client';
 
 export const config = { maxDuration: 60 };
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(_req: VercelRequest, res: VercelResponse) {
   res.setHeader('Cache-Control', 'no-store');
 
   const token = await getWalmartToken();
