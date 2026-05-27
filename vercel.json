@@ -6,6 +6,7 @@
     "api/walmart-sync.ts":    { "maxDuration": 300 },
     "api/walmart-item-feed.ts":   { "maxDuration": 300 },
     "api/walmart-feed-status.ts": { "maxDuration": 10  },
+    "api/walmart-feed-diag.ts":   { "maxDuration": 10  },
     "api/walmart-ship.ts":        { "maxDuration": 60  }
   },
   "rewrites": [
