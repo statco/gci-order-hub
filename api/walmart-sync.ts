@@ -13,10 +13,10 @@
 //   ?dry=true              — preview without writing to Walmart
 //   ?mode=listed           — only sync SKUs currently listed on Walmart
 //                            (fetches /v3/items to build allowed-SKU set)
+//   ?mode=audit            — compare Walmart vs Shopify SKUs, no writes
 //   ?offset=N&limit=M      — when mode=listed, slice the Walmart SKU list
 //                            to [offset, offset+limit) so large catalogues
 //                            can be processed in time-bounded chunks
-//                            (crons staggered 5 min apart cover 300 SKUs each)
 //
 // Env vars:
 //   SHOPIFY_STORE_DOMAIN        — e.g. gcitires.myshopify.com
@@ -34,7 +34,7 @@ import {
   chunkArray,
   type WalmartPriceItem,
   type WalmartInventoryItem,
-} from './lib/walmart-client.js';
+} from './lib/walmart-client';
 
 export const config = { maxDuration: 300 };
 
@@ -114,11 +114,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: 'Shopify credentials not configured' });
   }
 
-  const isDry      = req.query.dry  === 'true';
-  const mode       = (req.query.mode as string) ?? '';
+  const isDry       = req.query.dry === 'true';
+  const mode        = (req.query.mode as string) ?? '';
   const offsetParam = parseInt((req.query.offset as string) ?? '0', 10) || 0;
   const limitParam  = req.query.limit ? parseInt(req.query.limit as string, 10) : null;
-  const start      = Date.now();
+  const start       = Date.now();
 
   console.log(
     `🛒 Walmart sync starting${
@@ -141,6 +141,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: 'Shopify fetch failed', details: err.message });
   }
 
+  // ── mode=audit: compare Walmart vs Shopify SKUs, no writes ───────────
+  if (mode === 'audit') {
+    let listedSkus: Set<string>;
+    try {
+      console.log('🔍 Fetching Walmart-listed SKUs for audit…');
+      listedSkus = await fetchListedSkus();
+    } catch (err: any) {
+      console.error('❌ Walmart items fetch failed:', err.message);
+      return res.status(500).json({ error: 'Walmart items fetch failed', details: err.message });
+    }
+
+    const shopifySkus = new Set(items.map(i => i.sku).filter(Boolean));
+    const matched     = [...listedSkus].filter(s => shopifySkus.has(s)).length;
+
+    return res.status(200).json({
+      walmartTotal:      listedSkus.size,
+      shopifyTotal:      shopifySkus.size,
+      matched,
+      unmatchedWalmart:  [...listedSkus].filter(s => !shopifySkus.has(s)).slice(0, 20),
+      unmatchedShopify:  [...shopifySkus].filter(s => !listedSkus.has(s)).slice(0, 20),
+    });
+  }
+
   if (items.length === 0) {
     return res.status(200).json({ ok: true, message: 'No variants found', synced: 0 });
   }
@@ -153,11 +176,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     try {
       console.log('🔍 Fetching Walmart-listed SKUs…');
       const listedSkus      = await fetchListedSkus();
-      const listedSkusArray = [...listedSkus];   // preserve API iteration order
+      const listedSkusArray = [...listedSkus];
       totalListed           = listedSkusArray.length;
       listedSkuCount        = totalListed;
 
-      // Apply chunk slice when offset/limit params are present
       const skusToProcess: Set<string> = limitParam !== null
         ? new Set(listedSkusArray.slice(offsetParam, offsetParam + limitParam))
         : listedSkus;
@@ -232,12 +254,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const walmartSecs = ((Date.now() - walmartStart) / 1000).toFixed(1);
   console.log(`Walmart calls complete: ${totalPriceSuccess + totalInventorySuccess} succeeded, ${totalPriceFailed + totalInventoryFailed} failed in ${walmartSecs}s`);
 
-  const durationMs     = Date.now() - start;
-  const priceResult    = { success: totalPriceSuccess,     failed: totalPriceFailed };
+  const durationMs      = Date.now() - start;
+  const priceResult     = { success: totalPriceSuccess,     failed: totalPriceFailed };
   const inventoryResult = { success: totalInventorySuccess, failed: totalInventoryFailed };
   console.log(`✅ Walmart sync done in ${durationMs}ms`);
 
-  // ── Chunked response (when offset+limit were provided) ──────────────
+  // ── Chunked response ───────────────────────────────────────────────
   if (limitParam !== null) {
     const nextOffset = offsetParam + limitParam < totalListed ? offsetParam + limitParam : null;
     return res.status(errors.length > 0 ? 207 : 200).json({
@@ -254,7 +276,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   }
 
-  // ── Full-catalogue response (backward compatible) ────────────────
+  // ── Full-catalogue response ──────────────────────────────────────────
   return res.status(errors.length > 0 ? 207 : 200).json({
     ok:              errors.length === 0,
     totalVariants:   items.length,
