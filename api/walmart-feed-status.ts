@@ -99,6 +99,9 @@ export default async function handler(
 
     const data = await walmartRes.json();
 
+    // TEMP DIAGNOSTIC — remove after inspecting structure
+    return res.status(200).json({ raw: data });
+
     // Extract per-item errors from itemDetails if present
     const itemErrors: ItemError[] = [];
 
