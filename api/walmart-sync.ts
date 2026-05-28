@@ -158,25 +158,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.log(`🔍 [chunked] ${chunkSkus.length} SKUs in chunk (offset ${offsetParam}, limit ${limitParam} of ${totalListed})`);
 
       items = [];
-      for (const walmartSku of chunkSkus) {
-        const bareSku = walmartSku.startsWith('TIRE-') ? walmartSku.slice(5) : walmartSku;
-        try {
-          const data: any = await shopifyGet<any>(`/variants.json?sku=${encodeURIComponent(bareSku)}&fields=sku,price,inventory_quantity`);
-          const variants: any[] = data.variants ?? [];
-          if (variants.length > 0) {
-            const v = variants[0];
-            const shopifyQty = Math.max(0, (v.inventory_quantity as number) ?? 0);
-            items.push({
-              sku:        walmartSku,
-              price:      parseFloat(v.price as string) || 0,
-              shopifyQty,
-              walmartQty: shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty,
-            });
+      const BATCH = 20;
+      for (let i = 0; i < chunkSkus.length; i += BATCH) {
+        const batch = chunkSkus.slice(i, i + BATCH);
+        const results = await Promise.all(batch.map(async (walmartSku) => {
+          const bareSku = walmartSku.startsWith('TIRE-') ? walmartSku.slice(5) : walmartSku;
+          try {
+            const data: any = await shopifyGet<any>(`/variants.json?sku=${encodeURIComponent(bareSku)}&fields=sku,price,inventory_quantity`);
+            const variants: any[] = data.variants ?? [];
+            if (variants.length > 0) {
+              const v = variants[0];
+              const shopifyQty = Math.max(0, (v.inventory_quantity as number) ?? 0);
+              return {
+                sku:        walmartSku,
+                price:      parseFloat(v.price as string) || 0,
+                shopifyQty,
+                walmartQty: shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty,
+              } as SyncItem;
+            }
+          } catch (err: any) {
+            console.warn(`[chunked] Shopify lookup failed for ${bareSku}: ${err.message}`);
           }
-        } catch (err: any) {
-          console.warn(`[chunked] Shopify lookup failed for ${bareSku}: ${err.message}`);
-        }
-        await delay(100);
+          return null;
+        }));
+        items.push(...results.filter((r): r is SyncItem => r !== null));
+        await delay(200);
       }
       console.log(`[chunked] Shopify lookup complete: ${items.length} of ${chunkSkus.length} SKUs found`);
     } catch (err: any) {
