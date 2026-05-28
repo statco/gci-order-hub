@@ -84,14 +84,21 @@ async function fetchTireVariants(): Promise<SyncItem[]> {
     for (const p of products) {
       for (const v of p.variants) {
         const sku = ((v.sku as string) ?? '').toUpperCase();
+        if (!sku) continue;
 
         const shopifyQty = Math.max(0, (v.inventory_quantity as number) ?? 0);
-        items.push({
-          sku,
+        const entry = {
           price:      parseFloat(v.price as string) || 0,
           shopifyQty,
           walmartQty: shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty,
-        });
+        };
+
+        // Push bare SKU + TIRE- prefixed version so the listed filter matches
+        // regardless of which format Walmart has the item listed under.
+        items.push({ sku, ...entry });
+        if (!sku.startsWith('TIRE-')) {
+          items.push({ sku: `TIRE-${sku}`, ...entry });
+        }
       }
     }
 
