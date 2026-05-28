@@ -151,6 +151,17 @@ function vehicleTypeLabel(v: VehicleType): string {
   return map[v];
 }
 
+function walmartTitle(baseTitle: string, season: SeasonClassification): string {
+  const suffixMap: Record<SeasonClassification, string> = {
+    ALL_SEASON:  'All Season Tires',
+    ALL_WEATHER: 'All Weather Tires',
+    WINTER:      'Winter Tires',
+    SUMMER:      'Summer Tires',
+    ALL_TERRAIN: 'All Terrain Tires',
+  };
+  return `${baseTitle} ${suffixMap[season]}`;
+}
+
 function estimateShippingWeightLb(vehicleType: VehicleType): number {
   switch (vehicleType) {
     case 'LIGHT_TRUCK':   return 40;
@@ -182,7 +193,7 @@ function buildFeedItem(
 
   const season = getSeasonFromTags(product.tags);
   const vehicleType = getVehicleTypeFromTags(product.tags, parsed);
-  const description = `${product.vendor} ${parsed.model} ${parsed.fullSize} tire. Available at GCI Tires Canada.`;
+  const description = `${product.vendor} ${parsed.model} ${parsed.fullSize} tires. Available at GCI Tires Canada.`;
 
   const item: WalmartFeedItem = {
     Orderable: {
@@ -191,7 +202,7 @@ function buildFeedItem(
         productIdType: 'GTIN',
         productId: 'CUSTOM',
       },
-      productName: { en: product.title },
+      productName: { en: walmartTitle(product.title, season) },
       brand:        { en: product.vendor },
       price,
       ShippingWeight: {
