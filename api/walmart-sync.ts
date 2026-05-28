@@ -148,6 +148,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: 'Shopify fetch failed', details: err.message });
   }
 
+  // ── mode=sku-sample: inspect raw SKU formats from both sides, no writes ─
+  if (mode === 'sku-sample') {
+    let listedSkus: Set<string>;
+    try {
+      console.log('🔍 Fetching Walmart-listed SKUs for sku-sample…');
+      listedSkus = await fetchListedSkus();
+    } catch (err: any) {
+      console.error('❌ Walmart items fetch failed:', err.message);
+      return res.status(500).json({ error: 'Walmart items fetch failed', details: err.message });
+    }
+
+    const walmartArray = [...listedSkus];
+    const matched = items.filter(i => listedSkus.has(i.sku)).length;
+
+    return res.status(200).json({
+      walmartTotal:  listedSkus.size,
+      shopifyTotal:  items.length,
+      matched,
+      walmartSample: walmartArray.slice(0, 10),
+      shopifySample: items.slice(0, 10).map(i => i.sku),
+    });
+  }
+
   // ── mode=audit: compare Walmart vs Shopify SKUs, no writes ───────────
   if (mode === 'audit') {
     let listedSkus: Set<string>;
