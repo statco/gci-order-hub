@@ -77,7 +77,7 @@ async function fetchTireVariants(): Promise<SyncItem[]> {
   let sinceId = 0;
 
   while (true) {
-    const q    = `tag=${CT_SYNC_TAG}&limit=250&fields=id,variants${sinceId ? `&since_id=${sinceId}` : ''}`;
+    const q    = `tag=${CT_SYNC_TAG}&status=active&limit=250&fields=id,variants${sinceId ? `&since_id=${sinceId}` : ''}`;
     const data: any = await shopifyGet<any>(`/products.json?${q}`);
     const products  = data.products ?? [];
 
@@ -138,14 +138,60 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   );
 
   // ── Fetch Shopify data ────────────────────────────────────────────────
+  // Chunked mode=listed skips the full Shopify scan and looks up each SKU
+  // directly — reducing the per-chunk Shopify fetch from ~90s to ~30s.
+  const isChunkedListed = mode === 'listed' && limitParam !== null;
+
   let items: SyncItem[];
-  try {
-    const shopifyStart = Date.now();
-    items = await fetchTireVariants();
-    console.log(`Shopify fetch complete: ${items.length} variants in ${((Date.now() - shopifyStart) / 1000).toFixed(1)}s`);
-  } catch (err: any) {
-    console.error('❌ Shopify fetch failed:', err.message);
-    return res.status(500).json({ error: 'Shopify fetch failed', details: err.message });
+  let listedSkuCount: number | undefined;
+  let totalListed = 0;
+
+  if (isChunkedListed) {
+    try {
+      console.log('🔍 [chunked] Fetching Walmart SKU list…');
+      const allListedSkus   = await fetchListedSkus();
+      const listedSkusArray = [...allListedSkus];
+      totalListed    = listedSkusArray.length;
+      listedSkuCount = totalListed;
+
+      const chunkSkus = listedSkusArray.slice(offsetParam, offsetParam + (limitParam as number));
+      console.log(`🔍 [chunked] ${chunkSkus.length} SKUs in chunk (offset ${offsetParam}, limit ${limitParam} of ${totalListed})`);
+
+      items = [];
+      for (const walmartSku of chunkSkus) {
+        const bareSku = walmartSku.startsWith('TIRE-') ? walmartSku.slice(5) : walmartSku;
+        try {
+          const data: any = await shopifyGet<any>(`/variants.json?sku=${encodeURIComponent(bareSku)}&fields=sku,price,inventory_quantity`);
+          const variants: any[] = data.variants ?? [];
+          if (variants.length > 0) {
+            const v = variants[0];
+            const shopifyQty = Math.max(0, (v.inventory_quantity as number) ?? 0);
+            items.push({
+              sku:        walmartSku,
+              price:      parseFloat(v.price as string) || 0,
+              shopifyQty,
+              walmartQty: shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty,
+            });
+          }
+        } catch (err: any) {
+          console.warn(`[chunked] Shopify lookup failed for ${bareSku}: ${err.message}`);
+        }
+        await delay(100);
+      }
+      console.log(`[chunked] Shopify lookup complete: ${items.length} of ${chunkSkus.length} SKUs found`);
+    } catch (err: any) {
+      console.error('❌ Chunked listed fetch failed:', err.message);
+      return res.status(500).json({ error: 'Chunked fetch failed', details: err.message });
+    }
+  } else {
+    try {
+      const shopifyStart = Date.now();
+      items = await fetchTireVariants();
+      console.log(`Shopify fetch complete: ${items.length} variants in ${((Date.now() - shopifyStart) / 1000).toFixed(1)}s`);
+    } catch (err: any) {
+      console.error('❌ Shopify fetch failed:', err.message);
+      return res.status(500).json({ error: 'Shopify fetch failed', details: err.message });
+    }
   }
 
   // ── mode=sku-sample: inspect raw SKU formats from both sides, no writes ─
@@ -198,11 +244,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).json({ ok: true, message: 'No variants found', synced: 0 });
   }
 
-  // ── mode=listed: filter to only Walmart-listed SKUs ──────────────────
-  let listedSkuCount: number | undefined;
-  let totalListed = 0;
-
-  if (mode === 'listed') {
+  // ── mode=listed (full scan): filter to only Walmart-listed SKUs ─────
+  if (mode === 'listed' && limitParam === null) {
     try {
       console.log('🔍 Fetching Walmart-listed SKUs…');
       const listedSkus      = await fetchListedSkus();
