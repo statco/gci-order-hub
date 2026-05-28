@@ -271,7 +271,7 @@ export async function fetchListedSkus(): Promise<Set<string>> {
 
     for (const item of itemList) {
       const sku = (item.sku ?? '') as string;
-      if (sku) skus.add(sku);
+      if (sku) skus.add(sku.toUpperCase());
     }
 
     page++;
