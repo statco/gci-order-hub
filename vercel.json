@@ -29,6 +29,7 @@
     { "path": "/api/walmart-sync?mode=listed&offset=2100&limit=300", "schedule": "35 9 * * *" },
     { "path": "/api/walmart-sync?mode=listed&offset=2400&limit=300", "schedule": "40 9 * * *" },
     { "path": "/api/walmart-order-sync",                             "schedule": "*/15 * * * *" },
+    { "path": "/api/walmart-price-audit",                            "schedule": "0 10 * * *"  },
     { "path": "/api/ct-tracking-parser",                             "schedule": "*/30 * * * *" }
   ],
   "headers": [

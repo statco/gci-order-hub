@@ -170,8 +170,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'GET only' });
 
   const dryRun = req.query.dryRun === 'true';
+  const isCron = req.headers['x-vercel-cron'] === '1';
   const offset = parseInt(req.query.offset as string ?? '0', 10) || 0;
-  const limit = parseInt(req.query.limit as string ?? '300', 10) || 300;
+  const limit = isCron ? 99999 : (parseInt(req.query.limit as string ?? '300', 10) || 300);
 
   try {
     const token = await getWalmartToken();
