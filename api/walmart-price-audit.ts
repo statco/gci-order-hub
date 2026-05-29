@@ -153,6 +153,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'GET only' });
 
   const dryRun = req.query.dryRun === 'true';
+  const offset = parseInt(req.query.offset as string ?? '0', 10) || 0;
+  const limit = parseInt(req.query.limit as string ?? '300', 10) || 300;
 
   try {
     const token = await getWalmartToken();
@@ -168,7 +170,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const flagged: AuditRow[] = [];
     const clean: number[] = [];
 
-    for (const { sku, price: walmartPrice } of walmartItems) {
+    const pagedItems = walmartItems.slice(offset, offset + limit);
+
+    for (const { sku, price: walmartPrice } of pagedItems) {
       const shopifyPrice = shopifyPrices.get(sku);
       if (!shopifyPrice) continue; // no Shopify match — skip
 
@@ -205,7 +209,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     return res.status(200).json({
       dryRun,
-      totalChecked: walmartItems.length,
+      totalItems: walmartItems.length,
+      offset,
+      limit,
+      nextOffset: offset + limit < walmartItems.length ? offset + limit : null,
+      totalChecked: pagedItems.length,
       matched: flagged.length + clean.length,
       flaggedCount: flagged.length,
       cleanCount: clean.length,
