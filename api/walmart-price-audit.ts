@@ -191,9 +191,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const flagged: AuditRow[] = [];
     const clean: number[] = [];
 
-    const pagedItems = walmartItems.slice(offset, offset + limit);
-
-    for (const { sku, price: walmartPrice } of pagedItems) {
+    for (const { sku, price: walmartPrice } of walmartItems) {
       const shopifyPrice = shopifyPrices.get(sku);
       if (!shopifyPrice) continue; // no Shopify match — skip
 
@@ -208,15 +206,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           corrected: false,
         };
 
-        if (!dryRun) {
-          try {
-            await correctWalmartPrice(token, sku, shopifyPrice);
-            row.corrected = true;
-          } catch (e: unknown) {
-            row.error = e instanceof Error ? e.message : String(e);
-          }
-        }
-
         flagged.push(row);
       } else {
         clean.push(walmartPrice);
@@ -226,20 +215,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Sort worst discrepancy first
     flagged.sort((a, b) => b.pctBelow - a.pctBelow);
 
-    console.log(`[walmart-price-audit] Flagged: ${flagged.length} | Clean: ${clean.length} | dryRun: ${dryRun}`);
+    // Paginate corrections on the flagged array, not walmartItems
+    const pagedFlagged = flagged.slice(offset, offset + limit);
+
+    if (!dryRun) {
+      for (const row of pagedFlagged) {
+        try {
+          await correctWalmartPrice(token, row.sku, row.shopifyPrice);
+          row.corrected = true;
+        } catch (e: unknown) {
+          row.error = e instanceof Error ? e.message : String(e);
+        }
+      }
+    }
+
+    console.log(`[walmart-price-audit] Flagged: ${flagged.length} | Paged: ${pagedFlagged.length} | Corrected: ${pagedFlagged.filter(r => r.corrected).length} | dryRun: ${dryRun}`);
 
     return res.status(200).json({
       dryRun,
       totalItems: walmartItems.length,
+      totalFlagged: flagged.length,
       offset,
       limit,
-      nextOffset: offset + limit < walmartItems.length ? offset + limit : null,
-      totalChecked: pagedItems.length,
-      matched: flagged.length + clean.length,
-      flaggedCount: flagged.length,
+      nextOffset: offset + limit < flagged.length ? offset + limit : null,
+      pagedFlaggedCount: pagedFlagged.length,
+      corrected: pagedFlagged.filter(r => r.corrected).length,
       cleanCount: clean.length,
-      corrected: flagged.filter(r => r.corrected).length,
-      flagged,
+      flagged: pagedFlagged,
     });
 
   } catch (err: unknown) {
