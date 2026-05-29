@@ -69,7 +69,7 @@ async function fetchListedItemsWithPrices(
 
   while (offset < totalItems) {
     const res = await fetch(
-      `${WALMART_BASE}/v3/ca/items?limit=${PAGE_SIZE}&offset=${offset}&publishedStatus=PUBLISHED&lifecycleStatus=ACTIVE`,
+      `${WALMART_BASE}/v3/items?limit=${PAGE_SIZE}&offset=${offset}&publishedStatus=PUBLISHED&lifecycleStatus=ACTIVE`,
       {
         headers: {
           'WM_SEC.ACCESS_TOKEN':    token,
