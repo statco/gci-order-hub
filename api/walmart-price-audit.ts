@@ -33,15 +33,25 @@ interface AuditRow {
 
 async function fetchShopifyPriceMap(): Promise<Map<string, number>> {
   const map = new Map<string, number>();
-  let url = `https://${SHOPIFY_STORE}/admin/api/2024-01/variants.json?limit=250&fields=sku,price`;
+  let pageInfo: string | null = null;
+  let hasMore = true;
 
-  while (url) {
-    const res = await fetch(url, {
-      headers: {
-        'X-Shopify-Access-Token': SHOPIFY_TOKEN,
-        'Content-Type': 'application/json',
-      },
+  while (hasMore) {
+    const params = new URLSearchParams({
+      limit: '250',
+      fields: 'sku,price',
     });
+    if (pageInfo) params.set('page_info', pageInfo);
+
+    const res = await fetch(
+      `https://${SHOPIFY_STORE}/admin/api/2024-01/variants.json?${params}`,
+      {
+        headers: {
+          'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
     if (!res.ok) throw new Error(`Shopify variants error: ${res.status}`);
     const data = await res.json();
 
@@ -49,10 +59,13 @@ async function fetchShopifyPriceMap(): Promise<Map<string, number>> {
       if (v.sku) map.set(v.sku.toUpperCase(), parseFloat(v.price));
     }
 
-    // Pagination via Link header
     const link = res.headers.get('Link') ?? '';
-    const next = link.match(/<([^>]+)>;\s*rel="next"/)?.[1] ?? null;
-    url = next ?? '';
+    const nextMatch = link.match(/<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"/);
+    if (nextMatch) {
+      pageInfo = nextMatch[1];
+    } else {
+      hasMore = false;
+    }
   }
 
   return map;
