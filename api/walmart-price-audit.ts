@@ -179,10 +179,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     console.log('[walmart-price-audit] Fetching Walmart listed items with prices...');
     const walmartItems = await fetchListedItemsWithPrices(token);
     console.log(`[walmart-price-audit] Got ${walmartItems.length} Walmart items with prices`);
+    const debugSku = 'TIRE-170034002';
+    const debugWalmart = walmartItems.find(i => i.sku === debugSku);
+    console.log(`[walmart-price-audit] DEBUG ${debugSku} → walmart: ${debugWalmart ? debugWalmart.price : 'NOT FOUND'}`);
 
     console.log('[walmart-price-audit] Fetching Shopify price map...');
     const shopifyPrices = await fetchShopifyPriceMap();
     console.log(`[walmart-price-audit] Got ${shopifyPrices.size} Shopify variant prices`);
+    console.log(`[walmart-price-audit] DEBUG ${debugSku} → shopify: ${shopifyPrices.get(debugSku) ?? 'NOT FOUND'}`);
 
     const flagged: AuditRow[] = [];
     const clean: number[] = [];
