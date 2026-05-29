@@ -37,7 +37,7 @@ async function fetchShopifyPriceMap(): Promise<Map<string, number>> {
   let hasMore = true;
 
   while (hasMore) {
-    const query = `{
+    const query: string = `{
       productVariants(first: 250${cursor ? `, after: "${cursor}"` : ''}) {
         pageInfo { hasNextPage endCursor }
         edges {
@@ -46,7 +46,7 @@ async function fetchShopifyPriceMap(): Promise<Map<string, number>> {
       }
     }`;
 
-    const res = await fetch(
+    const res: Response = await fetch(
       `https://${SHOPIFY_STORE}/admin/api/2024-01/graphql.json`,
       {
         method: 'POST',
@@ -58,9 +58,9 @@ async function fetchShopifyPriceMap(): Promise<Map<string, number>> {
       }
     );
     if (!res.ok) throw new Error(`Shopify GraphQL error: ${res.status}`);
-    const data = await res.json();
+    const data: any = await res.json();
 
-    const variants = data?.data?.productVariants;
+    const variants: any = data?.data?.productVariants;
     if (!variants) throw new Error('Shopify GraphQL: unexpected response shape');
 
     for (const edge of variants.edges) {
