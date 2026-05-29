@@ -33,39 +33,43 @@ interface AuditRow {
 
 async function fetchShopifyPriceMap(): Promise<Map<string, number>> {
   const map = new Map<string, number>();
-  let pageInfo: string | null = null;
+  let cursor: string | null = null;
   let hasMore = true;
 
   while (hasMore) {
-    const params = new URLSearchParams({
-      limit: '250',
-      fields: 'sku,price',
-    });
-    if (pageInfo) params.set('page_info', pageInfo);
+    const query = `{
+      productVariants(first: 250${cursor ? `, after: "${cursor}"` : ''}) {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node { sku price }
+        }
+      }
+    }`;
 
     const res = await fetch(
-      `https://${SHOPIFY_STORE}/admin/api/2024-01/variants.json?${params}`,
+      `https://${SHOPIFY_STORE}/admin/api/2024-01/graphql.json`,
       {
+        method: 'POST',
         headers: {
           'X-Shopify-Access-Token': SHOPIFY_TOKEN,
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({ query }),
       }
     );
-    if (!res.ok) throw new Error(`Shopify variants error: ${res.status}`);
+    if (!res.ok) throw new Error(`Shopify GraphQL error: ${res.status}`);
     const data = await res.json();
 
-    for (const v of data.variants ?? []) {
-      if (v.sku) map.set(v.sku.toUpperCase(), parseFloat(v.price));
+    const variants = data?.data?.productVariants;
+    if (!variants) throw new Error('Shopify GraphQL: unexpected response shape');
+
+    for (const edge of variants.edges) {
+      const { sku, price } = edge.node;
+      if (sku) map.set(sku.toUpperCase(), parseFloat(price));
     }
 
-    const link = res.headers.get('Link') ?? '';
-    const nextMatch = link.match(/<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"/);
-    if (nextMatch) {
-      pageInfo = nextMatch[1];
-    } else {
-      hasMore = false;
-    }
+    hasMore = variants.pageInfo.hasNextPage;
+    cursor = variants.pageInfo.endCursor;
   }
 
   return map;
