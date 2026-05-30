@@ -80,13 +80,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const holdExposed = req.query.holdExposed !== 'false';
 
   try {
-    console.log('[reconcile] Fetching Shopify variants (price, cost, inventory)…');
-    const shopify = await fetchAllShopifyVariants();
-    console.log(`[reconcile] ${shopify.size} Shopify variants`);
-
-    console.log('[reconcile] Fetching Walmart listed items…');
-    const walmartItems = await fetchWalmartItems();
-    console.log(`[reconcile] ${walmartItems.length} Walmart listed items`);
+    console.log('[reconcile] Fetching Shopify variants + Walmart listed items in parallel…');
+    const [shopify, walmartItems] = await Promise.all([
+      fetchAllShopifyVariants(),
+      fetchWalmartItems(),
+    ]);
+    console.log(`[reconcile] ${shopify.size} Shopify variants, ${walmartItems.length} Walmart listed items`);
 
     // Only operate on SKUs that exist on both sides.
     const matched = walmartItems.filter(w => shopify.has(w.sku));
