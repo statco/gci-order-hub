@@ -31,19 +31,9 @@ const WRITE_CONCURRENCY = 6;     // parallel Walmart writes per batch
 
 async function fetchWalmartItems(): Promise<Array<{ sku: string; price: number | null }>> {
   const items: Array<{ sku: string; price: number | null }> = [];
-  let offset = 0;
-  let totalItems = Infinity;
 
-  while (offset < totalItems) {
-    const data: any = await walmartFetch<any>(
-      `/v3/items?limit=${PAGE_SIZE}&offset=${offset}&publishedStatus=PUBLISHED&lifecycleStatus=ACTIVE`,
-    );
-
-    if (offset === 0) totalItems = data?.totalItems ?? 0;
-
+  const collect = (data: any): number => {
     const page: any[] = data?.ItemResponse ?? data?.items ?? [];
-    if (page.length === 0) break;
-
     for (const item of page) {
       const sku = (item.sku ?? item.mart?.sku ?? '').toUpperCase();
       const price =
@@ -54,8 +44,25 @@ async function fetchWalmartItems(): Promise<Array<{ sku: string; price: number |
         null;
       if (sku) items.push({ sku, price: price != null ? parseFloat(price) : null });
     }
+    return page.length;
+  };
 
-    offset += PAGE_SIZE;
+  const pageUrl = (offset: number) =>
+    `/v3/items?limit=${PAGE_SIZE}&offset=${offset}&publishedStatus=PUBLISHED&lifecycleStatus=ACTIVE`;
+
+  // Page 1 first to learn totalItems, then fetch the remaining pages in parallel.
+  const first: any = await walmartFetch<any>(pageUrl(0));
+  const firstCount = collect(first);
+  const totalItems = first?.totalItems ?? firstCount;
+
+  const offsets: number[] = [];
+  for (let o = PAGE_SIZE; o < totalItems; o += PAGE_SIZE) offsets.push(o);
+
+  const FETCH_CONCURRENCY = 5;
+  for (let i = 0; i < offsets.length; i += FETCH_CONCURRENCY) {
+    const batch = offsets.slice(i, i + FETCH_CONCURRENCY);
+    const pages = await Promise.all(batch.map(o => walmartFetch<any>(pageUrl(o))));
+    pages.forEach(collect);
   }
 
   return items;
