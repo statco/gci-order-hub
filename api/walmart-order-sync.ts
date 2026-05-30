@@ -104,7 +104,7 @@ async function sendTelegram(message: string): Promise<void> {
   });
 }
 
-function buildTelegramMessage(orders: WalmartOrder[], ackedIds: Set<string>): string {
+function buildTelegramMessage(orders: WalmartOrder[]): string {
   const header =
     orders.length === 1
       ? `🚨 <b>1 New Walmart Order</b>`
@@ -112,8 +112,8 @@ function buildTelegramMessage(orders: WalmartOrder[], ackedIds: Set<string>): st
 
   const blocks = orders.map((order) => {
     const addr = order.shippingInfo?.postalAddress;
-    const acked = ackedIds.has(order.purchaseOrderId);
     const lines = order.orderLines?.orderLine ?? [];
+    const total = lines.reduce((sum, l) => sum + getLinePrice(l), 0);
 
     const linesSummary = lines
       .map((line) => {
@@ -128,7 +128,7 @@ function buildTelegramMessage(orders: WalmartOrder[], ackedIds: Set<string>): st
       `📦 Items:\n${linesSummary}\n` +
       `👤 ${addr?.name ?? 'Unknown'}\n` +
       `📍 ${addr ? formatAddress(addr) : 'Unknown'}\n` +
-      `✅ Acknowledged: ${acked ? 'Yes' : '⚠️ FAILED — acknowledge manually'}`
+      `💰 Total: $${total.toFixed(2)} CAD`
     );
   });
 
@@ -158,11 +158,16 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
 
     console.log(`[order-sync] ${newOrders.length} new order(s) to process`);
 
+    // 1. Alert fires immediately — before acknowledge or sheet log — so it
+    //    reaches the team even if any downstream step fails.
+    await sendTelegram(buildTelegramMessage(newOrders));
+    console.log('[order-sync] Telegram alert sent');
+
     const ackedIds = new Set<string>();
     const rows: string[][] = [];
 
     for (const order of newOrders) {
-      // 1. Acknowledge on Walmart (must be within 4 hrs)
+      // 2. Acknowledge on Walmart (must be within 4 hrs)
       const acked = await acknowledgeOrder(token, order.purchaseOrderId);
       if (acked) ackedIds.add(order.purchaseOrderId);
       console.log(`[order-sync] ${order.purchaseOrderId} acknowledged: ${acked}`);
@@ -173,7 +178,7 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
       const orderDate = new Date(order.orderDate).toISOString();
       const orderLines = order.orderLines?.orderLine ?? [];
 
-      // 2. One row per order line
+      // 3. One row per order line
       for (const line of orderLines) {
         rows.push([
           order.purchaseOrderId,        // order_id
@@ -193,14 +198,9 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
       }
     }
 
-    // 3. Log to sheet
+    // 4. Log to sheet
     await appendSheetRows(SHEET_ID, rows);
     console.log(`[order-sync] Logged ${rows.length} row(s) to sheet`);
-
-    // 4. Batched Telegram notification
-    const message = buildTelegramMessage(newOrders, ackedIds);
-    await sendTelegram(message);
-    console.log('[order-sync] Telegram sent');
 
     return res.status(200).json({
       newOrders: newOrders.length,
