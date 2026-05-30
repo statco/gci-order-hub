@@ -35,6 +35,8 @@ import {
   type WalmartPriceItem,
   type WalmartInventoryItem,
 } from './lib/walmart-client';
+import { fetchAllShopifyVariants } from './lib/shopify';
+import { safeWalmartPrice } from './lib/pricing';
 
 export const config = { maxDuration: 300 };
 
@@ -68,6 +70,7 @@ async function shopifyGet<T>(path: string): Promise<T> {
 interface SyncItem {
   sku:          string;
   price:        number;
+  cost:         number | null;   // attached from the GraphQL variant map (for the Layer 1 floor)
   shopifyQty:   number;
   walmartQty:   number;
 }
@@ -89,6 +92,7 @@ async function fetchTireVariants(): Promise<SyncItem[]> {
         const shopifyQty = Math.max(0, (v.inventory_quantity as number) ?? 0);
         const entry = {
           price:      parseFloat(v.price as string) || 0,
+          cost:       null as number | null,  // enriched post-fetch from the GraphQL variant map
           shopifyQty,
           walmartQty: shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty,
         };
@@ -172,6 +176,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               return {
                 sku:        walmartSku,
                 price:      parseFloat(v.price as string) || 0,
+                cost:       null,  // enriched post-fetch from the GraphQL variant map
                 shopifyQty,
                 walmartQty: shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty,
               } as SyncItem;
@@ -277,6 +282,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // ── Enrich with cost (LAYER 1 floor needs it) ───────────────────────
+  // Cost lives on InventoryItem.unitCost in GraphQL — not returned by the
+  // REST product/variant calls above. Fetch it once and attach by SKU.
+  try {
+    const variantMap = await fetchAllShopifyVariants();
+    for (const i of items) {
+      const v = variantMap.get(i.sku) ?? variantMap.get(i.sku.replace(/^TIRE-/, ''));
+      i.cost = v?.cost ?? null;
+    }
+    const withCost = items.filter(i => i.cost != null).length;
+    console.log(`💲 Cost enrichment: ${withCost}/${items.length} variants have a cost`);
+  } catch (err: any) {
+    console.error('❌ Cost enrichment failed (prices will be skipped without cost):', err.message);
+  }
+
   const safetyZeroed = items.filter(i => i.shopifyQty > 0 && i.walmartQty === 0).length;
   console.log(`🛡️  Safety-zeroed: ${safetyZeroed} items (qty < ${LOW_STOCK_CUTOFF})`);
 
@@ -290,6 +310,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       sample:       items.slice(0, 5).map(i => ({
         sku:        i.sku,
         price:      i.price,
+        cost:       i.cost,
+        safePrice:  safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost }),
         shopifyQty: i.shopifyQty,
         walmartQty: i.walmartQty,
       })),
@@ -297,13 +319,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // ── Push to Walmart ──────────────────────────────────────────────
-  const priceItems:     WalmartPriceItem[]     = items.map(i => ({ sku: i.sku, price: i.price }));
+  const priceItems:     WalmartPriceItem[]     = items.map(i => ({ sku: i.sku, price: i.price, cost: i.cost }));
   const inventoryItems: WalmartInventoryItem[] = items.map(i => ({ sku: i.sku, quantity: i.walmartQty }));
 
   let totalPriceSuccess     = 0;
   let totalPriceFailed      = 0;
   let totalInventorySuccess = 0;
   let totalInventoryFailed  = 0;
+  const skippedNoCost: string[] = [];
   const errors: string[]    = [];
 
   const walmartStart = Date.now();
@@ -313,6 +336,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const result = await bulkPriceFeed(chunk);
       totalPriceSuccess += result.success;
       totalPriceFailed  += result.failed;
+      if (result.skippedNoCost) skippedNoCost.push(...result.skippedNoCost);
     } catch (err: any) {
       errors.push(`price chunk: ${err.message}`);
     }
@@ -350,6 +374,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       done:           nextOffset === null,
       priceResult,
       inventoryResult,
+      skippedNoCostCount: skippedNoCost.length,
+      skippedNoCost:      skippedNoCost.slice(0, 100),
       durationMs,
       ...(errors.length ? { errors } : {}),
     });
@@ -363,6 +389,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ...(listedSkuCount !== undefined ? { listedSkuCount } : {}),
     priceResult,
     inventoryResult,
+    skippedNoCostCount: skippedNoCost.length,
+    skippedNoCost:      skippedNoCost.slice(0, 100),
     durationMs,
     ...(errors.length ? { errors } : {}),
   });

@@ -14,6 +14,8 @@
 // Docs: https://developer.walmart.com/global-marketplace
 // ─────────────────────────────────────────────────────────────
 
+import { safeWalmartPrice, assertAboveCost } from './pricing.js';
+
 const WALMART_BASE = (
   process.env.WALMART_BASE_URL ?? 'https://marketplace.walmartapis.com'
 ).replace(/\/$/, '');
@@ -125,7 +127,8 @@ export async function walmartFetch<T>(path: string, options: RequestInit = {}): 
 
 export interface WalmartPriceItem {
   sku:   string;
-  price: number;   // CAD, two decimal places
+  price: number;          // CAD — candidate Shopify price (pre-floor)
+  cost?: number | null;   // unit cost; required for the floor to apply. Missing → SKIP.
 }
 
 export interface WalmartInventoryItem {
@@ -136,14 +139,30 @@ export interface WalmartInventoryItem {
 export interface BulkFeedResult {
   success: number;
   failed:  number;
+  skippedNoCost?: string[];  // SKUs skipped because cost was missing/invalid
 }
 
 // ─── PUBLIC METHODS ───────────────────────────────────────────────
 
 /**
  * Update price for a single SKU.
+ *
+ * LAYER 1: routes through safeWalmartPrice(). If cost is missing/invalid
+ * the write is SKIPPED (returns false) — never guess a price. A final
+ * assertion blocks any below-cost amount before the PUT.
+ *
+ * @returns true if the price was written, false if it was skipped.
  */
-export async function updatePrice(item: WalmartPriceItem): Promise<void> {
+export async function updatePrice(item: WalmartPriceItem): Promise<boolean> {
+  const safe = safeWalmartPrice({ shopifyPrice: item.price, cost: item.cost ?? null });
+  if (safe == null) {
+    console.warn(`[price] SKIP ${item.sku}: no valid cost — cannot guarantee safe price`);
+    return false;
+  }
+
+  const amount = parseFloat(safe.toFixed(2));
+  assertAboveCost(item.sku, amount, item.cost ?? null);
+
   await walmartFetch<any>('/v3/price', {
     method: 'PUT',
     body:   JSON.stringify({
@@ -152,11 +171,12 @@ export async function updatePrice(item: WalmartPriceItem): Promise<void> {
         currentPriceType: 'BASE',
         currentPrice: {
           currency: 'CAD',
-          amount:   parseFloat(item.price.toFixed(2)),
+          amount,
         },
       }],
     }),
   });
+  return true;
 }
 
 /**
@@ -179,8 +199,20 @@ export async function bulkPriceFeed(
   let success            = 0;
   let failed             = 0;
   let firstSuccessLogged = false;
+  const skippedNoCost: string[] = [];
 
   for (const i of items) {
+    // LAYER 1: the floor is the only way a price is computed.
+    const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost ?? null });
+    if (safe == null) {
+      skippedNoCost.push(i.sku);
+      continue;
+    }
+
+    const amount = parseFloat(safe.toFixed(2));
+    // Defense in depth — a below-cost amount throws rather than ships.
+    assertAboveCost(i.sku, amount, i.cost ?? null);
+
     const { status, ok, body } = await walmartFetchRaw('/v3/price', {
       method: 'PUT',
       body: JSON.stringify({
@@ -189,7 +221,7 @@ export async function bulkPriceFeed(
           currentPriceType: 'BASE',
           currentPrice: {
             currency: 'CAD',
-            amount: parseFloat(i.price.toFixed(2)),
+            amount,
           },
         }],
       }),
@@ -207,8 +239,8 @@ export async function bulkPriceFeed(
     }
   }
 
-  console.log(`✅ Walmart price: ${success} updated, ${failed} failed`);
-  return { success, failed };
+  console.log(`✅ Walmart price: ${success} updated, ${failed} failed, ${skippedNoCost.length} skipped (no cost)`);
+  return { success, failed, skippedNoCost };
 }
 
 export async function bulkInventoryFeed(
