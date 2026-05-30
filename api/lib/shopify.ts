@@ -16,7 +16,8 @@ const API_VERSION   = '2024-01';
 export interface ShopifyVariantData {
   sku: string;                       // UPPER-cased
   price: number | null;
-  cost: number | null;              // InventoryItem.unitCost.amount
+  cost: number | null;              // InventoryItem.unitCost.amount — what the floor reads
+  ctCost: number | null;            // canada_tire.cost metafield — raw CT dealer cost (for divergence checks)
   inventoryQuantity: number | null;
 }
 
@@ -46,6 +47,9 @@ export async function fetchAllShopifyVariants(): Promise<Map<string, ShopifyVari
             price
             inventoryQuantity
             inventoryItem { unitCost { amount } }
+            product {
+              ctCost: metafield(namespace: "canada_tire", key: "cost") { value }
+            }
           }
         }
       }
@@ -81,10 +85,12 @@ export async function fetchAllShopifyVariants(): Promise<Map<string, ShopifyVari
       if (!sku) continue;
 
       const rawCost = node.inventoryItem?.unitCost?.amount;
+      const rawCt   = node.product?.ctCost?.value;
       map.set(sku, {
         sku,
         price: node.price != null ? parseFloat(node.price) : null,
         cost: rawCost != null ? parseFloat(rawCost) : null,
+        ctCost: rawCt != null ? parseFloat(rawCt) : null,
         inventoryQuantity: node.inventoryQuantity != null ? Number(node.inventoryQuantity) : null,
       });
     }

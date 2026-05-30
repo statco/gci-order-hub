@@ -22,9 +22,11 @@ import { walmartFetch, updatePrice, updateInventory } from './lib/walmart-client
 import { fetchAllShopifyVariants } from './lib/shopify.js';
 import { safeWalmartPrice } from './lib/pricing.js';
 
-const PAGE_SIZE        = 200;
-const LOW_STOCK_CUTOFF = 4;     // Shopify qty below this → Walmart qty = 0
-const PRICE_EPSILON    = 0.01;  // treat sub-cent differences as equal
+const PAGE_SIZE            = 200;
+const LOW_STOCK_CUTOFF     = 4;     // Shopify qty below this → Walmart qty = 0
+const PRICE_EPSILON        = 0.01;  // treat sub-cent differences as equal
+const DIVERGENCE_THRESHOLD = 0.10;  // unitCost vs CT cost > 10% → suspect cost data
+const WRITE_CONCURRENCY    = 6;     // parallel Walmart writes per batch
 
 // ─── Walmart: list every published+active item with its current price ──────────
 
@@ -71,6 +73,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const isCron = req.headers['x-vercel-cron'] === '1';
   const offset = parseInt((req.query.offset as string) ?? '0', 10) || 0;
   const limit  = isCron ? 99999 : (parseInt((req.query.limit as string) ?? '500', 10) || 500);
+  // Hold (skip the price write for) SKUs whose stored cost diverges from the
+  // CT cost — their floor would be computed off a suspect cost basis.
+  // Inventory is still pushed. Default ON; pass holdDiverged=false to override.
+  const holdDiverged = req.query.holdDiverged !== 'false';
 
   try {
     console.log('[reconcile] Fetching Shopify variants (price, cost, inventory)…');
@@ -88,25 +94,35 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let priceCorrected     = 0;
     let inventoryCorrected = 0;
     const skippedNoCost: string[]                 = [];
+    const heldDiverged: string[]                  = [];
     const errors: Array<{ sku: string; error: string }> = [];
 
-    for (const w of page) {
+    // Process one matched SKU: correct price (unless held) + push inventory.
+    async function processSku(w: { sku: string; price: number | null }): Promise<void> {
       const sv = shopify.get(w.sku)!;
 
-      // ── Price (Layer 1 floor) ──────────────────────────────────────────
+      // ── Price (Layer 1 floor + hold-diverged guard) ────────────────────
       const safe = safeWalmartPrice({ shopifyPrice: sv.price, cost: sv.cost });
       if (safe == null) {
         skippedNoCost.push(w.sku);
-      } else if (w.price == null || Math.abs(safe - w.price) >= PRICE_EPSILON) {
-        if (!dryRun) {
-          try {
-            const written = await updatePrice({ sku: w.sku, price: sv.price ?? safe, cost: sv.cost });
-            if (written) priceCorrected++;
-          } catch (e: unknown) {
-            errors.push({ sku: w.sku, error: e instanceof Error ? e.message : String(e) });
+      } else {
+        const divergent =
+          sv.ctCost != null && sv.ctCost > 0 && sv.cost != null &&
+          Math.abs(sv.cost - sv.ctCost) / sv.ctCost > DIVERGENCE_THRESHOLD;
+
+        if (holdDiverged && divergent) {
+          heldDiverged.push(w.sku); // suspect cost basis — hold price, still push inventory
+        } else if (w.price == null || Math.abs(safe - w.price) >= PRICE_EPSILON) {
+          if (!dryRun) {
+            try {
+              const written = await updatePrice({ sku: w.sku, price: sv.price ?? safe, cost: sv.cost });
+              if (written) priceCorrected++;
+            } catch (e: unknown) {
+              errors.push({ sku: w.sku, error: e instanceof Error ? e.message : String(e) });
+            }
+          } else {
+            priceCorrected++;
           }
-        } else {
-          priceCorrected++;
         }
       }
 
@@ -125,15 +141,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
+    // Bounded-concurrency sweep so a paginated live run fits in the timeout.
+    for (let i = 0; i < page.length; i += WRITE_CONCURRENCY) {
+      await Promise.all(page.slice(i, i + WRITE_CONCURRENCY).map(processSku));
+    }
+
     const nextOffset = offset + limit < matched.length ? offset + limit : null;
 
     console.log(
       `[reconcile] matched=${matched.length} paged=${page.length} priceCorrected=${priceCorrected} ` +
-      `inventoryPushed=${inventoryCorrected} skippedNoCost=${skippedNoCost.length} errors=${errors.length} dryRun=${dryRun}`,
+      `inventoryPushed=${inventoryCorrected} heldDiverged=${heldDiverged.length} ` +
+      `skippedNoCost=${skippedNoCost.length} errors=${errors.length} dryRun=${dryRun}`,
     );
 
     return res.status(errors.length ? 207 : 200).json({
       dryRun,
+      holdDiverged,
       totalMatched:       matched.length,
       processed:          page.length,
       offset,
@@ -141,6 +164,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       nextOffset,
       priceCorrected,
       inventoryCorrected,
+      heldDivergedCount:  heldDiverged.length,
+      heldDiverged:       heldDiverged.slice(0, 200),
       skippedNoCostCount: skippedNoCost.length,
       skippedNoCost:      skippedNoCost.slice(0, 200),
       errorCount:         errors.length,
