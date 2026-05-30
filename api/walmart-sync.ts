@@ -36,7 +36,7 @@ import {
   type WalmartInventoryItem,
 } from './lib/walmart-client';
 import { fetchAllShopifyVariants } from './lib/shopify';
-import { safeWalmartPrice } from './lib/pricing';
+import { safeWalmartPrice, PRICE_FLOOR_MULTIPLIER } from './lib/pricing';
 
 export const config = { maxDuration: 300 };
 
@@ -71,6 +71,7 @@ interface SyncItem {
   sku:          string;
   price:        number;
   cost:         number | null;   // attached from the GraphQL variant map (for the Layer 1 floor)
+  ctCost:       number | null;   // canada_tire.cost metafield — for the exposure hold
   shopifyQty:   number;
   walmartQty:   number;
 }
@@ -93,6 +94,7 @@ async function fetchTireVariants(): Promise<SyncItem[]> {
         const entry = {
           price:      parseFloat(v.price as string) || 0,
           cost:       null as number | null,  // enriched post-fetch from the GraphQL variant map
+          ctCost:     null as number | null,  // enriched post-fetch (canada_tire.cost)
           shopifyQty,
           walmartQty: shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty,
         };
@@ -177,6 +179,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 sku:        walmartSku,
                 price:      parseFloat(v.price as string) || 0,
                 cost:       null,  // enriched post-fetch from the GraphQL variant map
+                ctCost:     null,  // enriched post-fetch (canada_tire.cost)
                 shopifyQty,
                 walmartQty: shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty,
               } as SyncItem;
@@ -290,6 +293,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     for (const i of items) {
       const v = variantMap.get(i.sku) ?? variantMap.get(i.sku.replace(/^TIRE-/, ''));
       i.cost = v?.cost ?? null;
+      i.ctCost = v?.ctCost ?? null;
     }
     const withCost = items.filter(i => i.cost != null).length;
     console.log(`💲 Cost enrichment: ${withCost}/${items.length} variants have a cost`);
@@ -319,7 +323,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // ── Push to Walmart ──────────────────────────────────────────────
-  const priceItems:     WalmartPriceItem[]     = items.map(i => ({ sku: i.sku, price: i.price, cost: i.cost }));
+  // Exposure hold: skip the price write for any SKU where the price we'd push
+  // is below (true CT cost × floor) — i.e. a halved/suspect stored cost would
+  // leave us under true cost. Inventory is still pushed. Mirrors reconcile's
+  // holdExposed; auto-releases once the stored Shopify cost is corrected.
+  const isExposed = (i: SyncItem): boolean => {
+    if (i.ctCost == null || i.ctCost <= 0) return false;
+    const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost });
+    return safe != null && safe < i.ctCost * PRICE_FLOOR_MULTIPLIER;
+  };
+  const heldExposed: string[] = items.filter(isExposed).map(i => i.sku);
+  if (heldExposed.length) {
+    console.log(`⏸️  Exposure-held (price skipped, suspect cost): ${heldExposed.length} SKUs`);
+  }
+
+  const priceItems:     WalmartPriceItem[]     = items.filter(i => !isExposed(i)).map(i => ({ sku: i.sku, price: i.price, cost: i.cost }));
   const inventoryItems: WalmartInventoryItem[] = items.map(i => ({ sku: i.sku, quantity: i.walmartQty }));
 
   let totalPriceSuccess     = 0;
@@ -376,6 +394,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       inventoryResult,
       skippedNoCostCount: skippedNoCost.length,
       skippedNoCost:      skippedNoCost.slice(0, 100),
+      heldExposedCount:   heldExposed.length,
+      heldExposed:        heldExposed.slice(0, 100),
       durationMs,
       ...(errors.length ? { errors } : {}),
     });
@@ -391,6 +411,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     inventoryResult,
     skippedNoCostCount: skippedNoCost.length,
     skippedNoCost:      skippedNoCost.slice(0, 100),
+    heldExposedCount:   heldExposed.length,
+    heldExposed:        heldExposed.slice(0, 100),
     durationMs,
     ...(errors.length ? { errors } : {}),
   });
