@@ -20,13 +20,12 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { walmartFetch, updatePrice, updateInventory } from './lib/walmart-client.js';
 import { fetchAllShopifyVariants } from './lib/shopify.js';
-import { safeWalmartPrice } from './lib/pricing.js';
+import { safeWalmartPrice, PRICE_FLOOR_MULTIPLIER } from './lib/pricing.js';
 
-const PAGE_SIZE            = 200;
-const LOW_STOCK_CUTOFF     = 4;     // Shopify qty below this → Walmart qty = 0
-const PRICE_EPSILON        = 0.01;  // treat sub-cent differences as equal
-const DIVERGENCE_THRESHOLD = 0.10;  // unitCost vs CT cost > 10% → suspect cost data
-const WRITE_CONCURRENCY    = 6;     // parallel Walmart writes per batch
+const PAGE_SIZE         = 200;
+const LOW_STOCK_CUTOFF  = 4;     // Shopify qty below this → Walmart qty = 0
+const PRICE_EPSILON     = 0.01;  // treat sub-cent differences as equal
+const WRITE_CONCURRENCY = 6;     // parallel Walmart writes per batch
 
 // ─── Walmart: list every published+active item with its current price ──────────
 
@@ -73,10 +72,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const isCron = req.headers['x-vercel-cron'] === '1';
   const offset = parseInt((req.query.offset as string) ?? '0', 10) || 0;
   const limit  = isCron ? 99999 : (parseInt((req.query.limit as string) ?? '500', 10) || 500);
-  // Hold (skip the price write for) SKUs whose stored cost diverges from the
-  // CT cost — their floor would be computed off a suspect cost basis.
-  // Inventory is still pushed. Default ON; pass holdDiverged=false to override.
-  const holdDiverged = req.query.holdDiverged !== 'false';
+  // Hold (skip the price write for) only SKUs that are actually EXPOSED: where
+  // the price we'd push is below (true CT cost × floor multiplier). A halved /
+  // suspect stored cost only matters when it leaves us under true cost; a
+  // divergent SKU whose Shopify price already covers true cost is safe to push.
+  // Inventory is still pushed for held SKUs. Default ON; holdExposed=false to override.
+  const holdExposed = req.query.holdExposed !== 'false';
 
   try {
     console.log('[reconcile] Fetching Shopify variants (price, cost, inventory)…');
@@ -94,24 +95,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let priceCorrected     = 0;
     let inventoryCorrected = 0;
     const skippedNoCost: string[]                 = [];
-    const heldDiverged: string[]                  = [];
+    const heldExposed: Array<{
+      sku: string; shopifyPrice: number | null; storedCost: number | null;
+      ctCost: number | null; requiredFloor: number; wouldPush: number;
+    }> = [];
     const errors: Array<{ sku: string; error: string }> = [];
 
     // Process one matched SKU: correct price (unless held) + push inventory.
     async function processSku(w: { sku: string; price: number | null }): Promise<void> {
       const sv = shopify.get(w.sku)!;
 
-      // ── Price (Layer 1 floor + hold-diverged guard) ────────────────────
+      // ── Price (Layer 1 floor + hold-exposed guard) ─────────────────────
       const safe = safeWalmartPrice({ shopifyPrice: sv.price, cost: sv.cost });
       if (safe == null) {
         skippedNoCost.push(w.sku);
       } else {
-        const divergent =
-          sv.ctCost != null && sv.ctCost > 0 && sv.cost != null &&
-          Math.abs(sv.cost - sv.ctCost) / sv.ctCost > DIVERGENCE_THRESHOLD;
+        // Exposed = the price we'd push doesn't cover TRUE CT cost × floor.
+        const requiredFloor =
+          sv.ctCost != null && sv.ctCost > 0 ? sv.ctCost * PRICE_FLOOR_MULTIPLIER : null;
+        const exposed = requiredFloor != null && safe < requiredFloor - PRICE_EPSILON;
 
-        if (holdDiverged && divergent) {
-          heldDiverged.push(w.sku); // suspect cost basis — hold price, still push inventory
+        if (holdExposed && exposed) {
+          heldExposed.push({
+            sku: w.sku, shopifyPrice: sv.price, storedCost: sv.cost,
+            ctCost: sv.ctCost, requiredFloor: parseFloat(requiredFloor!.toFixed(2)), wouldPush: safe,
+          });
         } else if (w.price == null || Math.abs(safe - w.price) >= PRICE_EPSILON) {
           if (!dryRun) {
             try {
@@ -150,13 +158,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     console.log(
       `[reconcile] matched=${matched.length} paged=${page.length} priceCorrected=${priceCorrected} ` +
-      `inventoryPushed=${inventoryCorrected} heldDiverged=${heldDiverged.length} ` +
+      `inventoryPushed=${inventoryCorrected} heldExposed=${heldExposed.length} ` +
       `skippedNoCost=${skippedNoCost.length} errors=${errors.length} dryRun=${dryRun}`,
     );
 
     return res.status(errors.length ? 207 : 200).json({
       dryRun,
-      holdDiverged,
+      holdExposed,
       totalMatched:       matched.length,
       processed:          page.length,
       offset,
@@ -164,8 +172,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       nextOffset,
       priceCorrected,
       inventoryCorrected,
-      heldDivergedCount:  heldDiverged.length,
-      heldDiverged:       heldDiverged.slice(0, 200),
+      heldExposedCount:   heldExposed.length,
+      heldExposed:        heldExposed.slice(0, 300),
       skippedNoCostCount: skippedNoCost.length,
       skippedNoCost:      skippedNoCost.slice(0, 200),
       errorCount:         errors.length,
