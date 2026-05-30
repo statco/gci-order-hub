@@ -11,9 +11,9 @@
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getWalmartToken } from './lib/walmart-client.js';
+import { fetchAllShopifyVariants } from './lib/shopify.js';
+import { safeWalmartPrice, assertAboveCost } from './lib/pricing.js';
 
-const SHOPIFY_STORE   = process.env.SHOPIFY_STORE_DOMAIN!;
-const SHOPIFY_TOKEN   = process.env.SHOPIFY_ADMIN_API_TOKEN!;
 const WALMART_BASE    = process.env.WALMART_BASE_URL!;
 const PAGE_SIZE       = 200;
 const PRICE_THRESHOLD = 0.05; // flag if Walmart price < Shopify price × (1 - 0.05)
@@ -24,55 +24,12 @@ interface AuditRow {
   sku: string;
   walmartPrice: number;
   shopifyPrice: number;
+  cost: number | null;
+  safePrice: number | null;
   pctBelow: number;
   corrected: boolean;
+  skippedNoCost?: boolean;
   error?: string;
-}
-
-// ─── Shopify helpers ──────────────────────────────────────────────────────────
-
-async function fetchShopifyPriceMap(): Promise<Map<string, number>> {
-  const map = new Map<string, number>();
-  let cursor: string | null = null;
-  let hasMore = true;
-
-  while (hasMore) {
-    const query: string = `{
-      productVariants(first: 250${cursor ? `, after: "${cursor}"` : ''}) {
-        pageInfo { hasNextPage endCursor }
-        edges {
-          node { sku price }
-        }
-      }
-    }`;
-
-    const res: Response = await fetch(
-      `https://${SHOPIFY_STORE}/admin/api/2024-01/graphql.json`,
-      {
-        method: 'POST',
-        headers: {
-          'X-Shopify-Access-Token': SHOPIFY_TOKEN,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ query }),
-      }
-    );
-    if (!res.ok) throw new Error(`Shopify GraphQL error: ${res.status}`);
-    const data: any = await res.json();
-
-    const variants: any = data?.data?.productVariants;
-    if (!variants) throw new Error('Shopify GraphQL: unexpected response shape');
-
-    for (const edge of variants.edges) {
-      const { sku, price } = edge.node;
-      if (sku) map.set(sku.toUpperCase(), parseFloat(price));
-    }
-
-    hasMore = variants.pageInfo.hasNextPage;
-    cursor = variants.pageInfo.endCursor;
-  }
-
-  return map;
 }
 
 // ─── Walmart helpers ──────────────────────────────────────────────────────────
@@ -136,8 +93,13 @@ async function fetchListedItemsWithPrices(
 async function correctWalmartPrice(
   token: string,
   sku: string,
-  newPrice: number
+  newPrice: number,
+  cost: number | null
 ): Promise<void> {
+  const amount = parseFloat(newPrice.toFixed(2));
+  // LAYER 1 backstop — a below-cost correction throws rather than ships.
+  assertAboveCost(sku, amount, cost);
+
   const res = await fetch(`${WALMART_BASE}/v3/price`, {
     method: 'PUT',
     headers: {
@@ -153,7 +115,7 @@ async function correctWalmartPrice(
       sku,
       pricing: [{
         currentPriceType: 'BASE',
-        currentPrice: { currency: 'CAD', amount: parseFloat(newPrice.toFixed(2)) },
+        currentPrice: { currency: 'CAD', amount },
       }],
     }),
   });
@@ -181,24 +143,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const walmartItems = await fetchListedItemsWithPrices(token);
     console.log(`[walmart-price-audit] Got ${walmartItems.length} Walmart items with prices`);
 
-    console.log('[walmart-price-audit] Fetching Shopify price map...');
-    const shopifyPrices = await fetchShopifyPriceMap();
-    console.log(`[walmart-price-audit] Got ${shopifyPrices.size} Shopify variant prices`);
+    console.log('[walmart-price-audit] Fetching Shopify variant map (price + cost)...');
+    const shopify = await fetchAllShopifyVariants();
+    console.log(`[walmart-price-audit] Got ${shopify.size} Shopify variants`);
 
     const flagged: AuditRow[] = [];
     const clean: number[] = [];
 
     for (const { sku, price: walmartPrice } of walmartItems) {
-      const shopifyPrice = shopifyPrices.get(sku);
-      if (!shopifyPrice) continue; // no Shopify match — skip
+      const sv = shopify.get(sku);
+      if (!sv || sv.price == null) continue; // no Shopify match — skip
+      const shopifyPrice = sv.price;
 
       const threshold = shopifyPrice * (1 - PRICE_THRESHOLD);
       if (walmartPrice < threshold) {
         const pctBelow = ((shopifyPrice - walmartPrice) / shopifyPrice) * 100;
+        const safePrice = safeWalmartPrice({ shopifyPrice, cost: sv.cost });
         const row: AuditRow = {
           sku,
           walmartPrice,
           shopifyPrice,
+          cost: sv.cost,
+          safePrice,
           pctBelow: parseFloat(pctBelow.toFixed(1)),
           corrected: false,
         };
@@ -217,8 +183,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (!dryRun) {
       for (const row of pagedFlagged) {
+        // LAYER 1: correct to the floored safe price, never the raw Shopify
+        // price. Missing cost → skip + log (never guess).
+        if (row.safePrice == null) {
+          row.skippedNoCost = true;
+          continue;
+        }
         try {
-          await correctWalmartPrice(token, row.sku, row.shopifyPrice);
+          await correctWalmartPrice(token, row.sku, row.safePrice, row.cost);
           row.corrected = true;
         } catch (e: unknown) {
           row.error = e instanceof Error ? e.message : String(e);
@@ -237,6 +209,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       nextOffset: offset + limit < flagged.length ? offset + limit : null,
       pagedFlaggedCount: pagedFlagged.length,
       corrected: pagedFlagged.filter(r => r.corrected).length,
+      skippedNoCost: pagedFlagged.filter(r => r.skippedNoCost).map(r => r.sku),
       cleanCount: clean.length,
       flagged: pagedFlagged,
     });
