@@ -41,40 +41,57 @@ let _tokenExp: number        = 0;
 async function getToken(): Promise<string> {
   if (_token && Date.now() < _tokenExp - 60_000) return _token;
 
-  const correlationId = crypto.randomUUID();
-  const res = await fetch(`${WALMART_BASE}/v3/token`, {
-    method: 'POST',
-    headers: {
-      'Authorization':         `Basic ${basicCredentials()}`,
-      'Content-Type':          'application/x-www-form-urlencoded',
-      'WM_SVC.NAME':           'Walmart Marketplace',
-      'WM_QOS.CORRELATION_ID': correlationId,
-      'WM_MARKET':             'ca',
-      'Accept':                'application/json',
-    },
-    body: 'grant_type=client_credentials',
-  });
+  const MAX_ATTEMPTS = 3;
+  let lastError: Error | null = null;
 
-  if (!res.ok) {
-    const errBody = await res.text();
-    console.error('[Walmart auth] HTTP', res.status, 'Body:', errBody);
-    console.error('[Walmart auth] Request headers sent:', {
-      'Content-Type':          'application/x-www-form-urlencoded',
-      'WM_SVC.NAME':           'Walmart Marketplace',
-      'WM_QOS.CORRELATION_ID': correlationId,
-      'WM_MARKET':             'ca',
-      'Accept':                'application/json',
-      'Authorization':         'Basic [REDACTED]',
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      const delay = 1000 * Math.pow(2, attempt - 1); // 1 s, 2 s
+      console.warn(`[Walmart auth] retry attempt ${attempt + 1} in ${delay}ms`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+
+    const correlationId = crypto.randomUUID();
+    const res = await fetch(`${WALMART_BASE}/v3/token`, {
+      method: 'POST',
+      headers: {
+        'Authorization':         `Basic ${basicCredentials()}`,
+        'Content-Type':          'application/x-www-form-urlencoded',
+        'WM_SVC.NAME':           'Walmart Marketplace',
+        'WM_QOS.CORRELATION_ID': correlationId,
+        'WM_MARKET':             'ca',
+        'Accept':                'application/json',
+      },
+      body: 'grant_type=client_credentials',
     });
-    throw new Error(`Walmart auth failed HTTP ${res.status}: ${errBody.slice(0, 200)}`);
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      const isTransient = res.status >= 500; // catches 5xx and Cloudflare 520
+      console.error(`[Walmart auth] HTTP ${res.status} (attempt ${attempt + 1})`, errBody.slice(0, 200));
+      lastError = new Error(`Walmart auth failed HTTP ${res.status}: ${errBody.slice(0, 200)}`);
+      if (isTransient && attempt < MAX_ATTEMPTS - 1) continue;
+      // Non-transient (4xx) or last attempt: log full headers and bail
+      console.error('[Walmart auth] Request headers sent:', {
+        'Content-Type':          'application/x-www-form-urlencoded',
+        'WM_SVC.NAME':           'Walmart Marketplace',
+        'WM_QOS.CORRELATION_ID': correlationId,
+        'WM_MARKET':             'ca',
+        'Accept':                'application/json',
+        'Authorization':         'Basic [REDACTED]',
+      });
+      throw lastError;
+    }
+
+    const data: any = await res.json();
+    _token          = data.access_token as string;
+    const expiresIn = (data.expires_in as number) ?? 900;
+    _tokenExp       = Date.now() + expiresIn * 1000;
+    console.log(`✅ Walmart token refreshed, expires in ${expiresIn}s`);
+    return _token!;
   }
 
-  const data: any = await res.json();
-  _token          = data.access_token as string;
-  const expiresIn = (data.expires_in as number) ?? 900;
-  _tokenExp       = Date.now() + expiresIn * 1000;
-  console.log(`✅ Walmart token refreshed, expires in ${expiresIn}s`);
-  return _token!;
+  throw lastError!;
 }
 
 // ─── INTERNAL FETCH ──────────────────────────────────────────────
