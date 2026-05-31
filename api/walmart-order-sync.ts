@@ -1,6 +1,8 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getWalmartToken } from './lib/walmart-client.js';
 import { getSheetOrderIds, appendSheetRows } from './lib/sheets-client.js';
+import { HttpError, retryWithBackoff } from './lib/retry.js';
+import { getSyncSince, setSyncSuccess } from './lib/sync-state.js';
 
 export const config = { maxDuration: 300 };
 
@@ -54,12 +56,15 @@ function walmartHeaders(token: string): Record<string, string> {
   };
 }
 
-async function fetchCreatedOrders(token: string): Promise<WalmartOrder[]> {
-  // Fetch orders from last 24 hours, filter Created status in code
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+async function fetchCreatedOrders(token: string, since: string): Promise<WalmartOrder[]> {
+  // Fetch orders created since the last successful sync (catch-up), filter
+  // Created status in code. Throws HttpError on failure so the retry wrapper
+  // can classify transient (5xx/520) vs permanent (4xx) responses.
   const url = `${WALMART_BASE_URL}/v3/orders?createdStartDate=${encodeURIComponent(since)}&limit=200`;
   const res = await fetch(url, { headers: walmartHeaders(token) });
-  if (!res.ok) throw new Error(`Walmart orders fetch failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    throw new HttpError(res.status, `Walmart orders fetch failed: ${res.status} ${await res.text()}`);
+  }
   const data = await res.json();
   const allOrders: WalmartOrder[] = data?.list?.elements?.order ?? [];
   // Filter to only Created status orders
@@ -74,7 +79,15 @@ async function acknowledgeOrder(token: string, orderId: string): Promise<boolean
     method: 'POST',
     headers: walmartHeaders(token),
   });
-  return res.ok;
+  if (res.ok) return true;
+  // Transient (5xx/520) → throw so retryWithBackoff retries. Permanent (4xx)
+  // → return false; the order is already visible via the early alert and gets
+  // logged, so one failed ack must not abort the whole run.
+  if (res.status >= 500) {
+    throw new HttpError(res.status, `acknowledge ${orderId} failed: ${res.status} ${await res.text()}`);
+  }
+  console.warn(`[order-sync] acknowledge ${orderId} returned ${res.status} (permanent) — continuing`);
+  return false;
 }
 
 // ── Formatters ───────────────────────────────────────────────────────────────────
@@ -93,7 +106,7 @@ function getLinePrice(line: OrderLine): number {
 // ── Telegram ───────────────────────────────────────────────────────────────────
 
 async function sendTelegram(message: string): Promise<void> {
-  await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -102,6 +115,12 @@ async function sendTelegram(message: string): Promise<void> {
       parse_mode: 'HTML',
     }),
   });
+  if (!res.ok) {
+    const body = await res.text();
+    console.error(`❌ Telegram notify failed ${res.status}:`, body.slice(0, 200));
+  } else {
+    console.log('✅ Telegram alert sent');
+  }
 }
 
 function buildTelegramMessage(orders: WalmartOrder[]): string {
@@ -138,11 +157,24 @@ function buildTelegramMessage(orders: WalmartOrder[]): string {
 // ── Handler ────────────────────────────────────────────────────────────────
 
 export default async function handler(_req: VercelRequest, res: VercelResponse) {
+  // Capture the cursor at the START of the run; we only persist it after a
+  // clean completion so a failed pass self-heals on the next successful one.
+  const runStartedAt = new Date().toISOString();
   try {
     const token = await getWalmartToken();
-    const orders = await fetchCreatedOrders(token);
+
+    // Catch-up: fetch orders created since the last SUCCESSFUL sync, not since
+    // the last run. retryWithBackoff retries transient failures (5xx/520/network)
+    // 2s/4s/8s before giving up.
+    const since = await getSyncSince();
+    const orders = await retryWithBackoff(() => fetchCreatedOrders(token, since), {
+      label: 'fetchCreatedOrders',
+    });
 
     if (orders.length === 0) {
+      // Nothing to process is itself a clean pass — advance the cursor so we
+      // don't re-scan an ever-growing window.
+      await setSyncSuccess(runStartedAt);
       console.log('[order-sync] No orders with status=Created');
       return res.status(200).json({ message: 'No new orders', processed: 0 });
     }
@@ -152,6 +184,8 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     const newOrders = orders.filter((o) => !existingIds.has(o.purchaseOrderId));
 
     if (newOrders.length === 0) {
+      // Clean pass (all already deduped) — advance the cursor.
+      await setSyncSuccess(runStartedAt);
       console.log('[order-sync] All orders already processed');
       return res.status(200).json({ message: 'All orders already logged', processed: 0 });
     }
@@ -167,8 +201,13 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     const rows: string[][] = [];
 
     for (const order of newOrders) {
-      // 2. Acknowledge on Walmart (must be within 4 hrs)
-      const acked = await acknowledgeOrder(token, order.purchaseOrderId);
+      // 2. Acknowledge on Walmart (must be within 4 hrs). Retries transient
+      //    failures (5xx/520/network) 2s/4s/8s; a permanent 4xx returns false.
+      //    A transient exhaustion throws → outer catch alerts + cursor stays put.
+      const acked = await retryWithBackoff(
+        () => acknowledgeOrder(token, order.purchaseOrderId),
+        { label: `acknowledge ${order.purchaseOrderId}` },
+      );
       if (acked) ackedIds.add(order.purchaseOrderId);
       console.log(`[order-sync] ${order.purchaseOrderId} acknowledged: ${acked}`);
 
@@ -201,6 +240,10 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     // 4. Log to sheet
     await appendSheetRows(SHEET_ID, rows);
     console.log(`[order-sync] Logged ${rows.length} row(s) to sheet`);
+
+    // 5. Clean completion — advance the catch-up cursor. Persisting at
+    //    runStartedAt (not now) keeps any orders created mid-run in range.
+    await setSyncSuccess(runStartedAt);
 
     return res.status(200).json({
       newOrders: newOrders.length,
