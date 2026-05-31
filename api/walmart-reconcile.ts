@@ -21,6 +21,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { walmartFetch, updatePrice, updateInventory } from './lib/walmart-client.js';
 import { fetchAllShopifyVariants } from './lib/shopify.js';
 import { safeWalmartPrice, PRICE_FLOOR_MULTIPLIER } from './lib/pricing.js';
+import { sendTelegramMessage } from './lib/telegram.js';
 
 const PAGE_SIZE         = 200;
 const LOW_STOCK_CUTOFF  = 4;     // Shopify qty below this → Walmart qty = 0
@@ -167,6 +168,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       `inventoryPushed=${inventoryCorrected} heldExposed=${heldExposed.length} ` +
       `skippedNoCost=${skippedNoCost.length} errors=${errors.length} dryRun=${dryRun}`,
     );
+
+    // Telegram summary on completion of a live run (skip dry-runs and
+    // intermediate pages of a manual paginated sweep). GCI Orders bot.
+    if (!dryRun && nextOffset === null) {
+      const errLine = errors.length
+        ? `\n⚠️ <b>Errors:</b> ${errors.length}` +
+          `\n${errors.slice(0, 5).map(e => `  • <code>${e.sku}</code>: ${e.error.slice(0, 80)}`).join('\n')}`
+        : '';
+      await sendTelegramMessage(
+        `🔄 <b>Walmart Reconcile complete</b>\n` +
+        `Matched SKUs: ${matched.length}\n` +
+        `💰 Prices corrected: ${priceCorrected}\n` +
+        `📦 Inventory pushed: ${inventoryCorrected}\n` +
+        `🛑 Held (exposed): ${heldExposed.length}\n` +
+        `❓ Skipped (no cost): ${skippedNoCost.length}` +
+        errLine,
+      );
+    }
 
     return res.status(errors.length ? 207 : 200).json({
       dryRun,
