@@ -6,8 +6,11 @@
 // Reads all ct-sync variants from Shopify (gcitires.com) and pushes
 // updated price + quantity to Walmart Marketplace.
 //
-// Safety switch:
-//   Shopify qty < 4  →  Walmart qty = 0  (prevents overselling)
+// Inventory rule:
+//   Shopify qty === 0  →  Walmart qty = 0
+//   Shopify qty  >  0  →  Walmart qty = real Shopify quantity (no suppression)
+//   (The previous "< 4 → 0" low-stock suppression was removed — it hid live
+//    stock from Walmart and suppressed sales.)
 //
 // Query params:
 //   ?dry=true              — preview without writing to Walmart
@@ -48,7 +51,6 @@ const API_VERSION    = '2024-01';
 const SHOPIFY_BASE   = `https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}`;
 
 const CT_SYNC_TAG      = 'ct-sync';
-const LOW_STOCK_CUTOFF = 4;     // qty below this → Walmart qty = 0
 const WALMART_CHUNK    = 1_000; // Walmart feed max items per call
 
 // ─── SHOPIFY HELPERS ────────────────────────────────────────────
@@ -96,7 +98,7 @@ async function fetchTireVariants(): Promise<SyncItem[]> {
           cost:       null as number | null,  // enriched post-fetch from the GraphQL variant map
           ctCost:     null as number | null,  // enriched post-fetch (canada_tire.cost)
           shopifyQty,
-          walmartQty: shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty,
+          walmartQty: shopifyQty, // send real qty; 0 only when Shopify is 0
         };
 
         // Push bare SKU + TIRE- prefixed version so the listed filter matches
@@ -181,7 +183,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 cost:       null,  // enriched post-fetch from the GraphQL variant map
                 ctCost:     null,  // enriched post-fetch (canada_tire.cost)
                 shopifyQty,
-                walmartQty: shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty,
+                walmartQty: shopifyQty, // send real qty; 0 only when Shopify is 0
               } as SyncItem;
             }
           } catch (err: any) {
@@ -301,8 +303,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     console.error('❌ Cost enrichment failed (prices will be skipped without cost):', err.message);
   }
 
+  // Suppression removed: an in-stock SKU is never zeroed. This stays as a
+  // backstop assertion — it must always be 0 now. `zeroStock` reports the
+  // SKUs sent 0 because Shopify genuinely shows 0.
   const safetyZeroed = items.filter(i => i.shopifyQty > 0 && i.walmartQty === 0).length;
-  console.log(`🛡️  Safety-zeroed: ${safetyZeroed} items (qty < ${LOW_STOCK_CUTOFF})`);
+  const zeroStock    = items.filter(i => i.shopifyQty === 0).length;
+  console.log(`📦 Inventory: ${zeroStock} at zero (Shopify shows 0); suppressed-in-stock=${safetyZeroed} (must be 0)`);
 
   // ── Dry run ───────────────────────────────────────────────────
   if (isDry) {
@@ -310,6 +316,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       dryRun:       true,
       total:        items.length,
       safetyZeroed,
+      zeroStock,
       ...(listedSkuCount !== undefined ? { listedSkuCount } : {}),
       sample:       items.slice(0, 5).map(i => ({
         sku:        i.sku,
@@ -406,6 +413,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ok:              errors.length === 0,
     totalVariants:   items.length,
     safetyZeroed,
+    zeroStock,
     ...(listedSkuCount !== undefined ? { listedSkuCount } : {}),
     priceResult,
     inventoryResult,

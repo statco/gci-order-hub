@@ -13,8 +13,9 @@
  *
  * Price flows through safeWalmartPrice() (the ONLY sanctioned write path):
  * below-cost prices are structurally impossible, missing-cost SKUs are
- * skipped + logged. Inventory applies the existing safety-zero rule
- * (qty < 4 → 0).
+ * skipped + logged. Inventory pushes the real Shopify quantity: only a
+ * genuine Shopify stock of 0 sends 0 to Walmart. (The previous "< 4 → 0"
+ * low-stock suppression was removed — it hid live stock and suppressed sales.)
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -24,7 +25,6 @@ import { safeWalmartPrice, PRICE_FLOOR_MULTIPLIER } from './lib/pricing.js';
 import { sendTelegramMessage } from './lib/telegram.js';
 
 const PAGE_SIZE         = 200;
-const LOW_STOCK_CUTOFF  = 4;     // Shopify qty below this → Walmart qty = 0
 const PRICE_EPSILON     = 0.01;  // treat sub-cent differences as equal
 const WRITE_CONCURRENCY = 6;     // parallel Walmart writes per batch
 
@@ -141,9 +141,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       }
 
-      // ── Inventory (safety-zero rule) ───────────────────────────────────
+      // ── Inventory ──────────────────────────────────────────────────────
+      // Push the real Shopify quantity. No low-stock suppression: 0 is sent
+      // only when Shopify genuinely shows 0 (Math.max guards negatives/nulls).
       const shopifyQty = Math.max(0, sv.inventoryQuantity ?? 0);
-      const walmartQty = shopifyQty < LOW_STOCK_CUTOFF ? 0 : shopifyQty;
+      const walmartQty = shopifyQty;
       if (!dryRun) {
         try {
           await updateInventory({ sku: w.sku, quantity: walmartQty });
