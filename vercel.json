@@ -7,6 +7,7 @@
     "api/walmart-reconcile.ts":    { "maxDuration": 300 },
     "api/cost-integrity-audit.ts": { "maxDuration": 60  },
     "api/walmart-price-audit.ts":  { "maxDuration": 300 },
+    "api/walmart-price-correct.ts":{ "maxDuration": 300 },
     "api/walmart-order-sync.ts":  { "maxDuration": 300 },
     "api/walmart-item-feed.ts":   { "maxDuration": 300 },
     "api/walmart-feed-status.ts": { "maxDuration": 10  },

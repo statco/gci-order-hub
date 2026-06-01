@@ -87,6 +87,7 @@ interface SkippedItem {
   sku: string | null;
   productTitle?: string;
   reason: string;
+  code: string;
 }
 
 // ─── Shopify ────────────────────────────────────────────────────────────────────────
@@ -176,27 +177,29 @@ function buildFeedItem(
   product: ShopifyProduct,
   variant: ShopifyVariant,
   cost: number | null
-): { item: WalmartFeedItem | null; skipReason?: string } {
+): { item: WalmartFeedItem | null; skipReason?: string; skipCode?: string } {
   const parsed = parseTireSize(product.title);
   if (!parsed) {
-    return { item: null, skipReason: `Could not parse tire size from title: "${product.title}"` };
+    return { item: null, skipReason: `Could not parse tire size from title: "${product.title}"`, skipCode: 'PARSE' };
   }
 
-  // LAYER 3: the embedded price comes from the cost floor, never a raw
-  // variant price or a hardcoded default. No cost → skip (never guess).
+  // LAYER 3: the embedded price comes ONLY from safeWalmartPrice() — never a
+  // hardcoded default (no $285), never a raw guess.
+  //  • Shopify price lookup fails / invalid → skip (skipNoPrice), do not guess.
+  //  • cost missing → safeWalmartPrice returns null → skip (skipNoCost).
   const shopifyPrice = parseFloat(variant.price);
-  const price = safeWalmartPrice({
-    shopifyPrice: isNaN(shopifyPrice) ? null : shopifyPrice,
-    cost,
-  });
+  if (isNaN(shopifyPrice) || shopifyPrice <= 0) {
+    return { item: null, skipReason: `No valid Shopify price (got: "${variant.price}")`, skipCode: 'NO_PRICE' };
+  }
+  const price = safeWalmartPrice({ shopifyPrice, cost });
   if (price == null) {
-    return { item: null, skipReason: `No valid cost — cannot price safely (variant price: ${variant.price})` };
+    return { item: null, skipReason: `No valid cost — cannot price safely (variant price: ${variant.price})`, skipCode: 'NO_COST' };
   }
 
   // Image is required for Walmart listings
   const imageUrl = product.images?.sort((a, b) => a.position - b.position)[0]?.src ?? '';
   if (!imageUrl) {
-    return { item: null, skipReason: 'No product image available' };
+    return { item: null, skipReason: 'No product image available', skipCode: 'NO_IMAGE' };
   }
 
   const season = getSeasonFromTags(product.tags);
@@ -281,51 +284,62 @@ export default async function handler(
       }
     }
 
+    const buildErrors: Array<{ sku: string | null; error: string }> = [];
+
     for (const product of allProducts) {
       for (const variant of product.variants) {
-        if (!variant.sku) {
-          skipped.push({ sku: null, productTitle: product.title, reason: 'Null SKU' });
-          continue;
-        }
-        if (!variant.sku.startsWith('TIRE-') && tirePrefixedBaseSkus.has(variant.sku)) {
-          skipped.push({ sku: variant.sku, productTitle: product.title, reason: 'Non-TIRE- SKU (TIRE- version exists)' });
-          continue;
-        }
-
-        const keptProductId = seenSkus.get(variant.sku);
-
-        if (keptProductId !== undefined) {
-          if (product.id < keptProductId) {
-            // Lower productId found — this is the canonical original; replace the existing feed item
-            const { item, skipReason } = buildFeedItem(product, variant, costFor(variant.sku));
-            if (!item || skipReason) {
-              skipped.push({ sku: variant.sku, reason: skipReason ?? 'Unknown' });
-              continue;
-            }
-            const idx = feedItems.findIndex(fi => fi.Orderable.sku === variant.sku);
-            if (idx !== -1) feedItems.splice(idx, 1, item);
-            skipped.push({ sku: variant.sku, reason: `productId ${keptProductId} replaced by lower productId ${product.id}` });
-            seenSkus.set(variant.sku, product.id);
-          } else {
-            skipped.push({ sku: variant.sku, reason: 'Duplicate SKU skipped' });
+        try {
+          if (!variant.sku) {
+            skipped.push({ sku: null, productTitle: product.title, reason: 'Null SKU', code: 'NULL_SKU' });
+            continue;
           }
-          continue;
+          if (!variant.sku.startsWith('TIRE-') && tirePrefixedBaseSkus.has(variant.sku)) {
+            skipped.push({ sku: variant.sku, productTitle: product.title, reason: 'Non-TIRE- SKU (TIRE- version exists)', code: 'BARE_SKU_DUP' });
+            continue;
+          }
+
+          const keptProductId = seenSkus.get(variant.sku);
+
+          if (keptProductId !== undefined) {
+            if (product.id < keptProductId) {
+              // Lower productId found — this is the canonical original; replace the existing feed item
+              const { item, skipReason, skipCode } = buildFeedItem(product, variant, costFor(variant.sku));
+              if (!item || skipReason) {
+                skipped.push({ sku: variant.sku, reason: skipReason ?? 'Unknown', code: skipCode ?? 'UNKNOWN' });
+                continue;
+              }
+              const idx = feedItems.findIndex(fi => fi.Orderable.sku === variant.sku);
+              if (idx !== -1) feedItems.splice(idx, 1, item);
+              skipped.push({ sku: variant.sku, reason: `productId ${keptProductId} replaced by lower productId ${product.id}`, code: 'REPLACED' });
+              seenSkus.set(variant.sku, product.id);
+            } else {
+              skipped.push({ sku: variant.sku, reason: 'Duplicate SKU skipped', code: 'DUPLICATE' });
+            }
+            continue;
+          }
+
+          const { item, skipReason, skipCode } = buildFeedItem(product, variant, costFor(variant.sku));
+
+          if (!item || skipReason) {
+            skipped.push({ sku: variant.sku, reason: skipReason ?? 'Unknown', code: skipCode ?? 'UNKNOWN' });
+            continue;
+          }
+
+          seenSkus.set(variant.sku, product.id);
+          feedItems.push(item);
+        } catch (e: unknown) {
+          buildErrors.push({ sku: variant.sku ?? null, error: e instanceof Error ? e.message : String(e) });
         }
-
-        const { item, skipReason } = buildFeedItem(product, variant, costFor(variant.sku));
-
-        if (!item || skipReason) {
-          skipped.push({ sku: variant.sku, reason: skipReason ?? 'Unknown' });
-          continue;
-        }
-
-        seenSkus.set(variant.sku, product.id);
-        feedItems.push(item);
       }
     }
 
+    // Categorised counts (brief: submitted / skippedNoCost / skippedNoPrice / errors).
+    const skippedNoCost  = skipped.filter(s => s.code === 'NO_COST').length;
+    const skippedNoPrice = skipped.filter(s => s.code === 'NO_PRICE').length;
+
     console.log(
-      `[walmart-item-feed] Built ${feedItems.length} feed items, skipped ${skipped.length}`
+      `[walmart-item-feed] Built ${feedItems.length}, skipped ${skipped.length} ` +
+      `(noCost=${skippedNoCost} noPrice=${skippedNoPrice}), buildErrors=${buildErrors.length}`
     );
 
     if (feedItems.length === 0) {
@@ -334,6 +348,10 @@ export default async function handler(
         message: 'No valid feed items built — check skipped list for reasons',
         submitted: 0,
         skipped: skipped.length,
+        skippedNoCost,
+        skippedNoPrice,
+        errors: buildErrors.length,
+        buildErrors: buildErrors.slice(0, 50),
         skippedItems: skipped,
       });
     }
@@ -400,6 +418,10 @@ export default async function handler(
       message: `Feed submitted successfully. Poll /api/walmart-feed-status?feedId=${feedId} to track progress.`,
       submitted: feedItems.length,
       skipped: skipped.length,
+      skippedNoCost,
+      skippedNoPrice,
+      errors: buildErrors.length,
+      buildErrors: buildErrors.slice(0, 50),
       skippedItems: skipped,
     });
 
