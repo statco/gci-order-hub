@@ -150,7 +150,7 @@ export interface WalmartPriceItem {
 
 export interface WalmartInventoryItem {
   sku:      string;
-  quantity: number;  // 0 to suppress listing
+  quantity: number;  // real Shopify quantity; 0 only when Shopify shows 0
 }
 
 export interface BulkFeedResult {
@@ -198,7 +198,9 @@ export async function updatePrice(item: WalmartPriceItem): Promise<boolean> {
 
 /**
  * Update inventory for a single SKU.
- * SAFETY: pass qty=0 explicitly when Shopify stock is below threshold.
+ * Writes the caller-supplied quantity verbatim (clamped to ≥ 0). Callers
+ * pass the real Shopify quantity — no low-stock suppression. Quantity is 0
+ * only when Shopify genuinely shows 0.
  */
 export async function updateInventory(item: WalmartInventoryItem): Promise<void> {
   await walmartFetch<any>(`/v3/inventory?sku=${encodeURIComponent(item.sku)}`, {
