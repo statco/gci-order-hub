@@ -20,8 +20,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 import { getWalmartToken } from './lib/walmart-client.js';
-import { fetchAllShopifyVariants } from './lib/shopify.js';
-import { safeWalmartPrice } from './lib/pricing.js';
 import {
   parseTireSize,
   getSeasonFromTags,
@@ -176,24 +174,17 @@ function estimateShippingWeightLb(vehicleType: VehicleType): number {
 function buildFeedItem(
   product: ShopifyProduct,
   variant: ShopifyVariant,
-  cost: number | null
 ): { item: WalmartFeedItem | null; skipReason?: string; skipCode?: string } {
   const parsed = parseTireSize(product.title);
   if (!parsed) {
     return { item: null, skipReason: `Could not parse tire size from title: "${product.title}"`, skipCode: 'PARSE' };
   }
 
-  // LAYER 3: the embedded price comes ONLY from safeWalmartPrice() — never a
-  // hardcoded default (no $285), never a raw guess.
-  //  • Shopify price lookup fails / invalid → skip (skipNoPrice), do not guess.
-  //  • cost missing → safeWalmartPrice returns null → skip (skipNoCost).
+  // LAYER 3: price comes directly from Shopify variant.price — no hardcoded
+  // default (no $285). Missing/invalid Shopify price → skip (NO_PRICE).
   const shopifyPrice = parseFloat(variant.price);
   if (isNaN(shopifyPrice) || shopifyPrice <= 0) {
     return { item: null, skipReason: `No valid Shopify price (got: "${variant.price}")`, skipCode: 'NO_PRICE' };
-  }
-  const price = safeWalmartPrice({ shopifyPrice, cost });
-  if (price == null) {
-    return { item: null, skipReason: `No valid cost — cannot price safely (variant price: ${variant.price})`, skipCode: 'NO_COST' };
   }
 
   // Image is required for Walmart listings
@@ -215,7 +206,7 @@ function buildFeedItem(
       },
       productName: { en: walmartTitle(product.title, season) },
       brand:        { en: product.vendor },
-      price,
+      price: shopifyPrice,
       ShippingWeight: {
         measure: estimateShippingWeightLb(vehicleType),
         unit: 'lb',
@@ -259,13 +250,6 @@ export default async function handler(
     const allProducts = await fetchShopifyProducts();
     console.log(`[walmart-item-feed] Fetched ${allProducts.length} products`);
 
-    // Cost lives on InventoryItem.unitCost (GraphQL) — not on the REST
-    // product/variant payload. Fetch it once for the Layer 1 floor.
-    console.log('[walmart-item-feed] Fetching Shopify variant costs (GraphQL)...');
-    const variantMap = await fetchAllShopifyVariants();
-    const costFor = (sku: string | null): number | null =>
-      sku ? (variantMap.get(sku.toUpperCase())?.cost ?? null) : null;
-
     // ── Step 2: Build feed items ──────────────────────────────────────────────
     const feedItems: WalmartFeedItem[] = [];
     const skipped: SkippedItem[] = [];
@@ -303,7 +287,7 @@ export default async function handler(
           if (keptProductId !== undefined) {
             if (product.id < keptProductId) {
               // Lower productId found — this is the canonical original; replace the existing feed item
-              const { item, skipReason, skipCode } = buildFeedItem(product, variant, costFor(variant.sku));
+              const { item, skipReason, skipCode } = buildFeedItem(product, variant);
               if (!item || skipReason) {
                 skipped.push({ sku: variant.sku, reason: skipReason ?? 'Unknown', code: skipCode ?? 'UNKNOWN' });
                 continue;
@@ -318,7 +302,7 @@ export default async function handler(
             continue;
           }
 
-          const { item, skipReason, skipCode } = buildFeedItem(product, variant, costFor(variant.sku));
+          const { item, skipReason, skipCode } = buildFeedItem(product, variant);
 
           if (!item || skipReason) {
             skipped.push({ sku: variant.sku, reason: skipReason ?? 'Unknown', code: skipCode ?? 'UNKNOWN' });
