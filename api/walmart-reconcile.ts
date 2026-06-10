@@ -13,12 +13,11 @@
  *
  * Price mirrors Shopify variant.price directly — SKUs with a null/zero price
  * are skipped and logged in skippedNoPrice. Inventory pushes the real Shopify
- * quantity: only a genuine Shopify stock of 0 sends 0 to Walmart. (The previous
- * "< 4 → 0" low-stock suppression was removed — it hid live stock.)
+ * quantity only when it differs from the current Walmart quantity.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { walmartFetch, updatePrice, updateInventory } from './lib/walmart-client.js';
+import { walmartFetch, updateInventory } from './lib/walmart-client.js';
 import { fetchAllShopifyVariants } from './lib/shopify.js';
 import { sendTelegramMessage } from './lib/telegram.js';
 
@@ -26,10 +25,16 @@ const PAGE_SIZE         = 200;
 const PRICE_EPSILON     = 0.01;  // treat sub-cent differences as equal
 const WRITE_CONCURRENCY = 6;     // parallel Walmart writes per batch
 
-// ─── Walmart: list every published+active item with its current price ──────────
+// ─── Walmart: list every published+active item with its current price + inventory ─
 
-async function fetchWalmartItems(): Promise<Array<{ sku: string; price: number | null }>> {
-  const items: Array<{ sku: string; price: number | null }> = [];
+interface WalmartItem {
+  sku:               string;
+  price:             number | null;
+  inventoryQuantity: number | null;
+}
+
+async function fetchWalmartItems(): Promise<WalmartItem[]> {
+  const items: WalmartItem[] = [];
 
   const collect = (data: any): number => {
     const page: any[] = data?.ItemResponse ?? data?.items ?? [];
@@ -41,7 +46,13 @@ async function fetchWalmartItems(): Promise<Array<{ sku: string; price: number |
         item.pricing?.[0]?.currentPrice?.amount ??
         item.currentPrice?.amount ??
         null;
-      if (sku) items.push({ sku, price: price != null ? parseFloat(price) : null });
+      // Walmart CA /v3/items returns inventory as quantity.amount
+      const qty = item.quantity?.amount ?? null;
+      if (sku) items.push({
+        sku,
+        price:             price != null ? parseFloat(price) : null,
+        inventoryQuantity: qty   != null ? Number(qty)       : null,
+      });
     }
     return page.length;
   };
@@ -49,7 +60,7 @@ async function fetchWalmartItems(): Promise<Array<{ sku: string; price: number |
   const pageUrl = (offset: number) =>
     `/v3/items?limit=${PAGE_SIZE}&offset=${offset}&publishedStatus=PUBLISHED&lifecycleStatus=ACTIVE`;
 
-  // Page 1 first to learn totalItems, then fetch the remaining pages in parallel.
+  // Page 1 first to learn totalItems, then fetch remaining pages in parallel.
   const first: any = await walmartFetch<any>(pageUrl(0));
   const firstCount = collect(first);
   const totalItems = first?.totalItems ?? firstCount;
@@ -93,22 +104,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     let priceCorrected     = 0;
     let inventoryCorrected = 0;
-    const skippedNoPrice: string[]                 = [];
+    const skippedNoPrice: string[]                     = [];
     const errors: Array<{ sku: string; error: string }> = [];
 
-    // Process one matched SKU: correct price + push inventory.
-    async function processSku(w: { sku: string; price: number | null }): Promise<void> {
+    // Process one matched SKU: correct price + push inventory (only when different).
+    async function processSku(w: WalmartItem): Promise<void> {
       const sv = shopify.get(w.sku)!;
 
       // ── Price (direct Shopify price mirror) ─────────────────────────────
+      // Use walmartFetch directly — bypasses the safeWalmartPrice re-gate
+      // inside updatePrice() which would skip writes when cost is null.
       const targetPrice = sv.price != null && sv.price > 0 ? sv.price : null;
       if (targetPrice == null) {
         skippedNoPrice.push(w.sku);
       } else if (w.price == null || Math.abs(targetPrice - w.price) >= PRICE_EPSILON) {
         if (!dryRun) {
           try {
-            const written = await updatePrice({ sku: w.sku, price: targetPrice, cost: sv.cost });
-            if (written) priceCorrected++;
+            await walmartFetch<any>('/v3/price', {
+              method: 'PUT',
+              body: JSON.stringify({
+                sku:     w.sku,
+                pricing: [{
+                  currentPriceType: 'BASE',
+                  currentPrice: {
+                    currency: 'CAD',
+                    amount:   parseFloat(targetPrice.toFixed(2)),
+                  },
+                }],
+              }),
+            });
+            priceCorrected++;
           } catch (e: unknown) {
             errors.push({ sku: w.sku, error: e instanceof Error ? e.message : String(e) });
           }
@@ -118,19 +143,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
 
       // ── Inventory ──────────────────────────────────────────────────────
-      // Push the real Shopify quantity. No low-stock suppression: 0 is sent
-      // only when Shopify genuinely shows 0 (Math.max guards negatives/nulls).
-      const shopifyQty = Math.max(0, sv.inventoryQuantity ?? 0);
-      const walmartQty = shopifyQty;
-      if (!dryRun) {
-        try {
-          await updateInventory({ sku: w.sku, quantity: walmartQty });
+      // Push only when Walmart's current quantity differs from Shopify's.
+      // No low-stock suppression: 0 is sent only when Shopify genuinely shows 0.
+      const shopifyQty  = Math.max(0, sv.inventoryQuantity ?? 0);
+      const walmartQty  = w.inventoryQuantity;
+      // If Walmart qty is unknown (not in API response) treat as needing update.
+      const needsUpdate = walmartQty === null || walmartQty !== shopifyQty;
+      if (needsUpdate) {
+        if (!dryRun) {
+          try {
+            await updateInventory({ sku: w.sku, quantity: shopifyQty });
+            inventoryCorrected++;
+          } catch (e: unknown) {
+            errors.push({ sku: w.sku, error: e instanceof Error ? e.message : String(e) });
+          }
+        } else {
           inventoryCorrected++;
-        } catch (e: unknown) {
-          errors.push({ sku: w.sku, error: e instanceof Error ? e.message : String(e) });
         }
-      } else {
-        inventoryCorrected++;
       }
     }
 
