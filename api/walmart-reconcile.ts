@@ -31,6 +31,8 @@ interface WalmartItem {
   sku:               string;
   price:             number | null;
   inventoryQuantity: number | null;
+  _rawPrice:         any;   // DEBUG: remove after diagnosis
+  _rawQty:           any;   // DEBUG: remove after diagnosis
 }
 
 async function fetchWalmartItems(): Promise<WalmartItem[]> {
@@ -52,6 +54,9 @@ async function fetchWalmartItems(): Promise<WalmartItem[]> {
         sku,
         price:             price != null ? parseFloat(price) : null,
         inventoryQuantity: qty   != null ? Number(qty)       : null,
+        // DEBUG fields — capture raw shapes to identify correct field paths
+        _rawPrice: item.price ?? item.pricing ?? item.currentPrice ?? '(no price field)',
+        _rawQty:   item.quantity ?? item.inventoryCount ?? item.availableToSellQuantity ?? '(no qty field)',
       });
     }
     return page.length;
@@ -64,6 +69,13 @@ async function fetchWalmartItems(): Promise<WalmartItem[]> {
   const first: any = await walmartFetch<any>(pageUrl(0));
   const firstCount = collect(first);
   const totalItems = first?.totalItems ?? firstCount;
+
+  // DEBUG: log raw keys of the first item to find inventory field path
+  const firstItem = first?.ItemResponse?.[0] ?? first?.items?.[0];
+  if (firstItem) {
+    console.log('[DEBUG] First Walmart item top-level keys:', Object.keys(firstItem));
+    console.log('[DEBUG] First Walmart item raw:', JSON.stringify(firstItem).slice(0, 1000));
+  }
 
   const offsets: number[] = [];
   for (let o = PAGE_SIZE; o < totalItems; o += PAGE_SIZE) offsets.push(o);
@@ -107,6 +119,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const skippedNoPrice: string[]                     = [];
     const errors: Array<{ sku: string; error: string }> = [];
 
+    // DEBUG: log first 3 SKUs processed
+    let debugCount = 0;
+
     // Process one matched SKU: correct price + push inventory (only when different).
     async function processSku(w: WalmartItem): Promise<void> {
       const sv = shopify.get(w.sku)!;
@@ -115,6 +130,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // Use walmartFetch directly — bypasses the safeWalmartPrice re-gate
       // inside updatePrice() which would skip writes when cost is null.
       const targetPrice = sv.price != null && sv.price > 0 ? sv.price : null;
+
+      // ── Inventory ──────────────────────────────────────────────────────
+      const shopifyQty = Math.max(0, sv.inventoryQuantity ?? 0);
+      const walmartQty = w.inventoryQuantity;
+
+      // DEBUG: log first 3 processed SKUs in full detail
+      if (debugCount < 3) {
+        debugCount++;
+        console.log('[DEBUG]', JSON.stringify({
+          sku:               w.sku,
+          shopifyPrice:      sv.price,
+          shopifyPriceType:  typeof sv.price,
+          walmartPrice:      w.price,
+          walmartPriceType:  typeof w.price,
+          targetPrice,
+          priceDiff:         w.price != null && targetPrice != null ? Math.abs(targetPrice - w.price) : 'n/a',
+          priceNeedsUpdate:  targetPrice != null && (w.price == null || (w.price != null && Math.abs(targetPrice - w.price) >= PRICE_EPSILON)),
+          walmartQty,
+          shopifyQty,
+          inventoryDiff:     walmartQty === null || walmartQty !== shopifyQty,
+          rawWalmartPrice:   w._rawPrice,
+          rawWalmartQty:     w._rawQty,
+        }));
+      }
+
       if (targetPrice == null) {
         skippedNoPrice.push(w.sku);
       } else if (w.price == null || Math.abs(targetPrice - w.price) >= PRICE_EPSILON) {
@@ -142,11 +182,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       }
 
-      // ── Inventory ──────────────────────────────────────────────────────
       // Push only when Walmart's current quantity differs from Shopify's.
       // No low-stock suppression: 0 is sent only when Shopify genuinely shows 0.
-      const shopifyQty  = Math.max(0, sv.inventoryQuantity ?? 0);
-      const walmartQty  = w.inventoryQuantity;
       // If Walmart qty is unknown (not in API response) treat as needing update.
       const needsUpdate = walmartQty === null || walmartQty !== shopifyQty;
       if (needsUpdate) {
