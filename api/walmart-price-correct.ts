@@ -115,15 +115,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const offset = parseInt((req.query.offset as string) ?? '0', 10) || 0;
   const limit = isCron ? 99999 : (parseInt((req.query.limit as string) ?? '300', 10) || 300);
 
+  // ─── LEGITIMATE $284.99 SKUs ──────────────────────────────────────────────────
+  // These SKUs compute safeWalmartPrice() = $284.99 for their CT cost tier.
+  // They are correctly priced — exclude from stuck scan to avoid false positives.
+  // Last verified: 2026-06-12. Re-check if PRICE_FLOOR_MULTIPLIER changes.
+  const LEGITIMATE_284_SKUS = new Set([
+    'TIRE-16960NXK', 'TIRE-16092NXK', 'TIRE-12350NXK', 'TIRE-12500NXK',
+    'TIRE-11229NXK', '16960NXK', '16092NXK', '12350NXK', '12500NXK',
+    '11229NXK', '166290008',
+  ]);
+
   try {
     const token = await getWalmartToken();
 
     console.log('[price-correct] Fetching stuck ($285/$284.99) Walmart items + Shopify variants…');
-    const [stuck, shopify] = await Promise.all([
+    const [stuckRaw, shopify] = await Promise.all([
       fetchStuckItems(token),
       fetchAllShopifyVariants(),
     ]);
-    console.log(`[price-correct] ${stuck.length} stuck items, ${shopify.size} Shopify variants`);
+    const stuck = stuckRaw.filter(item => !LEGITIMATE_284_SKUS.has(item.sku));
+    const legitimateCount = stuckRaw.length - stuck.length;
+    if (legitimateCount > 0) {
+      console.log(`[price-correct] Excluded ${legitimateCount} legitimately-priced $284.99 SKUs from stuck list`);
+    }
+    console.log(`[price-correct] ${stuck.length} stuck items (${stuckRaw.length} raw), ${shopify.size} Shopify variants`);
 
     const page = stuck.slice(offset, offset + limit);
 
@@ -197,6 +212,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(errors.length ? 207 : 200).json({
       dryRun,
       totalStuck: stuck.length,
+      legitimateSkipped: legitimateCount,
       processed: page.length,
       offset,
       limit,
