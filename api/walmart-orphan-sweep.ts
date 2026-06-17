@@ -21,6 +21,7 @@ import {
   fetchListedSkus,
   bulkInventoryFeed,
   chunkArray,
+  walmartFetch,
   type WalmartInventoryItem,
 } from './lib/walmart-client';
 
@@ -214,6 +215,30 @@ async function fetchVariantInventoryIds(
   return map;
 }
 
+// ── Fetch current Walmart quantity per SKU (best-effort, concurrency-limited) ──
+// Used only in dry-run reporting so we can distinguish live oversell vectors
+// (qty > 0) from already-zero/harmless orphans. Never writes. A failed lookup
+// is recorded as -1 (unknown) and never blocks the sweep.
+async function fetchWalmartQtys(skus: string[]): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  const CONCURRENCY = 10;
+  for (let i = 0; i < skus.length; i += CONCURRENCY) {
+    const batch = skus.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async sku => {
+      try {
+        const data = await walmartFetch<{ quantity?: { amount?: number } }>(
+          `/v3/inventory?sku=${encodeURIComponent(sku)}`,
+        );
+        const amt = data?.quantity?.amount;
+        map.set(sku, typeof amt === 'number' ? amt : 0);
+      } catch {
+        map.set(sku, -1); // unknown — lookup failed, non-fatal
+      }
+    }));
+  }
+  return map;
+}
+
 // ─── MAIN HANDLER ───────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -264,6 +289,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     console.log(`[orphan-sweep] Orphan count: ${orphans.length}`);
 
     if (dryRun) {
+      // Optional: probe each orphan's current Walmart quantity so the report
+      // separates live oversell vectors (qty > 0) from already-zero orphans.
+      const withQty = (req.query.withQty as string) === 'true';
+      let qtyReport: Record<string, unknown> | undefined;
+      if (withQty && orphans.length > 0) {
+        console.log(`[orphan-sweep] Probing Walmart qty for ${orphans.length} orphans…`);
+        const qtyMap = await fetchWalmartQtys(orphans);
+        const liveVectors = orphans
+          .map(sku => ({ sku, qty: qtyMap.get(sku) ?? -1 }))
+          .filter(o => o.qty > 0)
+          .sort((a, b) => b.qty - a.qty);
+        const unknown = [...qtyMap.values()].filter(q => q < 0).length;
+        qtyReport = {
+          liveVectorCount: liveVectors.length,
+          liveVectors,                    // full list of orphans with residual stock
+          alreadyZero: orphans.length - liveVectors.length - unknown,
+          qtyLookupFailed: unknown,
+        };
+      }
+
       return res.status(200).json({
         ok: true,
         mode: 'walmart-orphan-sweep',
@@ -271,7 +316,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         walmartListed: walmartListed.size,
         shopifyActiveCtSync: shopifyActive.size,
         orphanCount: orphans.length,
-        orphanSample: orphans.slice(0, 50),
+        orphans,                          // FULL list (not a slice)
+        ...(qtyReport ?? {}),
         durationMs: Date.now() - start,
       });
     }

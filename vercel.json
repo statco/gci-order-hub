@@ -34,6 +34,8 @@
     { "path": "/api/walmart-sync?mode=listed&offset=1800&limit=300", "schedule": "30 9 * * *" },
     { "path": "/api/walmart-sync?mode=listed&offset=2100&limit=300", "schedule": "35 9 * * *" },
     { "path": "/api/walmart-sync?mode=listed&offset=2400&limit=300", "schedule": "40 9 * * *" },
+    { "path": "/api/walmart-sync?mode=listed&offset=2700&limit=300", "schedule": "45 9 * * *" },
+    { "path": "/api/walmart-sync?mode=listed&offset=3000&limit=300", "schedule": "50 9 * * *" },
     { "path": "/api/walmart-order-sync",                             "schedule": "*/15 * * * *" },
     { "path": "/api/cost-integrity-audit",                           "schedule": "0 9 * * *"   },
     { "path": "/api/walmart-reconcile",                              "schedule": "0 10 * * *"  },
