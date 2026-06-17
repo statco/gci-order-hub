@@ -11,6 +11,9 @@
 //
 // Query params:
 //   ?dryRun=true|false  — default true (preview only)
+//   ?offset=0&limit=150 — chunk per-SKU work (qty probe / zero push)
+//   ?withQty=true       — dry-run: probe Walmart qty per orphan in chunk
+//   ?mode=sku-lookup&sku=XXX — targeted single-SKU status check (read-only)
 //
 // Auth: Bearer token must match WALMART_ZERO_SECRET env var.
 // Cron: daily at 11 AM UTC (vercel.json)
@@ -239,6 +242,109 @@ async function fetchWalmartQtys(skus: string[]): Promise<Map<string, number>> {
   return map;
 }
 
+// ── Targeted SKU status lookup (read-only, no full scan) ────────
+// Returns: Walmart listing status, active Shopify match, any-status Shopify match
+async function skuLookup(sku: string): Promise<{
+  sku: string;
+  walmart: { listed: boolean; forms: string[] };
+  shopifyActive: { found: boolean; matchedSku: string | null };
+  shopifyAnyStatus: Array<{ sku: string; status: string; inventoryQuantity: number; productId: number }>;
+}> {
+  const bare = sku.toUpperCase().startsWith('TIRE-') ? sku.toUpperCase().slice(5) : sku.toUpperCase();
+  const tireForm = 'TIRE-' + bare;
+
+  // (a) Walmart listing check
+  const listedSkus = await fetchListedSkus();
+  const walmartForms: string[] = [];
+  if (listedSkus.has(bare)) walmartForms.push(bare);
+  if (listedSkus.has(tireForm)) walmartForms.push(tireForm);
+
+  // (b) Active ct-sync Shopify product with bare SKU
+  let activeMatch: string | null = null;
+  try {
+    const data: { products: Array<{ id: number; variants: Array<{ sku: string }> }> } =
+      await shopifyRest(`/products.json?tag=ct-sync&status=active&limit=250&fields=id,variants`);
+    // Search through pages for this specific SKU
+    let products = data.products ?? [];
+    let sinceId = 0;
+    const checkProducts = (prods: typeof products) => {
+      for (const p of prods) {
+        for (const v of p.variants) {
+          const vSku = (v.sku ?? '').toUpperCase();
+          if (vSku === bare || vSku === tireForm) {
+            activeMatch = vSku;
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+    if (!checkProducts(products)) {
+      while (products.length === 250) {
+        sinceId = products[products.length - 1].id;
+        const next: typeof data = await shopifyRest(`/products.json?tag=ct-sync&status=active&limit=250&fields=id,variants&since_id=${sinceId}`);
+        products = next.products ?? [];
+        if (checkProducts(products)) break;
+        await delay(300);
+      }
+    }
+  } catch (e: unknown) {
+    console.warn(`[sku-lookup] Active product search error: ${e instanceof Error ? e.message : e}`);
+  }
+
+  // (c) Any-status Shopify products holding this SKU (search by title/sku isn't
+  //     reliable via REST, so we use GraphQL to find variants by SKU)
+  const anyStatus: Array<{ sku: string; status: string; inventoryQuantity: number; productId: number }> = [];
+  try {
+    for (const searchSku of [bare, tireForm]) {
+      const query = `{
+        productVariants(first: 10, query: "sku:${searchSku}") {
+          edges {
+            node {
+              sku
+              inventoryQuantity
+              product { id status }
+            }
+          }
+        }
+      }`;
+      const gqlRes = await fetch(
+        `https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}/graphql.json`,
+        {
+          method: 'POST',
+          headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query }),
+        },
+      );
+      if (gqlRes.ok) {
+        const gqlData: any = await gqlRes.json();
+        for (const edge of gqlData?.data?.productVariants?.edges ?? []) {
+          const n = edge.node;
+          const nSku = (n.sku ?? '').toUpperCase();
+          if (nSku === bare || nSku === tireForm) {
+            const pid = parseInt(String(n.product?.id ?? '').split('/').pop() ?? '0', 10);
+            anyStatus.push({
+              sku: nSku,
+              status: (n.product?.status ?? 'unknown').toUpperCase(),
+              inventoryQuantity: n.inventoryQuantity ?? 0,
+              productId: pid,
+            });
+          }
+        }
+      }
+    }
+  } catch (e: unknown) {
+    console.warn(`[sku-lookup] Any-status search error: ${e instanceof Error ? e.message : e}`);
+  }
+
+  return {
+    sku: sku.toUpperCase(),
+    walmart: { listed: walmartForms.length > 0, forms: walmartForms },
+    shopifyActive: { found: activeMatch !== null, matchedSku: activeMatch },
+    shopifyAnyStatus: anyStatus,
+  };
+}
+
 // ─── MAIN HANDLER ───────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -264,12 +370,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(500).json({ error: 'Shopify credentials not configured' });
     }
 
+    // ── SKU Lookup mode (read-only, fast, no full scan) ───────────
+    const mode = req.query.mode as string | undefined;
+    if (mode === 'sku-lookup') {
+      const skuParam = req.query.sku as string;
+      if (!skuParam) {
+        return res.status(400).json({ error: 'mode=sku-lookup requires ?sku=XXX' });
+      }
+      const start = Date.now();
+      const result = await skuLookup(skuParam);
+      return res.status(200).json({
+        ok: true,
+        mode: 'sku-lookup',
+        ...result,
+        durationMs: Date.now() - start,
+      });
+    }
+
     const dryRun = (req.query.dryRun as string ?? 'true') !== 'false';
-    const start = Date.now();
+    const offset = Math.max(0, parseInt(req.query.offset as string || '0', 10));
+    const limit  = Math.max(1, Math.min(500, parseInt(req.query.limit as string || '150', 10)));
+    const start  = Date.now();
 
-    console.log(`[orphan-sweep] Starting${dryRun ? ' [DRY RUN]' : ' [WRITE MODE]'}…`);
+    console.log(`[orphan-sweep] Starting${dryRun ? ' [DRY RUN]' : ' [WRITE MODE]'} offset=${offset} limit=${limit}…`);
 
-    // ── Step 1: Fetch both sides ──────────────────────────────────
+    // ── Step 1: Fetch both sides (fast — ~6s) ─────────────────────
     const [walmartListed, shopifyActive] = await Promise.all([
       fetchListedSkus(),
       fetchActiveCtSyncSkus(),
@@ -277,7 +402,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     console.log(`[orphan-sweep] Walmart listed: ${walmartListed.size}, Shopify active ct-sync: ${shopifyActive.size}`);
 
-    // ── Step 2: Compute orphans ───────────────────────────────────
+    // ── Step 2: Compute full orphan set ───────────────────────────
     const orphans: string[] = [];
     for (const sku of walmartListed) {
       if (!shopifyActive.has(sku)) {
@@ -286,28 +411,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     orphans.sort();
 
-    console.log(`[orphan-sweep] Orphan count: ${orphans.length}`);
+    const orphanCount = orphans.length;
+    console.log(`[orphan-sweep] Orphan count: ${orphanCount}`);
+
+    // ── Step 3: Slice to chunk ────────────────────────────────────
+    const chunk = orphans.slice(offset, offset + limit);
+    const chunkSize = chunk.length;
+    const nextOffset = (offset + limit < orphanCount) ? offset + limit : null;
+    const done = nextOffset === null;
+
+    console.log(`[orphan-sweep] Chunk: offset=${offset} limit=${limit} chunkSize=${chunkSize} nextOffset=${nextOffset} done=${done}`);
 
     if (dryRun) {
-      // Optional: probe each orphan's current Walmart quantity so the report
-      // separates live oversell vectors (qty > 0) from already-zero orphans.
       const withQty = (req.query.withQty as string) === 'true';
       let qtyReport: Record<string, unknown> | undefined;
-      if (withQty && orphans.length > 0) {
-        console.log(`[orphan-sweep] Probing Walmart qty for ${orphans.length} orphans…`);
-        const qtyMap = await fetchWalmartQtys(orphans);
-        const liveVectors = orphans
+      if (withQty && chunkSize > 0) {
+        console.log(`[orphan-sweep] Probing Walmart qty for ${chunkSize} orphans in chunk…`);
+        const qtyMap = await fetchWalmartQtys(chunk);
+        const liveVectors = chunk
           .map(sku => ({ sku, qty: qtyMap.get(sku) ?? -1 }))
           .filter(o => o.qty > 0)
           .sort((a, b) => b.qty - a.qty);
         const unknown = [...qtyMap.values()].filter(q => q < 0).length;
         qtyReport = {
           liveVectorCount: liveVectors.length,
-          liveVectors,                    // full list of orphans with residual stock
-          alreadyZero: orphans.length - liveVectors.length - unknown,
+          liveVectors,
+          alreadyZero: chunkSize - liveVectors.length - unknown,
           qtyLookupFailed: unknown,
         };
       }
+
+      const showOrphans = (req.query.showOrphans as string) === 'true';
 
       return res.status(200).json({
         ok: true,
@@ -315,40 +449,63 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         dryRun: true,
         walmartListed: walmartListed.size,
         shopifyActiveCtSync: shopifyActive.size,
-        orphanCount: orphans.length,
-        orphans,                          // FULL list (not a slice)
+        orphanCount,
+        offset,
+        limit,
+        chunkSize,
+        nextOffset,
+        done,
+        ...(showOrphans ? { orphans } : {}),
+        chunkSkus: chunk,
         ...(qtyReport ?? {}),
         durationMs: Date.now() - start,
       });
     }
 
-    // ── Step 3 (write mode): Zero Walmart inventory for orphans ───
-    const walmartItems: WalmartInventoryItem[] = orphans.map(sku => ({
+    // ── Write mode: zero Walmart + Shopify for chunk only ─────────
+    if (chunkSize === 0) {
+      return res.status(200).json({
+        ok: true,
+        mode: 'walmart-orphan-sweep',
+        dryRun: false,
+        orphanCount,
+        offset,
+        limit,
+        chunkSize: 0,
+        nextOffset,
+        done,
+        walmartZeroed: { success: 0, failed: 0 },
+        shopifyZeroed: { success: 0, failed: 0, skipped: 0 },
+        durationMs: Date.now() - start,
+      });
+    }
+
+    // ── Zero Walmart inventory for chunk ──────────────────────────
+    const walmartItems: WalmartInventoryItem[] = chunk.map(sku => ({
       sku,
       quantity: 0, // ALWAYS zero — NEVER non-zero
     }));
 
     let wmSuccess = 0;
     let wmFailed = 0;
-    for (const chunk of chunkArray(walmartItems, 1000)) {
+    for (const wChunk of chunkArray(walmartItems, 1000)) {
       try {
-        const result = await bulkInventoryFeed(chunk);
+        const result = await bulkInventoryFeed(wChunk);
         wmSuccess += result.success;
         wmFailed += result.failed;
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[orphan-sweep] Walmart chunk error: ${msg}`);
-        wmFailed += chunk.length;
+        wmFailed += wChunk.length;
       }
       await delay(500);
     }
 
     console.log(`[orphan-sweep] Walmart zeroed: ${wmSuccess} success, ${wmFailed} failed`);
 
-    // ── Step 4 (write mode): Zero Shopify inventory for orphans ───
-    // Build set of orphan SKUs (both bare and TIRE- forms for matching)
+    // ── Zero Shopify inventory for chunk ──────────────────────────
     const orphanSkuSet = new Set<string>();
-    for (const sku of orphans) {
+    for (const sku of chunk) {
       orphanSkuSet.add(sku);
       const bare = sku.startsWith('TIRE-') ? sku.slice(5) : sku;
       orphanSkuSet.add(bare);
@@ -363,9 +520,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const locationId = await getLocationId();
       const variantMap = await fetchVariantInventoryIds(orphanSkuSet);
 
-      console.log(`[orphan-sweep] Found ${variantMap.size} Shopify variants matching orphan SKUs`);
+      console.log(`[orphan-sweep] Found ${variantMap.size} Shopify variants matching chunk SKUs`);
 
-      // Zero inventory for orphan variants that have non-zero stock
       for (const [sku, info] of variantMap) {
         if (info.qty === 0) {
           shopifySkipped++;
@@ -383,7 +539,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           console.error(`[orphan-sweep] Shopify zero failed for ${sku} (item ${info.inventoryItemId}): ${msg}`);
           shopifyFailed++;
         }
-        await delay(200); // respect rate limits
+        await delay(200);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -398,8 +554,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       dryRun: false,
       walmartListed: walmartListed.size,
       shopifyActiveCtSync: shopifyActive.size,
-      orphanCount: orphans.length,
-      orphanSample: orphans.slice(0, 50),
+      orphanCount,
+      offset,
+      limit,
+      chunkSize,
+      nextOffset,
+      done,
+      chunkSkuSample: chunk.slice(0, 20),
       walmartZeroed: { success: wmSuccess, failed: wmFailed },
       shopifyZeroed: { success: shopifySuccess, failed: shopifyFailed, skipped: shopifySkipped },
       durationMs: Date.now() - start,
