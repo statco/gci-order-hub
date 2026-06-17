@@ -388,8 +388,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const dryRun = (req.query.dryRun as string ?? 'true') !== 'false';
-    const offset = Math.max(0, parseInt(req.query.offset as string || '0', 10));
-    const limit  = Math.max(1, Math.min(500, parseInt(req.query.limit as string || '150', 10)));
+    const rawOffset = parseInt(String(req.query.offset ?? '0'), 10);
+    const offset = Number.isNaN(rawOffset) ? 0 : Math.max(0, rawOffset);
+    const rawLimit  = parseInt(String(req.query.limit ?? '150'), 10);
+    const limit  = Number.isNaN(rawLimit) ? 150 : Math.max(1, Math.min(500, rawLimit));
     const start  = Date.now();
 
     console.log(`[orphan-sweep] Starting${dryRun ? ' [DRY RUN]' : ' [WRITE MODE]'} offset=${offset} limit=${limit}…`);
