@@ -347,6 +347,28 @@ export async function getFeedStatus(feedId: string): Promise<any> {
 export const getWalmartToken = getToken;
 
 /**
+ * Retire (permanently remove) a single item from the Walmart catalogue.
+ * Uses DELETE /v3/items/{sku}. Returns true on success, false on a benign
+ * "already gone" response (404/410), and throws on unexpected errors.
+ */
+export async function retireItem(sku: string): Promise<boolean> {
+  const { status, ok, body } = await walmartFetchRaw(
+    `/v3/items/${encodeURIComponent(sku)}`,
+    { method: 'DELETE' },
+  );
+
+  if (ok || status === 204) return true;
+
+  // 404/410 → item already absent; treat as idempotent success
+  if (status === 404 || status === 410) {
+    console.log(`[retireItem] ${sku} already absent (${status}) — treating as success`);
+    return true;
+  }
+
+  throw new Error(`Walmart retire ${sku} failed HTTP ${status}: ${body.slice(0, 200)}`);
+}
+
+/**
  * Chunk an array for Walmart's 1 000-item feed limit.
  */
 export function chunkArray<T>(arr: T[], size = 1_000): T[][] {
