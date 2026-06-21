@@ -108,7 +108,12 @@ export async function fetchAllShopifyVariants(): Promise<Map<string, ShopifyVari
  * source — only active products can sell, so only their quantities are safe
  * to push to Walmart.
  *
- * Filters: product.status = ACTIVE AND product.tags includes "ct-sync".
+ * Filters via the `products` connection: status:active tag:ct-sync.
+ * Using `products` (not `productVariants`) because the products connection's
+ * `status` filter is authoritative — the productVariants connection does not
+ * support product-level filter predicates and silently ignores them, meaning
+ * archived/draft variants leak through.
+ *
  * Returns a Map keyed by UPPER-cased bare SKU (no TIRE- prefix).
  */
 export async function fetchActiveCtSyncVariants(): Promise<Map<string, ShopifyVariantData>> {
@@ -121,21 +126,24 @@ export async function fetchActiveCtSyncVariants(): Promise<Map<string, ShopifyVa
   let hasMore = true;
 
   while (hasMore) {
-    // Filter to active ct-sync products only. Shopify GraphQL productVariants
-    // supports query strings with product.status and product.tag filters.
-    const queryFilter = 'product.status:active product.tag:ct-sync';
     const query: string = `{
-      productVariants(first: 250, query: "${queryFilter}"${cursor ? `, after: "${cursor}"` : ''}) {
+      products(first: 250, query: "status:active tag:ct-sync"${cursor ? `, after: "${cursor}"` : ''}) {
         pageInfo { hasNextPage endCursor }
         edges {
           node {
-            sku
-            price
-            inventoryQuantity
-            inventoryItem { unitCost { amount } }
-            product {
-              ctCost: metafield(namespace: "canada_tire", key: "cost") { value }
+            id
+            variants(first: 100) {
+              pageInfo { hasNextPage }
+              edges {
+                node {
+                  sku
+                  price
+                  inventoryQuantity
+                  inventoryItem { unitCost { amount } }
+                }
+              }
             }
+            ctCost: metafield(namespace: "canada_tire", key: "cost") { value }
           }
         }
       }
@@ -162,30 +170,39 @@ export async function fetchActiveCtSyncVariants(): Promise<Map<string, ShopifyVa
     const data: any = await res.json();
     if (data.errors) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors).slice(0, 200)}`);
 
-    const variants: any = data?.data?.productVariants;
-    if (!variants) throw new Error('Shopify GraphQL: unexpected response shape');
+    const products: any = data?.data?.products;
+    if (!products) throw new Error('Shopify GraphQL: unexpected response shape');
 
-    for (const edge of variants.edges) {
-      const node = edge.node;
-      const rawSku = (node.sku ?? '').toUpperCase();
-      if (!rawSku) continue;
-      // Normalise to bare SKU — TIRE- products are archived; active products
-      // carry bare SKUs. Strip any accidental TIRE- prefix just in case.
-      const sku = rawSku.startsWith('TIRE-') ? rawSku.slice(5) : rawSku;
+    for (const productEdge of products.edges) {
+      const product = productEdge.node;
+      const rawCt   = product.ctCost?.value;
 
-      const rawCost = node.inventoryItem?.unitCost?.amount;
-      const rawCt   = node.product?.ctCost?.value;
-      map.set(sku, {
-        sku,
-        price: node.price != null ? parseFloat(node.price) : null,
-        cost: rawCost != null ? parseFloat(rawCost) : null,
-        ctCost: rawCt != null ? parseFloat(rawCt) : null,
-        inventoryQuantity: node.inventoryQuantity != null ? Number(node.inventoryQuantity) : null,
-      });
+      // Tire listings are one-variant-per-product; guard in case that changes.
+      if (product.variants.pageInfo.hasNextPage) {
+        console.warn(`[fetchActiveCtSyncVariants] product ${product.id} has >100 variants — trailing variants skipped`);
+      }
+
+      for (const variantEdge of product.variants.edges) {
+        const node   = variantEdge.node;
+        const rawSku = (node.sku ?? '').toUpperCase();
+        if (!rawSku) continue;
+        // Normalise to bare SKU — active products carry bare SKUs; strip any
+        // accidental TIRE- prefix just in case.
+        const sku = rawSku.startsWith('TIRE-') ? rawSku.slice(5) : rawSku;
+
+        const rawCost = node.inventoryItem?.unitCost?.amount;
+        map.set(sku, {
+          sku,
+          price:             node.price != null ? parseFloat(node.price) : null,
+          cost:              rawCost != null ? parseFloat(rawCost) : null,
+          ctCost:            rawCt   != null ? parseFloat(rawCt)   : null,
+          inventoryQuantity: node.inventoryQuantity != null ? Number(node.inventoryQuantity) : null,
+        });
+      }
     }
 
-    hasMore = variants.pageInfo.hasNextPage;
-    cursor = variants.pageInfo.endCursor;
+    hasMore = products.pageInfo.hasNextPage;
+    cursor  = products.pageInfo.endCursor;
   }
 
   return map;
