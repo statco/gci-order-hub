@@ -101,3 +101,93 @@ export async function fetchAllShopifyVariants(): Promise<Map<string, ShopifyVari
 
   return map;
 }
+
+/**
+ * Fetch ACTIVE ct-sync Shopify variants only, with inventory quantity, price,
+ * and cost. Used by the mode=listed sync path as the authoritative quantity
+ * source — only active products can sell, so only their quantities are safe
+ * to push to Walmart.
+ *
+ * Filters: product.status = ACTIVE AND product.tags includes "ct-sync".
+ * Returns a Map keyed by UPPER-cased bare SKU (no TIRE- prefix).
+ */
+export async function fetchActiveCtSyncVariants(): Promise<Map<string, ShopifyVariantData>> {
+  if (!SHOPIFY_STORE || !SHOPIFY_TOKEN) {
+    throw new Error('Shopify credentials not configured (SHOPIFY_STORE_DOMAIN / SHOPIFY_ADMIN_API_TOKEN)');
+  }
+
+  const map = new Map<string, ShopifyVariantData>();
+  let cursor: string | null = null;
+  let hasMore = true;
+
+  while (hasMore) {
+    // Filter to active ct-sync products only. Shopify GraphQL productVariants
+    // supports query strings with product.status and product.tag filters.
+    const queryFilter = 'product.status:active product.tag:ct-sync';
+    const query: string = `{
+      productVariants(first: 250, query: "${queryFilter}"${cursor ? `, after: "${cursor}"` : ''}) {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            sku
+            price
+            inventoryQuantity
+            inventoryItem { unitCost { amount } }
+            product {
+              ctCost: metafield(namespace: "canada_tire", key: "cost") { value }
+            }
+          }
+        }
+      }
+    }`;
+
+    const res: Response = await fetch(
+      `https://${SHOPIFY_STORE}/admin/api/${API_VERSION}/graphql.json`,
+      {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query }),
+      },
+    );
+
+    if (res.status === 429) {
+      await new Promise(r => setTimeout(r, 2_000));
+      continue;
+    }
+    if (!res.ok) throw new Error(`Shopify GraphQL error: ${res.status} ${(await res.text()).slice(0, 200)}`);
+
+    const data: any = await res.json();
+    if (data.errors) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors).slice(0, 200)}`);
+
+    const variants: any = data?.data?.productVariants;
+    if (!variants) throw new Error('Shopify GraphQL: unexpected response shape');
+
+    for (const edge of variants.edges) {
+      const node = edge.node;
+      const rawSku = (node.sku ?? '').toUpperCase();
+      if (!rawSku) continue;
+      // Normalise to bare SKU — TIRE- products are archived; active products
+      // carry bare SKUs. Strip any accidental TIRE- prefix just in case.
+      const sku = rawSku.startsWith('TIRE-') ? rawSku.slice(5) : rawSku;
+
+      const rawCost = node.inventoryItem?.unitCost?.amount;
+      const rawCt   = node.product?.ctCost?.value;
+      map.set(sku, {
+        sku,
+        price: node.price != null ? parseFloat(node.price) : null,
+        cost: rawCost != null ? parseFloat(rawCost) : null,
+        ctCost: rawCt != null ? parseFloat(rawCt) : null,
+        inventoryQuantity: node.inventoryQuantity != null ? Number(node.inventoryQuantity) : null,
+      });
+    }
+
+    hasMore = variants.pageInfo.hasNextPage;
+    cursor = variants.pageInfo.endCursor;
+  }
+
+  return map;
+}
+

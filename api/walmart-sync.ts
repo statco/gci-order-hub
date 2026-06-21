@@ -38,7 +38,7 @@ import {
   type WalmartPriceItem,
   type WalmartInventoryItem,
 } from './lib/walmart-client';
-import { fetchAllShopifyVariants } from './lib/shopify';
+import { fetchAllShopifyVariants, fetchActiveCtSyncVariants } from './lib/shopify';
 import { safeWalmartPrice, PRICE_FLOOR_MULTIPLIER } from './lib/pricing';
 
 export const config = { maxDuration: 300 };
@@ -153,48 +153,64 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   let items: SyncItem[];
   let listedSkuCount: number | undefined;
   let totalListed = 0;
+  // Tracks listed SKUs whose bare twin has no active ct-sync Shopify variant —
+  // these are zeroed (not dropped) so their Walmart listing is corrected.
+  let zeroedNoActiveMatch = 0;
 
   if (isChunkedListed) {
     try {
-      console.log('🔍 [chunked] Fetching Walmart SKU list…');
-      const allListedSkus   = await fetchListedSkus();
+      console.log('🔍 [chunked] Fetching Walmart SKU list + active Shopify variants…');
+      // Fetch both in parallel: Walmart listed set + active ct-sync variant map.
+      // The active map is the sole quantity source — /variants.json is NOT used
+      // because it returns variants from archived/draft products, causing the
+      // qty-source bug that re-armed 360 oversell vectors in June 2026.
+      const [allListedSkus, activeVariantMap] = await Promise.all([
+        fetchListedSkus(),
+        fetchActiveCtSyncVariants(),
+      ]);
+
       const listedSkusArray = [...allListedSkus];
       totalListed    = listedSkusArray.length;
       listedSkuCount = totalListed;
 
       const chunkSkus = listedSkusArray.slice(offsetParam, offsetParam + (limitParam as number));
-      console.log(`🔍 [chunked] ${chunkSkus.length} SKUs in chunk (offset ${offsetParam}, limit ${limitParam} of ${totalListed})`);
+      console.log(`🔍 [chunked] ${chunkSkus.length} SKUs in chunk (offset ${offsetParam}, limit ${limitParam} of ${totalListed}); active Shopify variants: ${activeVariantMap.size}`);
 
       items = [];
-      const BATCH = 20;
-      for (let i = 0; i < chunkSkus.length; i += BATCH) {
-        const batch = chunkSkus.slice(i, i + BATCH);
-        const results = await Promise.all(batch.map(async (walmartSku) => {
-          const bareSku = walmartSku.startsWith('TIRE-') ? walmartSku.slice(5) : walmartSku;
-          try {
-            const data: any = await shopifyGet<any>(`/variants.json?sku=${encodeURIComponent(bareSku)}&fields=sku,price,inventory_quantity`);
-            const variants: any[] = data.variants ?? [];
-            if (variants.length > 0) {
-              const v = variants[0];
-              const shopifyQty = Math.max(0, (v.inventory_quantity as number) ?? 0);
-              return {
-                sku:        walmartSku,
-                price:      parseFloat(v.price as string) || 0,
-                cost:       null,  // enriched post-fetch from the GraphQL variant map
-                ctCost:     null,  // enriched post-fetch (canada_tire.cost)
-                shopifyQty,
-                walmartQty: shopifyQty, // send real qty; 0 only when Shopify is 0
-              } as SyncItem;
-            }
-          } catch (err: any) {
-            console.warn(`[chunked] Shopify lookup failed for ${bareSku}: ${err.message}`);
-          }
-          return null;
-        }));
-        items.push(...results.filter((r): r is SyncItem => r !== null));
-        await delay(200);
+      for (const walmartSku of chunkSkus) {
+        // Normalise to bare SKU for the active-variant map lookup.
+        const bareSku = walmartSku.startsWith('TIRE-') ? walmartSku.slice(5) : walmartSku;
+        const activeVariant = activeVariantMap.get(bareSku);
+
+        if (activeVariant != null) {
+          // Active ct-sync variant exists — use its real inventory quantity.
+          const shopifyQty = Math.max(0, activeVariant.inventoryQuantity ?? 0);
+          items.push({
+            sku:        walmartSku,
+            price:      activeVariant.price ?? 0,
+            cost:       activeVariant.cost,
+            ctCost:     activeVariant.ctCost,
+            shopifyQty,
+            walmartQty: shopifyQty,
+          });
+        } else {
+          // No active ct-sync variant — archived, draft, or no Shopify product.
+          // Push qty 0 (safe correction) rather than omitting the SKU entirely.
+          // Omitting would leave the Walmart listing at its current (possibly
+          // re-armed default-100) value; zeroing is always the safe path.
+          zeroedNoActiveMatch++;
+          items.push({
+            sku:        walmartSku,
+            price:      0,
+            cost:       null,
+            ctCost:     null,
+            shopifyQty: 0,
+            walmartQty: 0,
+          });
+        }
       }
-      console.log(`[chunked] Shopify lookup complete: ${items.length} of ${chunkSkus.length} SKUs found`);
+
+      console.log(`[chunked] built ${items.length} items; zeroedNoActiveMatch=${zeroedNoActiveMatch}`);
     } catch (err: any) {
       console.error('❌ Chunked listed fetch failed:', err.message);
       return res.status(500).json({ error: 'Chunked fetch failed', details: err.message });
@@ -288,19 +304,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // ── Enrich with cost (LAYER 1 floor needs it) ───────────────────────
-  // Cost lives on InventoryItem.unitCost in GraphQL — not returned by the
-  // REST product/variant calls above. Fetch it once and attach by SKU.
-  try {
-    const variantMap = await fetchAllShopifyVariants();
-    for (const i of items) {
-      const v = variantMap.get(i.sku) ?? variantMap.get(i.sku.replace(/^TIRE-/, ''));
-      i.cost = v?.cost ?? null;
-      i.ctCost = v?.ctCost ?? null;
+  // Cost lives on InventoryItem.unitCost in GraphQL. For the chunked listed
+  // path cost is already attached from fetchActiveCtSyncVariants(); this
+  // enrichment step only runs for the full-scan (fetchTireVariants) path.
+  if (!isChunkedListed) {
+    try {
+      const variantMap = await fetchAllShopifyVariants();
+      for (const i of items) {
+        const v = variantMap.get(i.sku) ?? variantMap.get(i.sku.replace(/^TIRE-/, ''));
+        i.cost = v?.cost ?? null;
+        i.ctCost = v?.ctCost ?? null;
+      }
+      const withCost = items.filter(i => i.cost != null).length;
+      console.log(`💲 Cost enrichment: ${withCost}/${items.length} variants have a cost`);
+    } catch (err: any) {
+      console.error('❌ Cost enrichment failed (prices will be skipped without cost):', err.message);
     }
-    const withCost = items.filter(i => i.cost != null).length;
-    console.log(`💲 Cost enrichment: ${withCost}/${items.length} variants have a cost`);
-  } catch (err: any) {
-    console.error('❌ Cost enrichment failed (prices will be skipped without cost):', err.message);
   }
 
   // Suppression removed: an in-stock SKU is never zeroed. This stays as a
@@ -317,6 +336,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       total:        items.length,
       safetyZeroed,
       zeroStock,
+      zeroedNoActiveMatch,
       ...(listedSkuCount !== undefined ? { listedSkuCount } : {}),
       sample:       items.slice(0, 5).map(i => ({
         sku:        i.sku,
@@ -397,6 +417,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       limit:          limitParam,
       nextOffset,
       done:           nextOffset === null,
+      zeroedNoActiveMatch,
       priceResult,
       inventoryResult,
       skippedNoCostCount: skippedNoCost.length,
