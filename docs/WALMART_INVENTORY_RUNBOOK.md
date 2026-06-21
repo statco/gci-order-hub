@@ -304,6 +304,8 @@ un-retired) is invisible to the sweep. Catch these via the `mode=listed` sync dr
 | #123 (gci-brain) | `inventory-reconcile` (hourly) + zero-before-archive + reactive `pushWalmartZeros`. |
 | #31 | `walmart-retire` endpoint: bulk-retire `TIRE-` duplicate listings. Separate `WALMART_RETIRE_SECRET`. Hard guardrails: bare-SKU batch reject, live bare-twin check, `dryRun` default `true`, 100-SKU chunks, idempotent. No cron. |
 
+**2026-06-20 — Additive SKU-rename oversell incident:** 321 bare matched vectors + TIRE- duplicates re-armed by a second catalog rename; see [`WALMART_OVERSELL_INCIDENT_2026-06-20_HANDOFF.md`](./WALMART_OVERSELL_INCIDENT_2026-06-20_HANDOFF.md) for full timeline, fixes queued (A–E), and durable lessons.
+
 **June 2026 — TIRE- duplicate incident & retire execution:**
 An additive Walmart SKU-rename created 384 `TIRE-` duplicate listings (each had a confirmed
 live bare twin) re-armed with default qty 100. Remediation sequence:
