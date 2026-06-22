@@ -24,7 +24,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { fetchListedSkus, retireItem } from './lib/walmart-client';
+import { fetchListedSkus, retireItem, getItemLifecycleStatus } from './lib/walmart-client';
 
 export const config = { maxDuration: 300 };
 
@@ -164,14 +164,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    const retired: string[]                           = [];
-    const failed:  Array<{ sku: string; error: string }> = [];
+    const accepted: string[]                             = [];
+    const failed:   Array<{ sku: string; error: string }> = [];
 
     for (const sku of chunk) {
       try {
         await retireItem(sku);
-        console.log(`[walmart-retire] ✓ retired ${sku}`);
-        retired.push(sku);
+        console.log(`[walmart-retire] ✓ accepted ${sku}`);
+        accepted.push(sku);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[walmart-retire] ✗ ${sku}: ${msg}`);
@@ -181,28 +181,51 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await delay(150);
     }
 
+    // ── Lifecycle verification: accepted ≠ applied ──────────────────
+    // After accepting the DELETEs, re-query each item. A 404/410 response
+    // means the item is confirmed removed from the catalogue. Anything else
+    // means the DELETE was accepted but feed propagation is still pending.
+    await delay(2_000); // Brief pause before re-querying
+    const confirmedRetired: string[]    = [];
+    const acceptedButPending: string[]  = [];
+
+    for (const sku of accepted) {
+      const status = await getItemLifecycleStatus(sku);
+      if (status === 'NOT_FOUND') {
+        console.log(`[walmart-retire] ✓ confirmed retired ${sku}`);
+        confirmedRetired.push(sku);
+      } else {
+        console.log(`[walmart-retire] ⏳ accepted but still live (pending propagation): ${sku}`);
+        acceptedButPending.push(sku);
+      }
+    }
+
     console.log(
-      `[walmart-retire] done chunk: ${retired.length} retired, ${failed.length} failed, ` +
-      `${skippedNoBareTwin.length} skippedNoBareTwin`,
+      `[walmart-retire] done chunk: accepted=${accepted.length} confirmedRetired=${confirmedRetired.length} ` +
+      `acceptedButPending=${acceptedButPending.length} failed=${failed.length} ` +
+      `skippedNoBareTwin=${skippedNoBareTwin.length}`,
     );
 
     return res.status(200).json({
-      ok:               true,
-      dryRun:           false,
-      walmartListed:    listedSkus.size,
-      totalInputSkus:   skus.length,
-      willRetireCount:  totalWillRetire,
+      ok:                     failed.length === 0,
+      dryRun:                 false,
+      walmartListed:          listedSkus.size,
+      totalInputSkus:         skus.length,
+      willRetireCount:        totalWillRetire,
       skippedNoBareTwin,
       offset,
       limit,
       chunkSize,
       nextOffset,
       done,
-      retiredCount:     retired.length,
-      retired,
-      failedCount:      failed.length,
+      acceptedCount:          accepted.length,
+      confirmedRetiredCount:  confirmedRetired.length,
+      confirmedRetired,
+      acceptedButPendingCount: acceptedButPending.length,
+      acceptedButPending:     acceptedButPending.slice(0, 50),
+      failedCount:            failed.length,
       failed,
-      durationMs:       Date.now() - start,
+      durationMs:             Date.now() - start,
     });
 
   } catch (err: unknown) {

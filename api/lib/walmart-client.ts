@@ -369,6 +369,18 @@ export async function retireItem(sku: string): Promise<boolean> {
 }
 
 /**
+ * Check whether a single Walmart item is still live after a DELETE.
+ * Returns 'NOT_FOUND' (404/410 → retire confirmed) or 'LIVE' (still in catalog).
+ * A brief propagation delay is expected; callers should treat 'LIVE' as pending,
+ * not as a failure — accepted ≠ applied.
+ */
+export async function getItemLifecycleStatus(sku: string): Promise<'NOT_FOUND' | 'LIVE'> {
+  const { status } = await walmartFetchRaw(`/v3/items/${encodeURIComponent(sku)}`);
+  if (status === 404 || status === 410) return 'NOT_FOUND';
+  return 'LIVE';
+}
+
+/**
  * Chunk an array for Walmart's 1 000-item feed limit.
  */
 export function chunkArray<T>(arr: T[], size = 1_000): T[][] {

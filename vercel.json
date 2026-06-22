@@ -15,9 +15,10 @@
     "api/walmart-ship.ts":        { "maxDuration": 60  },
     "api/getPendingOrders.ts":    { "maxDuration": 30  },
     "api/ct-tracking-parser.ts":  { "maxDuration": 60  },
-    "api/walmart-zero.ts":         { "maxDuration": 60  },
-    "api/walmart-orphan-sweep.ts": { "maxDuration": 300 },
-    "api/walmart-retire.ts":       { "maxDuration": 300 }
+    "api/walmart-zero.ts":             { "maxDuration": 120 },
+    "api/walmart-orphan-sweep.ts":     { "maxDuration": 300 },
+    "api/walmart-retire.ts":           { "maxDuration": 300 },
+    "api/walmart-oversell-monitor.ts": { "maxDuration": 300 }
   },
   "rewrites": [
     {
