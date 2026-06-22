@@ -13,5 +13,5 @@
     "rootDir": "."
   },
   "include": ["api/**/*.ts"],
-  "exclude": ["node_modules", ".vercel"]
+  "exclude": ["node_modules", ".vercel", "api/tests"]
 }
