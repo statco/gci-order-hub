@@ -359,6 +359,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost });
     return safe != null && safe < i.ctCost * PRICE_FLOOR_MULTIPLIER;
   };
+  // heldExposed: stored Shopify price is below true CT cost × floor (suspect cost); price write
+  // skipped until the stored cost is corrected. Inventory IS still pushed for these SKUs —
+  // only the price write is held, never the quantity write.
   const heldExposed: string[] = items.filter(isExposed).map(i => i.sku);
   if (heldExposed.length) {
     console.log(`⏸️  Exposure-held (price skipped, suspect cost): ${heldExposed.length} SKUs`);
