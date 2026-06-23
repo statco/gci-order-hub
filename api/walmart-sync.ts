@@ -38,8 +38,9 @@ import {
   type WalmartPriceItem,
   type WalmartInventoryItem,
 } from './lib/walmart-client';
-import { fetchAllShopifyVariants, fetchActiveCtSyncVariants } from './lib/shopify';
+import { fetchAllShopifyVariants } from './lib/shopify';
 import { safeWalmartPrice, PRICE_FLOOR_MULTIPLIER } from './lib/pricing';
+import { runListedSyncChunk } from './lib/listed-sync';
 
 export const config = { maxDuration: 300 };
 
@@ -145,85 +146,74 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }…`
   );
 
-  // ── Fetch Shopify data ────────────────────────────────────────────────
-  // Chunked mode=listed skips the full Shopify scan and looks up each SKU
-  // directly — reducing the per-chunk Shopify fetch from ~90s to ~30s.
+  // ── Chunked mode=listed: delegate entirely to runListedSyncChunk ──────────
+  // This is the cron path. All fetch + write logic lives in api/lib/listed-sync.ts
+  // so that the cursor endpoint (api/walmart-sync-cursor.ts) shares the same
+  // audited code path — no forked logic.
   const isChunkedListed = mode === 'listed' && limitParam !== null;
 
+  if (isChunkedListed) {
+    let result;
+    try {
+      result = await runListedSyncChunk({ offset: offsetParam, limit: limitParam as number, dry: isDry });
+    } catch (err: any) {
+      console.error('❌ Chunked listed sync failed:', err.message);
+      return res.status(500).json({ error: 'Chunked fetch failed', details: err.message });
+    }
+
+    if (isDry) {
+      const safetyZeroed = result.items.filter(i => i.shopifyQty > 0 && i.walmartQty === 0).length;
+      const zeroStock    = result.items.filter(i => i.shopifyQty === 0).length;
+      return res.status(200).json({
+        dryRun:              true,
+        total:               result.processed,
+        safetyZeroed,
+        zeroStock,
+        zeroedNoActiveMatch: result.zeroedNoActiveMatch,
+        listedSkuCount:      result.totalListed,
+        sample: result.items.slice(0, 5).map(i => ({
+          sku:        i.sku,
+          price:      i.price,
+          cost:       i.cost,
+          safePrice:  safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost }),
+          shopifyQty: i.shopifyQty,
+          walmartQty: i.walmartQty,
+        })),
+      });
+    }
+
+    return res.status(result.errors.length > 0 ? 207 : 200).json({
+      ok:                 result.errors.length === 0,
+      processed:          result.processed,
+      offset:             result.offset,
+      limit:              result.limit,
+      nextOffset:         result.nextOffset,
+      done:               result.done,
+      zeroedNoActiveMatch: result.zeroedNoActiveMatch,
+      priceResult:        result.priceResult,
+      inventoryResult:    result.inventoryResult,
+      skippedNoCostCount: result.skippedNoCost.length,
+      skippedNoCost:      result.skippedNoCost.slice(0, 100),
+      heldExposedCount:   result.heldExposed.length,
+      heldExposed:        result.heldExposed.slice(0, 100),
+      durationMs:         result.durationMs,
+      ...(result.errors.length ? { errors: result.errors } : {}),
+    });
+  }
+
+  // ── All other modes: non-chunked fetch ────────────────────────────────────
   let items: SyncItem[];
   let listedSkuCount: number | undefined;
   let totalListed = 0;
-  // Tracks listed SKUs whose bare twin has no active ct-sync Shopify variant —
-  // these are zeroed (not dropped) so their Walmart listing is corrected.
-  let zeroedNoActiveMatch = 0;
+  const zeroedNoActiveMatch = 0;
 
-  if (isChunkedListed) {
-    try {
-      console.log('🔍 [chunked] Fetching Walmart SKU list + active Shopify variants…');
-      // Fetch both in parallel: Walmart listed set + active ct-sync variant map.
-      // The active map is the sole quantity source — /variants.json is NOT used
-      // because it returns variants from archived/draft products, causing the
-      // qty-source bug that re-armed 360 oversell vectors in June 2026.
-      const [allListedSkus, activeVariantMap] = await Promise.all([
-        fetchListedSkus(),
-        fetchActiveCtSyncVariants(),
-      ]);
-
-      const listedSkusArray = [...allListedSkus];
-      totalListed    = listedSkusArray.length;
-      listedSkuCount = totalListed;
-
-      const chunkSkus = listedSkusArray.slice(offsetParam, offsetParam + (limitParam as number));
-      console.log(`🔍 [chunked] ${chunkSkus.length} SKUs in chunk (offset ${offsetParam}, limit ${limitParam} of ${totalListed}); active Shopify variants: ${activeVariantMap.size}`);
-
-      items = [];
-      for (const walmartSku of chunkSkus) {
-        // Normalise to bare SKU for the active-variant map lookup.
-        const bareSku = walmartSku.startsWith('TIRE-') ? walmartSku.slice(5) : walmartSku;
-        const activeVariant = activeVariantMap.get(bareSku);
-
-        if (activeVariant != null) {
-          // Active ct-sync variant exists — use its real inventory quantity.
-          const shopifyQty = Math.max(0, activeVariant.inventoryQuantity ?? 0);
-          items.push({
-            sku:        walmartSku,
-            price:      activeVariant.price ?? 0,
-            cost:       activeVariant.cost,
-            ctCost:     activeVariant.ctCost,
-            shopifyQty,
-            walmartQty: shopifyQty,
-          });
-        } else {
-          // No active ct-sync variant — archived, draft, or no Shopify product.
-          // Push qty 0 (safe correction) rather than omitting the SKU entirely.
-          // Omitting would leave the Walmart listing at its current (possibly
-          // re-armed default-100) value; zeroing is always the safe path.
-          zeroedNoActiveMatch++;
-          items.push({
-            sku:        walmartSku,
-            price:      0,
-            cost:       null,
-            ctCost:     null,
-            shopifyQty: 0,
-            walmartQty: 0,
-          });
-        }
-      }
-
-      console.log(`[chunked] built ${items.length} items; zeroedNoActiveMatch=${zeroedNoActiveMatch}`);
-    } catch (err: any) {
-      console.error('❌ Chunked listed fetch failed:', err.message);
-      return res.status(500).json({ error: 'Chunked fetch failed', details: err.message });
-    }
-  } else {
-    try {
-      const shopifyStart = Date.now();
-      items = await fetchTireVariants();
-      console.log(`Shopify fetch complete: ${items.length} variants in ${((Date.now() - shopifyStart) / 1000).toFixed(1)}s`);
-    } catch (err: any) {
-      console.error('❌ Shopify fetch failed:', err.message);
-      return res.status(500).json({ error: 'Shopify fetch failed', details: err.message });
-    }
+  try {
+    const shopifyStart = Date.now();
+    items = await fetchTireVariants();
+    console.log(`Shopify fetch complete: ${items.length} variants in ${((Date.now() - shopifyStart) / 1000).toFixed(1)}s`);
+  } catch (err: any) {
+    console.error('❌ Shopify fetch failed:', err.message);
+    return res.status(500).json({ error: 'Shopify fetch failed', details: err.message });
   }
 
   // ── mode=sku-sample: inspect raw SKU formats from both sides, no writes ─
@@ -304,22 +294,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // ── Enrich with cost (LAYER 1 floor needs it) ───────────────────────
-  // Cost lives on InventoryItem.unitCost in GraphQL. For the chunked listed
-  // path cost is already attached from fetchActiveCtSyncVariants(); this
-  // enrichment step only runs for the full-scan (fetchTireVariants) path.
-  if (!isChunkedListed) {
-    try {
-      const variantMap = await fetchAllShopifyVariants();
-      for (const i of items) {
-        const v = variantMap.get(i.sku) ?? variantMap.get(i.sku.replace(/^TIRE-/, ''));
-        i.cost = v?.cost ?? null;
-        i.ctCost = v?.ctCost ?? null;
-      }
-      const withCost = items.filter(i => i.cost != null).length;
-      console.log(`💲 Cost enrichment: ${withCost}/${items.length} variants have a cost`);
-    } catch (err: any) {
-      console.error('❌ Cost enrichment failed (prices will be skipped without cost):', err.message);
+  // Cost lives on InventoryItem.unitCost in GraphQL. Enrichment runs for
+  // the full-scan (fetchTireVariants) path; the chunked listed path
+  // (now delegated to runListedSyncChunk) gets cost from fetchActiveCtSyncVariants().
+  try {
+    const variantMap = await fetchAllShopifyVariants();
+    for (const i of items) {
+      const v = variantMap.get(i.sku) ?? variantMap.get(i.sku.replace(/^TIRE-/, ''));
+      i.cost = v?.cost ?? null;
+      i.ctCost = v?.ctCost ?? null;
     }
+    const withCost = items.filter(i => i.cost != null).length;
+    console.log(`💲 Cost enrichment: ${withCost}/${items.length} variants have a cost`);
+  } catch (err: any) {
+    console.error('❌ Cost enrichment failed (prices will be skipped without cost):', err.message);
   }
 
   // Suppression removed: an in-stock SKU is never zeroed. This stays as a
