@@ -28,7 +28,7 @@
     }
   ],
   "crons": [
-    { "path": "/api/walmart-sync-cursor", "schedule": "*/2 * * * *" },
+    { "path": "/api/walmart-sync-cursor", "schedule": "* * * * *" },
     { "path": "/api/walmart-order-sync",                             "schedule": "*/15 * * * *" },
     { "path": "/api/cost-integrity-audit",                           "schedule": "0 9 * * *"   },
     { "path": "/api/ct-tracking-parser",                             "schedule": "*/30 * * * *" },
