@@ -24,6 +24,10 @@ create table if not exists walmart_sync_cursor (
 alter table walmart_sync_cursor
   add constraint walmart_sync_cursor_single_row check (id = 1);
 
+-- Lock the table to server-side (service-role) access only.
+-- Service-role bypasses RLS; the public/anon API gets no access (no policies defined).
+alter table walmart_sync_cursor enable row level security;
+
 -- Seed the cursor row (idempotent).
 insert into walmart_sync_cursor (id, current_offset)
   values (1, 0)
