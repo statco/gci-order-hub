@@ -70,9 +70,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   );
 
   // ── 3. Poison-skip guard ──────────────────────────────────────────────────
-  // A chunk that has crashed the function 3 times (hard timeout kills the
-  // process before any post-run write) is unsafe to retry indefinitely.
-  // Skip it: advance the offset and let the next tick resume from there.
   if (cursor.attempt_count >= 3) {
     const skippedOffset = offset;
     const nextOffset    = offset + CHUNK_LIMIT;
@@ -80,14 +77,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       `⚠️  POISON-SKIP: offset=${skippedOffset} has attempt_count=${cursor.attempt_count} >= 3.` +
       ` Advancing to offset=${nextOffset} and skipping.`
     );
-    if (!isDry) {
-      await updateCursor({
-        current_offset: nextOffset,
-        attempt_count:  0,
-        last_status:    'skipped',
-        last_run_at:    new Date().toISOString(),
-      });
-    }
+    await updateCursor({
+      current_offset: nextOffset,
+      attempt_count:  0,
+      last_status:    'skipped',
+      last_run_at:    new Date().toISOString(),
+    });
     return res.status(200).json({
       skipped:       true,
       skippedOffset,
@@ -102,9 +97,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Critical: Vercel may kill the function mid-chunk on a hard timeout.
   // Incrementing attempt_count here (before the work) means the poison-skip
   // guard will fire on the next tick even if we never reach the post-run write.
-  if (!isDry) {
-    await updateCursor({ attempt_count: cursor.attempt_count + 1 });
-  }
+  // Cursor writes are NOT gated by isDry — dry suppresses only Walmart writes
+  // (inside runListedSyncChunk), never cursor mechanics.
+  await updateCursor({ attempt_count: cursor.attempt_count + 1 });
 
   // ── 5. Run the chunk ──────────────────────────────────────────────────────
   let chunkResult;
@@ -113,13 +108,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('❌ Chunk failed:', msg);
-    if (!isDry) {
-      await updateCursor({
-        consecutive_failures: cursor.consecutive_failures + 1,
-        last_status:          'error',
-        last_run_at:          new Date().toISOString(),
-      });
-    }
+    await updateCursor({
+      consecutive_failures: cursor.consecutive_failures + 1,
+      last_status:          'error',
+      last_run_at:          new Date().toISOString(),
+    });
     return res.status(500).json({ error: 'Chunk failed', details: msg, offset, status: 'error' });
   }
 
@@ -135,19 +128,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ` inv_fail=${chunkResult.inventoryResult?.failed ?? 'dry'}`
   );
 
-  if (!isDry) {
-    await updateCursor({
-      current_offset:       nextOffset,
-      attempt_count:        0,
-      consecutive_failures: 0,
-      total_listed:         chunkResult.totalListed,
-      last_inv_ok:          chunkResult.inventoryResult?.success ?? null,
-      last_inv_fail:        chunkResult.inventoryResult?.failed  ?? null,
-      last_zeroed:          chunkResult.zeroedNoActiveMatch,
-      last_status:          newStatus,
-      last_run_at:          new Date().toISOString(),
-    });
-  }
+  await updateCursor({
+    current_offset:       nextOffset,
+    attempt_count:        0,
+    consecutive_failures: 0,
+    total_listed:         chunkResult.totalListed,
+    last_inv_ok:          chunkResult.inventoryResult?.success ?? null,
+    last_inv_fail:        chunkResult.inventoryResult?.failed  ?? null,
+    last_zeroed:          chunkResult.zeroedNoActiveMatch,
+    last_status:          newStatus,
+    last_run_at:          new Date().toISOString(),
+  });
 
   // ── 8. Return summary ─────────────────────────────────────────────────────
   return res.status(200).json({

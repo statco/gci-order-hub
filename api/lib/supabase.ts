@@ -42,12 +42,18 @@ async function restPatch(path: string, body: Record<string, unknown>): Promise<v
       'apikey':        SERVICE_ROLE_KEY,
       'Authorization': `Bearer ${SERVICE_ROLE_KEY}`,
       'Content-Type':  'application/json',
-      'Prefer':        'return=minimal',
+      // return=representation so PostgREST returns the updated rows —
+      // lets us assert the PATCH actually matched (accepted ≠ applied guard).
+      'Prefer':        'return=representation',
     },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
     throw new Error(`Supabase PATCH ${path} → ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  }
+  const rows: unknown[] = await res.json();
+  if (rows.length === 0) {
+    throw new Error(`Supabase PATCH ${path} matched 0 rows — cursor row missing or filter wrong`);
   }
 }
 
