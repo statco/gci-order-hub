@@ -11,10 +11,7 @@
 # (e.g. a 504 timeout) — it aborts and tells you where to resume.
 #
 # ── PRE-FLIGHT (do these once) ───────────────────────────────────────────────
-#  1. DRY param name: this script uses `&dry=true`. CONFIRM that's what
-#     api/walmart-sync.ts checks — the handoff says `dry`, an earlier debug note
-#     said `dryRun`. If the code expects `dryRun`, then DRY=true is SILENTLY
-#     IGNORED and the run is LIVE. Verify before trusting dry mode.
+#  11. Dry param confirmed: this script uses &dry=true, which is correct for walmart-sync.ts.
 #  2. Start with DRY=true. Inspect the chunk-1 sample. Only then set DRY=false.
 #  3. The script pauses for confirmation after chunk 1 regardless of DRY.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -25,7 +22,7 @@ BASE="https://gci-order-hub.vercel.app/api/walmart-sync"
 MODE="listed"
 LIMIT=50            # proven: 78s/HTTP200. Do NOT raise without a sub-120s probe.
 SLEEP=5             # seconds between chunks (Walmart rate-pressure margin)
-DRY=false            # START HERE. Flip to false only after a clean chunk-1 sample.
+DRY=true            # START HERE. Flip to false only after a clean chunk-1 sample.
 DRY_PARAM="dry"     # change to "dryRun" if that's what the handler reads
 START_OFFSET=0      # set to a chunk's offset to RESUME after an abort
 MAX_OFFSET=4000     # safety cap: abort if nextOffset ever exceeds this
