@@ -16,3 +16,10 @@ zf_*.json
 zr_*.json
 docs/
 scripts/
+bare_oversell_to_zero.json
+retire_skus.json
+zchunk_*.json
+zf_*.json
+zr_*.json
+docs/
+scripts/
