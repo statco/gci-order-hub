@@ -21,7 +21,7 @@ const SHEET_ID            = process.env.WALMART_ORDER_LOG_SHEET_ID!;
 const TELEGRAM_BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN!;
 const TELEGRAM_CHAT_ID    = process.env.TELEGRAM_CHAT_ID!;
 
-// ── Carrier map ─────────────────────────────────────────────────────────
+// ── Carrier maps ─────────────────────────────────────────────────────────
 
 const CARRIER_MAP: Record<string, string> = {
   purolator:     'PUROLATOR',
@@ -35,6 +35,12 @@ const CARRIER_MAP: Record<string, string> = {
   canpar:        'OTHER',
 };
 
+// Carriers that Walmart classifies as OTHER but have their own tracking portals.
+// Checked before TRACKING_URL_MAP so the right link appears in Telegram.
+const RAW_CARRIER_TRACKING_OVERRIDES: Record<string, (t: string) => string> = {
+  canpar: (t) => `https://www.canpar.com/en/tracking/TrackingAction.do?reference=${t}&locale=en`,
+};
+
 const TRACKING_URL_MAP: Record<string, (t: string) => string> = {
   PUROLATOR:   (t) => `https://www.purolator.com/en/shipping/tracker?pin=${t}`,
   UPS:         (t) => `https://www.ups.com/track?tracknum=${t}`,
@@ -43,13 +49,19 @@ const TRACKING_URL_MAP: Record<string, (t: string) => string> = {
   DHL:         (t) => `https://www.dhl.com/en/express/tracking.html?AWB=${t}`,
   OTHER:       (t) => `https://gls-group.com/CA/en/parcel-tracking/?match=${t}`,
 };
+
 function normalizeCarrier(raw: string): string {
   const key = raw.trim().toLowerCase();
   return CARRIER_MAP[key] ?? raw.toUpperCase();
 }
 
-function getTrackingUrl(carrier: string, trackingNumber: string): string {
-  const fn = TRACKING_URL_MAP[carrier] ?? TRACKING_URL_MAP['OTHER'];
+// rawCarrier preserved so RAW_CARRIER_TRACKING_OVERRIDES can fire even when
+// Walmart sees the carrier as OTHER.
+function getTrackingUrl(rawCarrier: string, normalizedCarrier: string, trackingNumber: string): string {
+  const rawKey = rawCarrier.trim().toLowerCase();
+  const fn = RAW_CARRIER_TRACKING_OVERRIDES[rawKey]
+    ?? TRACKING_URL_MAP[normalizedCarrier]
+    ?? TRACKING_URL_MAP['OTHER'];
   return fn(trackingNumber);
 }
 
@@ -88,7 +100,8 @@ async function markShipped(
   orderId: string,
   lines: Array<{ lineNumber: string; sku: string }>,
   trackingNumber: string,
-  carrier: string,
+  rawCarrier: string,
+  normalizedCarrier: string,
 ): Promise<void> {
   const payload = {
     orderShipment: {
@@ -102,10 +115,10 @@ async function markShipped(
                 statusQuantity: { unitOfMeasurement: 'EACH', amount: '1' },
                 trackingInfo: {
                   shipDateTime:  new Date().toISOString(),
-                  carrierName:   { carrier },
+                  carrierName:   { carrier: normalizedCarrier },
                   methodCode:    'Standard',
                   trackingNumber,
-                  trackingURL:   getTrackingUrl(carrier, trackingNumber),
+                  trackingURL:   getTrackingUrl(rawCarrier, normalizedCarrier, trackingNumber),
                 },
               },
             ],
@@ -148,7 +161,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(400).json({ error: 'orderId and trackingNumber are required' });
   }
 
-  const normalizedCarrier = normalizeCarrier(carrier as string);
+  const rawCarrier        = carrier as string;
+  const normalizedCarrier = normalizeCarrier(rawCarrier);
 
   try {
     const token = await getWalmartToken();
@@ -160,7 +174,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // 2. Mark shipped on Walmart
-    await markShipped(token, orderId as string, lines, trackingNumber as string, normalizedCarrier);
+    await markShipped(
+      token,
+      orderId as string,
+      lines,
+      trackingNumber as string,
+      rawCarrier,
+      normalizedCarrier,
+    );
     console.log(`[walmart-ship] Order ${orderId} marked shipped — tracking: ${trackingNumber}`);
 
     // 3. Update Sheet row
@@ -173,11 +194,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     console.log(`[walmart-ship] Sheet updated for order ${orderId}`);
 
     // 4. Telegram confirmation
+    const trackingUrl = getTrackingUrl(rawCarrier, normalizedCarrier, trackingNumber as string);
     await sendTelegram(
       `✅ <b>Order Shipped</b>\n` +
       `📦 Order: <code>${orderId}</code>\n` +
       `🚚 Carrier: ${normalizedCarrier}\n` +
-      `🔢 Tracking: <code>${trackingNumber}</code>`,
+      `🔢 Tracking: <code>${trackingNumber}</code>\n` +
+      `🔗 <a href="${trackingUrl}">Track Package</a>`,
     );
 
     return res.status(200).json({
