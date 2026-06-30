@@ -17,7 +17,7 @@ function walmartHeaders(token: string): Record<string, string> {
   };
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(_req: VercelRequest, res: VercelResponse) {
   try {
     const token = await getWalmartToken();
     const since = new Date('2026-06-25T00:00:00Z').toISOString();
