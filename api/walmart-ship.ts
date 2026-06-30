@@ -23,27 +23,26 @@ const TELEGRAM_CHAT_ID    = process.env.TELEGRAM_CHAT_ID!;
 
 // ── Carrier map ─────────────────────────────────────────────────────────
 
-const CARRIER_MAP = {
-  purolator: 'PUROLATOR',
-  ups: 'UPS',
-  fedex: 'FEDEX',
+const CARRIER_MAP: Record<string, string> = {
+  purolator:     'PUROLATOR',
+  ups:           'UPS',
+  fedex:         'FEDEX',
   'canada post': 'CANADA_POST',
-  canadapost: 'CANADA_POST',
-  dhl: 'DHL',
-  gls: 'OTHER',
-  '*gls': 'OTHER',
-  canpar: 'OTHER',
+  canadapost:    'CANADA_POST',
+  dhl:           'DHL',
+  gls:           'OTHER',
+  '*gls':        'OTHER',
+  canpar:        'OTHER',
 };
 
-const TRACKING_URL_MAP = {
-  PUROLATOR: (t) => `https://www.purolator.com/en/shipping/tracker?pin=${t}`,
-  UPS: (t) => `https://www.ups.com/track?tracknum=${t}`,
-  FEDEX: (t) => `https://www.fedex.com/fedextrack/?trknbr=${t}`,
+const TRACKING_URL_MAP: Record<string, (t: string) => string> = {
+  PUROLATOR:   (t) => `https://www.purolator.com/en/shipping/tracker?pin=${t}`,
+  UPS:         (t) => `https://www.ups.com/track?tracknum=${t}`,
+  FEDEX:       (t) => `https://www.fedex.com/fedextrack/?trknbr=${t}`,
   CANADA_POST: (t) => `https://www.canadapost-postescanada.ca/track-reperage/en#/details/${t}`,
-  DHL: (t) => `https://www.dhl.com/en/express/tracking.html?AWB=${t}`,
-  OTHER: (t) => `https://gls-group.com/CA/en/parcel-tracking/?match=${t}`,
+  DHL:         (t) => `https://www.dhl.com/en/express/tracking.html?AWB=${t}`,
+  OTHER:       (t) => `https://gls-group.com/CA/en/parcel-tracking/?match=${t}`,
 };
-
 function normalizeCarrier(raw: string): string {
   const key = raw.trim().toLowerCase();
   return CARRIER_MAP[key] ?? raw.toUpperCase();
