@@ -13,6 +13,7 @@
 // this must reflect what Shopify actually confirms was charged.
 
 const GCI_BRAIN_API_URL = process.env.GCI_BRAIN_API_URL || 'https://gci-brain.vercel.app';
+const INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET || '';
 const INSTALL_FEE_SKU_PREFIX = 'INSTALL-FEE-';
 
 export interface OrderLineItemLike {
@@ -71,7 +72,14 @@ function computeInstallationFeeCharged(lineItems: OrderLineItemLike[]): {
 async function createInstallationJobRecord(input: InstallerDispatchInput, fee: number, tireLine: OrderLineItemLike | null): Promise<void> {
   const res = await fetch(`${GCI_BRAIN_API_URL}/api/airtable`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      // gci-brain's /api/airtable now requires this (2026-07 security fix --
+      // it was previously open to anyone, exposing installer bank info).
+      // Set INTERNAL_API_SECRET to the same value in both this project's
+      // and gci-brain's Vercel env vars.
+      'X-Internal-Secret': INTERNAL_API_SECRET,
+    },
     body: JSON.stringify({
       table: 'Installation Jobs',
       method: 'POST',
