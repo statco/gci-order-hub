@@ -25,6 +25,7 @@ import type { VercelRequest, VercelResponse }        from '@vercel/node';
 import { createOrder }                               from './lib/cj-client.js';
 import { sendOrderNotification, NotifyPayload }      from './lib/notify.js';
 import { submitPurchaseOrder, CTNotConfiguredError, CT_AUTO_PO_ENABLED } from './lib/ct-client.js';
+import { dispatchInstaller }                         from './lib/installer-dispatch.js';
 
 export const config = { maxDuration: 30 };
 
@@ -357,6 +358,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } catch (err: any) {
       console.error('❌ NUPROZ routing error:', err);
       errors.push(`NUPROZ: ${err.message}`);
+    }
+  }
+
+  // ── Installer dispatch (AI Match + any other flow that sets gci_installer_id) ──
+  // Runs independently of supplier routing above -- an order can need
+  // installer dispatch regardless of whether its tire came via TIRE-/NUPROZ-/
+  // unprefixed SKU. Only fires here, AFTER Shopify has confirmed payment
+  // (this whole handler is the orders/paid webhook) -- see installer-dispatch.ts
+  // for why that ordering matters.
+  if (installer.installerId) {
+    try {
+      const addressParts = [addr.address1, addr.address2, addr.city, addr.province_code ?? addr.province, addr.zip]
+        .filter(Boolean);
+      const dispatch = await dispatchInstaller({
+        shopifyOrderId:  order.id,
+        orderNumber:     order.name,
+        customerEmail:   order.email,
+        customerName:    custName,
+        customerPhone:   addr.phone,
+        customerAddress: addressParts.join(', '),
+        lineItems:       order.line_items,
+        installerId:     installer.installerId,
+        installerName:   installer.installerName,
+      });
+      if (dispatch.ok) {
+        results.push(`INSTALL: job created + confirmation sent (installer: ${installer.installerName || installer.installerId})`);
+      } else {
+        // Partial failure (e.g. job created but email failed, or vice versa) --
+        // surface as a warning, not a hard failure, since Shopify would retry
+        // the whole webhook on a 500 and we don't want duplicate Airtable jobs.
+        errors.push(`INSTALL (partial): ${dispatch.errors.join('; ')}`);
+      }
+    } catch (err: any) {
+      console.error('❌ Installer dispatch error:', err);
+      errors.push(`INSTALL: ${err.message}`);
     }
   }
 
