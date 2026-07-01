@@ -38,13 +38,15 @@ export interface NotifyPayload {
   supplierType:     'TIRE' | 'NUPROZ';
   items:            NotifyItem[];
   totalCost:        number;            // sum of unitCost × qty
-  authorizeUrl:     string;            // HMAC-signed link
+  authorizeUrl:     string;            // HMAC-signed link -- ignored when autoSubmittedCtPoId is set
   customerName:     string;
   shippingCity:     string;
   shippingProvince: string;
   installerName?:   string;
   appointmentDate?: string;
   cjOrderId?:       string;            // set for NUPROZ orders
+  autoSubmittedCtPoId?: string;        // set when CT_AUTO_PO_ENABLED and submitPurchaseOrder() succeeded --
+                                        // notification becomes informational, no authorize action needed
 }
 
 // ─── TELEGRAM ────────────────────────────────────────────────
@@ -66,6 +68,10 @@ async function sendTelegram(p: NotifyPayload): Promise<void> {
 
   const cjLine = p.cjOrderId ? `\n🆔 *CJ Order ID:* \`${p.cjOrderId}\`` : '';
 
+  const actionLine = p.autoSubmittedCtPoId
+    ? `✅ *Auto-submitted to Canada Tire* — PO \`${p.autoSubmittedCtPoId}\`\n_No action needed._`
+    : `✅ [AUTHORIZE & SUBMIT](${p.authorizeUrl})\n\n_Link expires in 24 hours._`;
+
   const text = [
     `🚨 *GCI New Order — ${label}*`,
     '',
@@ -78,9 +84,7 @@ async function sendTelegram(p: NotifyPayload): Promise<void> {
     '',
     `*Total cost to GCI:* *$${p.totalCost.toFixed(2)} CAD*`,
     '',
-    `✅ [AUTHORIZE & SUBMIT](${p.authorizeUrl})`,
-    '',
-    '_Link expires in 24 hours._',
+    actionLine,
   ].join('\n');
 
   const res = await fetch(
@@ -157,7 +161,7 @@ async function sendEmail(p: NotifyPayload): Promise<void> {
       </tr>
     </table>
     <div style="padding:24px 28px;">
-      <p style="margin:0 0 12px;font-size:18px;font-weight:bold;color:#111827;">Order Alert — Action Required</p>
+      <p style="margin:0 0 12px;font-size:18px;font-weight:bold;color:#111827;">${p.autoSubmittedCtPoId ? 'Order Auto-Submitted to Canada Tire' : 'Order Alert — Action Required'}</p>
       <p style="margin:0 0 4px;font-size:18px;font-weight:bold;color:#111827;">Order ${p.orderNumber}</p>
       <p style="margin:4px 0;color:#374151;"><strong>Supplier:</strong> ${supplierLabel}</p>
       <p style="margin:4px 0;color:#374151;"><strong>Customer:</strong> ${p.customerName}</p>
@@ -182,11 +186,18 @@ async function sendEmail(p: NotifyPayload): Promise<void> {
         </tfoot>
       </table>
       <div style="margin-top:28px;text-align:center;">
+        ${p.autoSubmittedCtPoId ? `
+        <div style="display:inline-block;background:#ecfdf5;border:1px solid #10b981;color:#065f46;padding:14px 36px;border-radius:6px;font-weight:bold;font-size:16px;">
+          ✅ Auto-submitted to Canada Tire — PO ${p.autoSubmittedCtPoId}
+        </div>
+        <p style="margin:10px 0 0;font-size:12px;color:#9ca3af;">No action needed.</p>
+        ` : `
         <a href="${p.authorizeUrl}"
            style="display:inline-block;background:#10b981;color:#fff;text-decoration:none;padding:14px 36px;border-radius:6px;font-weight:bold;font-size:16px;">
           ✅ Authorize &amp; Submit Order
         </a>
         <p style="margin:10px 0 0;font-size:12px;color:#9ca3af;">This link expires in 24 hours.</p>
+        `}
       </div>
     </div>
   </div>
@@ -196,7 +207,9 @@ async function sendEmail(p: NotifyPayload): Promise<void> {
   const { error } = await resend.emails.send({
     from:    EMAIL_FROM,
     to:      [EMAIL_TO],
-    subject: `[GCI] Action Required: Order ${p.orderNumber} — ${supplierLabel}`,
+    subject: p.autoSubmittedCtPoId
+      ? `[GCI] Auto-submitted: Order ${p.orderNumber} — ${supplierLabel} (PO ${p.autoSubmittedCtPoId})`
+      : `[GCI] Action Required: Order ${p.orderNumber} — ${supplierLabel}`,
     html,
   });
 

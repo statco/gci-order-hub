@@ -24,6 +24,7 @@ import crypto                                       from 'crypto';
 import type { VercelRequest, VercelResponse }        from '@vercel/node';
 import { createOrder }                               from './lib/cj-client.js';
 import { sendOrderNotification, NotifyPayload }      from './lib/notify.js';
+import { submitPurchaseOrder, CTNotConfiguredError, CT_AUTO_PO_ENABLED } from './lib/ct-client.js';
 import { dispatchInstaller }                         from './lib/installer-dispatch.js';
 
 export const config = { maxDuration: 30 };
@@ -214,6 +215,51 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }));
       const totalCost = notifyItems.reduce((s, i) => s + i.unitCost * i.quantity, 0);
 
+      // ── The switch ──────────────────────────────────────────
+      // Only attempted when CT_AUTO_PO_ENABLED=true. Until Canada Tire
+      // provides a real order-creation RESTlet (CT_PO_SCRIPT/CT_PO_DEPLOY),
+      // this will always throw CTNotConfiguredError, which is caught below
+      // and falls through to the existing manual-authorize notification --
+      // exactly today's behavior, unchanged. Nothing here is a hard
+      // dependency on CT being ready.
+      let autoSubmittedCtPoId: string | undefined;
+      if (CT_AUTO_PO_ENABLED) {
+        try {
+          const result = await submitPurchaseOrder({
+            gciOrderNumber: order.name,
+            lines: tireItems.map(i => ({
+              partNumber: i.sku.replace(new RegExp(`^${TIRE_PREFIX}`, 'i'), ''),
+              quantity:   i.quantity,
+            })),
+            shipTo: installer.fulfillmentType === 'ship_to_installer'
+              ? {
+                  name: `${installer.installerName} (installer for ${custName})`,
+                  address1: '', city: '', province: '', postalCode: '', country: 'CA',
+                  note: `Ship to installer: ${installer.installerName} (id: ${installer.installerId})`,
+                }
+              : {
+                  name:       custName,
+                  address1:   addr.address1 ?? '',
+                  address2:   addr.address2,
+                  city:       addr.city ?? '',
+                  province:   addr.province_code ?? addr.province ?? '',
+                  postalCode: addr.zip ?? '',
+                  country:    addr.country_code ?? 'CA',
+                  phone:      addr.phone,
+                },
+          });
+          autoSubmittedCtPoId = result.ctPurchaseOrderId;
+          console.log(`✅ CT auto-PO submitted for order ${order.name}: ${autoSubmittedCtPoId}`);
+        } catch (err: any) {
+          if (err instanceof CTNotConfiguredError) {
+            console.log(`ℹ️  CT auto-PO not yet configured — falling back to manual authorize flow for ${order.name}`);
+          } else {
+            console.error(`⚠️  CT auto-PO submit failed for ${order.name}, falling back to manual:`, err);
+          }
+          // Deliberately not re-thrown -- manual flow below is the safety net.
+        }
+      }
+
       const authUrl = buildAuthorizeUrl({
         orderId:     order.id,
         orderNumber: order.name,
@@ -230,6 +276,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           ? { note: `Ship to installer: ${installer.installerName} (id: ${installer.installerId})` }
           : addr,
         installerMeta: installer,
+        autoSubmittedCtPoId,
       };
       console.log('🛞 TIRE PO:', JSON.stringify(po));
 
@@ -245,9 +292,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         shippingProvince: addr.province_code ?? addr.province ?? '',
         installerName:    installer.installerName  || undefined,
         appointmentDate:  installer.appointmentDate || undefined,
+        autoSubmittedCtPoId,
       };
       await sendOrderNotification(notify);
-      results.push('TIRE: PO built + notification sent');
+      results.push(autoSubmittedCtPoId
+        ? `TIRE: auto-submitted to CT (PO ${autoSubmittedCtPoId}) + notification sent`
+        : 'TIRE: PO built + notification sent');
     } catch (err: any) {
       console.error('❌ TIRE routing error:', err);
       errors.push(`TIRE: ${err.message}`);
