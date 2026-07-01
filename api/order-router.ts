@@ -9,10 +9,13 @@
 //  1. Verify Shopify HMAC signature (SHOPIFY_WEBHOOK_SECRET)
 //  2. Split line items by SKU prefix
 //       TIRE-   → build Canada Tire PO, preserve installer metadata
-//       NUPROZ- → create CJ Dropshipping order in PENDING state
+//       (anything else → unknownItems, logged, not auto-processed)
 //  3. For each supplier batch: generate HMAC-signed 24h authorize link
 //  4. Fire notifications (Telegram + email) — order not submitted yet
 //  5. Mixed orders handled independently (separate supplier batches)
+//
+// NUPROZ- (nuprozone.com dropshipping via CJ) routing removed 2026-07 --
+// confirmed permanently discontinued. See git history if ever needed again.
 //
 // Env vars:
 //   SHOPIFY_WEBHOOK_SECRET  — from Shopify webhook config
@@ -22,7 +25,6 @@
 
 import crypto                                       from 'crypto';
 import type { VercelRequest, VercelResponse }        from '@vercel/node';
-import { createOrder }                               from './lib/cj-client.js';
 import { sendOrderNotification, NotifyPayload }      from './lib/notify.js';
 import { submitPurchaseOrder, CTNotConfiguredError, CT_AUTO_PO_ENABLED } from './lib/ct-client.js';
 import { dispatchInstaller }                         from './lib/installer-dispatch.js';
@@ -39,11 +41,13 @@ const APP_BASE_URL   = (
 ).replace(/\/$/, '');
 
 const TIRE_PREFIX   = 'TIRE-';
-const NUPROZ_PREFIX = 'NUPROZ-';
+// NUPROZ- (nuprozone.com dropshipping) routing removed 2026-07 --
+// confirmed by GCI Tires as permanently discontinued (brand-conflict
+// decision, not a temporary pause). See git history for the old CJ
+// Dropshipping integration if this is ever needed again.
 
-// Your approximate net cost ratios — adjust per supplier agreement
+// Your approximate net cost ratio — adjust per supplier agreement
 const TIRE_COST_RATIO   = 0.50;
-const NUPROZ_COST_RATIO = 0.60;
 
 // ─── SHOPIFY TYPES ────────────────────────────────────────────
 
@@ -180,13 +184,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // ── Split line items by SKU prefix ───────────────────────────
   const tireItems:    ShopifyLineItem[] = [];
-  const nuProzItems:  ShopifyLineItem[] = [];
   const unknownItems: ShopifyLineItem[] = [];
 
   for (const item of order.line_items) {
     const sku = (item.sku ?? '').toUpperCase();
-    if (sku.startsWith(TIRE_PREFIX))   { tireItems.push(item);   continue; }
-    if (sku.startsWith(NUPROZ_PREFIX)) { nuProzItems.push(item); continue; }
+    if (sku.startsWith(TIRE_PREFIX)) { tireItems.push(item); continue; }
     unknownItems.push(item);
   }
 
@@ -301,63 +303,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } catch (err: any) {
       console.error('❌ TIRE routing error:', err);
       errors.push(`TIRE: ${err.message}`);
-    }
-  }
-
-  // ── NUPROZ- items → CJ Dropshipping pending order ────────────
-  if (nuProzItems.length > 0) {
-    try {
-      const cjProducts = nuProzItems.map(i => ({
-        vid:      i.sku.replace(/^NUPROZ-/i, ''),   // CJ vid stored after prefix
-        quantity: i.quantity,
-      }));
-
-      const cjOrder = await createOrder({
-        orderNumber:          order.name,
-        shippingCountry:      addr.country_code  ?? 'CA',
-        shippingCustomerName: custName,
-        shippingPhone:        addr.phone         ?? '',
-        shippingAddress:      addr.address1       ?? '',
-        shippingAddress2:     addr.address2       ?? '',
-        shippingCity:         addr.city           ?? '',
-        shippingProvince:     addr.province_code  ?? addr.province ?? '',
-        shippingZip:          addr.zip            ?? '',
-        products:             cjProducts,
-      });
-
-      const notifyItems = nuProzItems.map(i => ({
-        sku:      i.sku,
-        title:    i.title,
-        quantity: i.quantity,
-        unitCost: parseFloat(i.price) * NUPROZ_COST_RATIO,
-      }));
-      const totalCost = notifyItems.reduce((s, i) => s + i.unitCost * i.quantity, 0);
-
-      const authUrl = buildAuthorizeUrl({
-        orderId:     order.id,
-        orderNumber: order.name,
-        supplierType:'NUPROZ',
-        cjOrderId:   cjOrder.orderId,
-        exp:         Date.now() + 24 * 60 * 60 * 1_000,
-      });
-
-      const notify: NotifyPayload = {
-        shopifyOrderId:   order.id,
-        orderNumber:      `${order.name}-NUPROZ`,
-        supplierType:     'NUPROZ',
-        items:            notifyItems,
-        totalCost,
-        authorizeUrl:     authUrl,
-        customerName:     custName,
-        shippingCity:     addr.city          ?? '',
-        shippingProvince: addr.province_code ?? addr.province ?? '',
-        cjOrderId:        cjOrder.orderId,
-      };
-      await sendOrderNotification(notify);
-      results.push(`NUPROZ: CJ pending order ${cjOrder.orderId} created + notification sent`);
-    } catch (err: any) {
-      console.error('❌ NUPROZ routing error:', err);
-      errors.push(`NUPROZ: ${err.message}`);
     }
   }
 
