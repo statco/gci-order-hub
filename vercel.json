@@ -19,7 +19,8 @@
     "api/walmart-orphan-sweep.ts":     { "maxDuration": 300 },
     "api/walmart-retire.ts":           { "maxDuration": 300 },
     "api/walmart-oversell-monitor.ts": { "maxDuration": 300 },
-    "api/walmart-sync-cursor.ts":      { "maxDuration": 180 }
+    "api/walmart-sync-cursor.ts":      { "maxDuration": 180 },
+    "api/health-check-make.ts":        { "maxDuration": 30  }
   },
   "rewrites": [
     {
@@ -32,7 +33,8 @@
     { "path": "/api/walmart-order-sync",                             "schedule": "*/15 * * * *" },
     { "path": "/api/cost-integrity-audit",                           "schedule": "0 9 * * *"   },
     { "path": "/api/ct-tracking-parser",                             "schedule": "*/30 * * * *" },
-    { "path": "/api/walmart-orphan-sweep?dryRun=false",              "schedule": "0 11 * * *"  }
+    { "path": "/api/walmart-orphan-sweep?dryRun=false",              "schedule": "0 11 * * *"  },
+    { "path": "/api/health-check-make",                              "schedule": "0 10 * * *"  }
   ],
   "headers": [
     {
