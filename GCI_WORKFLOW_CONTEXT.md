@@ -133,7 +133,7 @@ with a code change:
    (`CT_AUTO_PO_ENABLED` unset, `CT_DRY_RUN` defaults true,
    `CT_ENVIRONMENT` defaults sandbox) — no real order can be placed today.
    ⛔ Do not enable anything CT-related without first reading
-   **`gci-order-hub/docs/CT-INTEGRATION-CONTEXT.md`**, which is the
+   **`gci-order-hub/CT-INTEGRATION-CONTEXT.md`**, which is the
    authoritative record and lists several verified-by-inspection-only gaps.
 3. **15 outreach prospects have no email on file** — real Ontario/Quebec
    shops stuck at "New" in Airtable's `Outreach Prospects` since ~Apr 25,
@@ -292,9 +292,9 @@ work in that repo specifically:
 
 - `gci-brain`: `GCI_Tires_Project_File.md`, `CLAUDE.md`
 - `gci-order-hub`: `README.md` (partially stale — check actual `api/` folder
-  contents against it); **`docs/CT-INTEGRATION-CONTEXT.md`** — authoritative
+  contents against it); **`CT-INTEGRATION-CONTEXT.md`** — authoritative
   Canada Tire + Walmart-order-routing record, read before any CT work;
-  `docs/CT-SESSION-PROMPTS.md` — ready-to-run implementation prompts
+  `CT-SESSION-PROMPTS.md` — ready-to-run implementation prompts
 - `gci-command-center`: `CONTEXT.md` (detailed, mostly current as of
   2026-06-15)
 - `gci-walmart-sync`: `docs/SESSION-CONTEXT.md` (detailed build history,
