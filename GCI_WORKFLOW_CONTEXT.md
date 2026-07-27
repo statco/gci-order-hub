@@ -120,12 +120,21 @@ with a code change:
    on a commercial-name update requirement. Deliberately PARKED by owner
    choice 2026-07-02 (Microsoft Merchant Center pursued instead). See
    gci-brain's project file.
-2. **CT order-creation API** — doesn't exist yet; GCI's rep is working with CT
-   on credit line + API access. The auto-PO switch (gci-order-hub) is built
-   and dormant, ready to activate once CT delivers their side — see
-   `api/lib/ct-client.ts` for exactly what's needed (note the payload shape
-   there is an educated guess; verify against CT's real contract before
-   enabling).
+2. **CT order-creation API** — ⚠️ **This entry was materially stale and was
+   corrected 2026-07-27.** The API *does* exist. As of 2026-07-27: the credit
+   line is **active**, blind drop-ship is **configured account-level**, OAuth
+   1.0a HMAC-SHA256 is **verified working** against production realm 8031691,
+   and `api/lib/ct-client.ts` was rewritten (gci-order-hub#47) to the real
+   V1.4 contract — **the payload shape is no longer a guess**. An idempotency
+   ledger (`ct_orders`) was added in gci-order-hub#48.
+   Still blocked on: **CT sandbox credentials** (requested from the rep,
+   pending), and the Submit Order endpoint has **never been called** in any
+   environment. All three safety gates remain closed
+   (`CT_AUTO_PO_ENABLED` unset, `CT_DRY_RUN` defaults true,
+   `CT_ENVIRONMENT` defaults sandbox) — no real order can be placed today.
+   ⛔ Do not enable anything CT-related without first reading
+   **`gci-order-hub/docs/CT-INTEGRATION-CONTEXT.md`**, which is the
+   authoritative record and lists several verified-by-inspection-only gaps.
 3. **15 outreach prospects have no email on file** — real Ontario/Quebec
    shops stuck at "New" in Airtable's `Outreach Prospects` since ~Apr 25,
    never contacted. The weekly outreach run now Telegram-alerts this list
@@ -283,7 +292,9 @@ work in that repo specifically:
 
 - `gci-brain`: `GCI_Tires_Project_File.md`, `CLAUDE.md`
 - `gci-order-hub`: `README.md` (partially stale — check actual `api/` folder
-  contents against it)
+  contents against it); **`docs/CT-INTEGRATION-CONTEXT.md`** — authoritative
+  Canada Tire + Walmart-order-routing record, read before any CT work;
+  `docs/CT-SESSION-PROMPTS.md` — ready-to-run implementation prompts
 - `gci-command-center`: `CONTEXT.md` (detailed, mostly current as of
   2026-06-15)
 - `gci-walmart-sync`: `docs/SESSION-CONTEXT.md` (detailed build history,
