@@ -14,14 +14,20 @@ const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || '';
  * Send a one-off message via the GCI Orders bot.
  * @param text       message body (HTML by default — escape any user data)
  * @param parseMode  Telegram parse mode; defaults to 'HTML'
+ * @returns true if the message was accepted by Telegram, false otherwise
+ *          (including missing config). Never throws — a notification
+ *          failure must not fail the job that produced it. Callers that
+ *          need to know whether the send actually went out (e.g. to make a
+ *          claim retryable on failure) can check the return value; existing
+ *          callers that don't care can keep ignoring it.
  */
 export async function sendTelegramMessage(
   text: string,
   parseMode: 'HTML' | 'Markdown' = 'HTML',
-): Promise<void> {
+): Promise<boolean> {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.warn('[telegram] TELEGRAM_BOT_TOKEN/CHAT_ID not configured — skipping notification');
-    return;
+    return false;
   }
 
   try {
@@ -38,10 +44,12 @@ export async function sendTelegramMessage(
     if (!res.ok) {
       const body = await res.text();
       console.error(`❌ Telegram notify failed ${res.status}:`, body.slice(0, 200));
-    } else {
-      console.log('✅ Telegram summary sent');
+      return false;
     }
+    console.log('✅ Telegram summary sent');
+    return true;
   } catch (err) {
     console.error('❌ Telegram notify threw:', err instanceof Error ? err.message : String(err));
+    return false;
   }
 }

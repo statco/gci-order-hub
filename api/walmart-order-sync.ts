@@ -3,12 +3,13 @@ import { getWalmartToken } from './lib/walmart-client.js';
 import { getSheetOrderIds, appendSheetRows } from './lib/sheets-client.js';
 import { HttpError, retryWithBackoff } from './lib/retry.js';
 import { getSyncSince, setSyncSuccess } from './lib/sync-state.js';
+import { sendTelegramMessage } from './lib/telegram.js';
+import { claimOrderAlert, releaseOrderAlert } from './lib/walmart-order-alerts.js';
+import { recordRunAndMaybeHeartbeat } from './lib/sync-heartbeat.js';
 
 export const config = { maxDuration: 300 };
 
 const WALMART_BASE_URL = process.env.WALMART_BASE_URL!;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 const SHEET_ID = process.env.WALMART_ORDER_LOG_SHEET_ID!;
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -37,8 +38,23 @@ interface OrderLine {
 
 interface WalmartOrder {
   purchaseOrderId: string;
+  // "Order#" in the ALERT CONTENT spec, distinct from purchaseOrderId (PO#).
+  // NOT verified against a live payload anywhere in this repo — no existing
+  // code reads it. Field name per Walmart's public v3 Orders API docs;
+  // confirm against a real order (e.g. extend debug-find-order.ts) before
+  // relying on it operationally. Falls back to 'N/A' if absent/renamed.
+  customerOrderId?: string;
   orderDate: number;
-  shippingInfo: { postalAddress: PostalAddress };
+  shippingInfo: {
+    postalAddress: PostalAddress;
+    // Ship-by / deliver-by. Same caveat as customerOrderId above: field
+    // names are unverified against a live payload, not exercised by any
+    // other code in this repo. Handled defensively (formatWalmartDate
+    // falls back to 'N/A' on anything unparseable) so a wrong field name
+    // degrades to a missing date, not a crash.
+    estimatedShipDate?: number | string;
+    estimatedDeliveryDate?: number | string;
+  };
   orderLines: { orderLine: OrderLine[] };
 }
 
@@ -103,25 +119,28 @@ function getLinePrice(line: OrderLine): number {
   return productCharge?.chargeAmount?.amount ?? 0;
 }
 
-// ── Telegram ───────────────────────────────────────────────────────────────────
-
-async function sendTelegram(message: string): Promise<void> {
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: TELEGRAM_CHAT_ID,
-      text: message,
-      parse_mode: 'HTML',
-    }),
+function formatWalmartDate(value: number | string | undefined): string {
+  if (value == null) return 'N/A';
+  const ms = typeof value === 'number' ? value : Date.parse(value);
+  if (!Number.isFinite(ms)) return 'N/A';
+  return new Date(ms).toLocaleDateString('en-CA', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
   });
-  if (!res.ok) {
-    const body = await res.text();
-    console.error(`❌ Telegram notify failed ${res.status}:`, body.slice(0, 200));
-  } else {
-    console.log('✅ Telegram alert sent');
-  }
 }
+
+// ── New-order Telegram alert ─────────────────────────────────────────────────
+//
+// Gated per-PO by walmart_order_alerts (lib/walmart-order-alerts.ts), not by
+// the Sheet dedup above — the Sheet read/append pair is check-then-act and
+// does not guarantee exactly-once across overlapping cron runs; the claim
+// table's unique constraint does. Uses lib/telegram.ts (the existing shared,
+// never-throws Telegram sender used elsewhere in this repo) rather than
+// api/lib/notify.ts, whose payload shape (mandatory authorizeUrl,
+// supplierType 'TIRE'|'NUPROZ', a second Resend email with an "Authorize &
+// Submit" CTA) is built for the Shopify → CT/CJ authorization flow and does
+// not apply to a Walmart order with no such action.
 
 function buildTelegramMessage(orders: WalmartOrder[]): string {
   const header =
@@ -142,16 +161,94 @@ function buildTelegramMessage(orders: WalmartOrder[]): string {
       })
       .join('\n');
 
+    const cityProvince = addr ? [addr.city, addr.state].filter(Boolean).join(', ') : 'Unknown';
+    const shipBy = formatWalmartDate(order.shippingInfo?.estimatedShipDate);
+    const deliverBy = formatWalmartDate(order.shippingInfo?.estimatedDeliveryDate);
+
     return (
-      `🛒 <b>Order ${order.purchaseOrderId}</b>\n` +
+      `🛒 <b>PO ${order.purchaseOrderId}</b>\n` +
+      `🆔 Order#: <code>${order.customerOrderId ?? 'N/A'}</code>\n` +
       `📦 Items:\n${linesSummary}\n` +
-      `👤 ${addr?.name ?? 'Unknown'}\n` +
-      `📍 ${addr ? formatAddress(addr) : 'Unknown'}\n` +
-      `💰 Total: $${total.toFixed(2)} CAD`
+      `📍 ${cityProvince}\n` +
+      `📅 Ship by ${shipBy} · Deliver by ${deliverBy}\n` +
+      `💰 Revenue: $${total.toFixed(2)} CAD\n` +
+      `🏭 CT cost / warehouse / stock: <i>— placeholder, filled by a later PR</i>`
     );
   });
 
   return `${header}\n\n${blocks.join('\n\n─────────────\n\n')}`;
+}
+
+/**
+ * Backfill guard: only orders created after this cutoff are eligible to
+ * alert. Returns null (meaning "alert nothing this run") if unset or
+ * unparseable — deliberately fail-closed rather than guessing a fallback
+ * window, since guessing wrong here means either flooding Telegram with
+ * every currently-open order on first deploy, or silently under-alerting.
+ * Must be set explicitly in Vercel before this feature does anything; see
+ * PR description for the recommended value.
+ */
+function getAlertCutoffMs(): number | null {
+  const raw = process.env.WALMART_ALERT_CUTOFF_ISO;
+  if (!raw) return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Claim + alert on newly-seen orders, independent of everything else in the
+ * run: called before acknowledge/sheet-log/cursor-advance, and a failure
+ * here (claim error, send failure) never throws, so it can't break the sync
+ * or block those later steps. A send failure releases its claims so the
+ * order is retried on the next run instead of being marked alerted for a
+ * message that never went out.
+ */
+async function alertNewOrders(orders: WalmartOrder[]): Promise<void> {
+  const cutoff = getAlertCutoffMs();
+  if (cutoff === null) {
+    console.warn(
+      '[order-sync] WALMART_ALERT_CUTOFF_ISO not set or invalid — skipping alert claim this run (ack/sheet-log unaffected)'
+    );
+    return;
+  }
+
+  const eligible = orders.filter((o) => o.orderDate > cutoff);
+  if (eligible.length < orders.length) {
+    console.log(
+      `[order-sync] ${orders.length - eligible.length} order(s) at/before cutoff — not alerted (backfill guard)`
+    );
+  }
+  if (eligible.length === 0) return;
+
+  const claimed: WalmartOrder[] = [];
+  for (const order of eligible) {
+    try {
+      const won = await claimOrderAlert(order.purchaseOrderId);
+      if (won) {
+        claimed.push(order);
+      } else {
+        console.log(`[order-sync] ${order.purchaseOrderId} already claimed for alert — skipping`);
+      }
+    } catch (err) {
+      // Claim itself failed (e.g. Supabase unreachable) — do not alert, do
+      // not throw. Nothing was claimed, so the next run retries cleanly.
+      console.error(
+        `[order-sync] claimOrderAlert(${order.purchaseOrderId}) failed:`,
+        err instanceof Error ? err.message : String(err)
+      );
+    }
+  }
+  if (claimed.length === 0) return;
+
+  const sent = await sendTelegramMessage(buildTelegramMessage(claimed));
+  if (!sent) {
+    console.error(
+      `[order-sync] Telegram alert send failed for ${claimed.length} order(s) — releasing claims so they retry next run`
+    );
+    await Promise.all(claimed.map((o) => releaseOrderAlert(o.purchaseOrderId)));
+    return;
+  }
+  console.log(`[order-sync] Telegram alert sent for ${claimed.length} order(s)`);
 }
 
 // ── Handler ────────────────────────────────────────────────────────────────
@@ -170,6 +267,11 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     const orders = await retryWithBackoff(() => fetchCreatedOrders(token, since), {
       label: 'fetchCreatedOrders',
     });
+
+    // Runs on every invocation (all ~96/day), independent of everything
+    // below — a broken alert or ack step must not suppress the one signal
+    // that would show the sync itself has gone quiet. Never throws.
+    await recordRunAndMaybeHeartbeat(orders.length, since, sendTelegramMessage);
 
     if (orders.length === 0) {
       // Nothing to process is itself a clean pass — advance the cursor so we
@@ -193,9 +295,11 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     console.log(`[order-sync] ${newOrders.length} new order(s) to process`);
 
     // 1. Alert fires immediately — before acknowledge or sheet log — so it
-    //    reaches the team even if any downstream step fails.
-    await sendTelegram(buildTelegramMessage(newOrders));
-    console.log('[order-sync] Telegram alert sent');
+    //    reaches the team even if any downstream step fails. Per-PO claimed
+    //    via walmart_order_alerts (survives overlapping cron runs); a send
+    //    failure releases its claims so it's retried, not permanently
+    //    marked alerted. Never throws.
+    await alertNewOrders(newOrders);
 
     const ackedIds = new Set<string>();
     const rows: string[][] = [];
@@ -253,9 +357,7 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
   } catch (err: any) {
     console.error('[order-sync] Error:', err);
     // Alert on Telegram so you know the cron is broken
-    try {
-      await sendTelegram(`⚠️ <b>walmart-order-sync ERROR</b>\n${err.message}`);
-    } catch (_) {}
+    await sendTelegramMessage(`⚠️ <b>walmart-order-sync ERROR</b>\n${err.message}`);
     return res.status(500).json({ error: err.message });
   }
 }
