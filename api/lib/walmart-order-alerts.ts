@@ -96,3 +96,78 @@ export async function releaseOrderAlert(walmartPo: string): Promise<void> {
     );
   }
 }
+
+// ── Deploy-time backfill cutoff ───────────────────────────────────────────
+//
+// Self-bootstrapping: no env var to set by hand. The first time this code
+// runs after deploy (no cutoff yet persisted in KV), "now" is written and
+// used as the cutoff for that same run. Every run after that reads the same
+// persisted value forever — it's a one-time "since deploy" boundary, not a
+// rolling window. At ~3 orders/week there's no meaningful backlog to guard
+// against, so bootstrapping to first-run time (rather than requiring an
+// exact deploy timestamp) is close enough in practice: worst case is the
+// handful of orders created in the gap between deploy and the next 15-min
+// cron tick, which is the same order of magnitude as the polling interval
+// itself already tolerates.
+//
+// Uses the same Vercel KV (Upstash) instance as lib/sync-state.ts and
+// lib/sync-heartbeat.ts, via its own small client — this repo's existing
+// convention (each of those two files also has its own kvGet/kvSet) rather
+// than a shared abstraction introduced as a drive-by refactor here.
+
+const KV_URL = (process.env.KV_REST_API_URL || '').replace(/\/$/, '');
+const KV_TOKEN = process.env.KV_REST_API_TOKEN || '';
+const CUTOFF_KEY = 'walmart-order-alerts:cutoffMs';
+
+function kvAvailable(): boolean {
+  return Boolean(KV_URL && KV_TOKEN);
+}
+
+async function kvGet(key: string): Promise<string | null> {
+  const res = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${KV_TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`KV get failed: ${res.status} ${await res.text()}`);
+  const data: any = await res.json();
+  return data?.result == null ? null : String(data.result);
+}
+
+async function kvSet(key: string, value: string): Promise<void> {
+  const res = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${KV_TOKEN}` },
+    body: value,
+  });
+  if (!res.ok) throw new Error(`KV set failed: ${res.status} ${await res.text()}`);
+}
+
+/**
+ * Returns the epoch-ms cutoff below which orders are never alerted,
+ * bootstrapping it to "now" on first call if none is persisted yet. Returns
+ * null (fail closed — alert nothing) if KV is unavailable or the bootstrap
+ * itself fails, so a KV outage can't accidentally alert the whole backlog.
+ */
+export async function getOrInitAlertCutoffMs(): Promise<number | null> {
+  if (!kvAvailable()) {
+    console.warn('[walmart-order-alerts] KV not configured — cannot bootstrap cutoff, alerting nothing this run');
+    return null;
+  }
+  try {
+    const stored = await kvGet(CUTOFF_KEY);
+    if (stored) {
+      const ms = Number(stored);
+      if (Number.isFinite(ms)) return ms;
+      console.warn(`[walmart-order-alerts] stored cutoff not a number (${stored}) — re-bootstrapping`);
+    }
+    const now = Date.now();
+    await kvSet(CUTOFF_KEY, String(now));
+    console.log(`[walmart-order-alerts] cutoff bootstrapped at ${new Date(now).toISOString()}`);
+    return now;
+  } catch (err) {
+    console.error(
+      '[walmart-order-alerts] cutoff bootstrap failed — alerting nothing this run:',
+      err instanceof Error ? err.message : String(err)
+    );
+    return null;
+  }
+}

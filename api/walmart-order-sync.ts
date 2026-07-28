@@ -4,7 +4,7 @@ import { getSheetOrderIds, appendSheetRows } from './lib/sheets-client.js';
 import { HttpError, retryWithBackoff } from './lib/retry.js';
 import { getSyncSince, setSyncSuccess } from './lib/sync-state.js';
 import { sendTelegramMessage } from './lib/telegram.js';
-import { claimOrderAlert, releaseOrderAlert } from './lib/walmart-order-alerts.js';
+import { claimOrderAlert, releaseOrderAlert, getOrInitAlertCutoffMs } from './lib/walmart-order-alerts.js';
 import { recordRunAndMaybeHeartbeat } from './lib/sync-heartbeat.js';
 
 export const config = { maxDuration: 300 };
@@ -180,37 +180,22 @@ function buildTelegramMessage(orders: WalmartOrder[]): string {
 }
 
 /**
- * Backfill guard: only orders created after this cutoff are eligible to
- * alert. Returns null (meaning "alert nothing this run") if unset or
- * unparseable — deliberately fail-closed rather than guessing a fallback
- * window, since guessing wrong here means either flooding Telegram with
- * every currently-open order on first deploy, or silently under-alerting.
- * Must be set explicitly in Vercel before this feature does anything; see
- * PR description for the recommended value.
- */
-function getAlertCutoffMs(): number | null {
-  const raw = process.env.WALMART_ALERT_CUTOFF_ISO;
-  if (!raw) return null;
-  const ms = Date.parse(raw);
-  return Number.isFinite(ms) ? ms : null;
-}
-
-/**
  * Claim + alert on newly-seen orders, independent of everything else in the
  * run: called before acknowledge/sheet-log/cursor-advance, and a failure
  * here (claim error, send failure) never throws, so it can't break the sync
  * or block those later steps. A send failure releases its claims so the
  * order is retried on the next run instead of being marked alerted for a
  * message that never went out.
+ *
+ * Backfill guard: getOrInitAlertCutoffMs() self-bootstraps to "now" on the
+ * first run after deploy (persisted in KV, no env var to set by hand) —
+ * only orders created after that are ever eligible to alert. Returns null
+ * (alert nothing this run) if KV is unavailable, deliberately fail-closed
+ * rather than guessing a fallback window.
  */
 async function alertNewOrders(orders: WalmartOrder[]): Promise<void> {
-  const cutoff = getAlertCutoffMs();
-  if (cutoff === null) {
-    console.warn(
-      '[order-sync] WALMART_ALERT_CUTOFF_ISO not set or invalid — skipping alert claim this run (ack/sheet-log unaffected)'
-    );
-    return;
-  }
+  const cutoff = await getOrInitAlertCutoffMs();
+  if (cutoff === null) return;
 
   const eligible = orders.filter((o) => o.orderDate > cutoff);
   if (eligible.length < orders.length) {
