@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
 import { getOrderIdByPoNumber } from './lib/sheets-client.js';
+import { CANONICAL_PO_NUMBER_SHAPE } from './lib/ct-order-ledger.js';
 
 const PDFParser = require('pdf2json');
 
@@ -62,17 +63,43 @@ interface ParsedInvoice {
   carrier: string;
 }
 
-function parseInvoicePdf(text: string): ParsedInvoice {
-  // PO # — e.g. "GCI0003"
-  const poMatch = text.match(/PO\s*#[\s:]*([ A-Z]{2,4}\d{3,6})/i);
+// PO # — canonical: "GCI-2026-447269" (GCI-<year>-<seq>, the only format CT
+// recognises going forward — see CANONICAL_PO_NUMBER_SHAPE in
+// ct-order-ledger.ts, the single source of truth this pattern is built from
+// so producer and consumer can never quietly drift apart). Legacy: "GCI0003"
+// — no hyphens, already present in CT invoice history, still matched here so
+// older invoices keep working.
+//
+// pdf2json (extractPdfText, below) joins text runs with a single space,
+// which can leave a stray space between "PO #" and the value (e.g.
+// "PO #: GCI0003"). The old regex smuggled that space into the capture
+// group's own character class ([ A-Z]{2,4}) instead of consuming it as
+// separator whitespace — handled deliberately here instead: whitespace (and
+// a possible colon) between the label and the value is consumed by
+// `[\s:]*`, and the source text is whitespace-normalized before matching so
+// runs of spaces/newlines collapse to a single space.
+const LEGACY_PO_NUMBER_SHAPE = '[A-Z]{2,4}\\d{3,6}';
+const PO_NUMBER_PATTERN = new RegExp(
+  `PO\\s*#[\\s:]*(${CANONICAL_PO_NUMBER_SHAPE}|${LEGACY_PO_NUMBER_SHAPE})`,
+  'i',
+);
+
+function normalizeWhitespace(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+export function parseInvoicePdf(text: string): ParsedInvoice {
+  const normalized = normalizeWhitespace(text);
+
+  const poMatch = normalized.match(PO_NUMBER_PATTERN);
   const poNumber = poMatch ? poMatch[1].toUpperCase() : null;
 
   // Tracking Number — labeled field in CT invoice
-  const trackingMatch = text.match(/Tracking\s*Number[\s:]*([A-Z0-9]{6,30})/i);
+  const trackingMatch = normalized.match(/Tracking\s*Number[\s:]*([A-Z0-9]{6,30})/i);
   const trackingNumber = trackingMatch ? trackingMatch[1] : null;
 
   // Carrier — from Mode of Delivery field
-  const carrierMatch = text.match(/Mode\s*of\s*Delivery[\s:]*\*?([A-Z]+)/i);
+  const carrierMatch = normalized.match(/Mode\s*of\s*Delivery[\s:]*\*?([A-Z]+)/i);
   const rawCarrier = carrierMatch ? carrierMatch[1].toLowerCase() : 'purolator';
 
   const carrierMap: Record<string, string> = {

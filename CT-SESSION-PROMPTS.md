@@ -126,8 +126,13 @@ BUILD
      sourceOrderId = Shopify order id  (BOTH channels — Shopify is the hub)
      sourceChannel = 'shopify' | 'walmart', from the walmart-import tag
      Walmart PO# from the note_attribute, stored as metadata
-   PO number: GCI-W-<walmartPO> for Walmart-origin, GCI-S-<shopifyOrderNumber>
-   for direct, so CT invoices reconcile against Walmart payouts.
+   PO number: let claimOrder() call buildPoNumber() — do NOT pass an explicit
+   poNumber for shopify/walmart. As of the canonical-PO-number-format PR,
+   buildPoNumber() emits GCI-<year>-<seq> (atomic Postgres sequence) for
+   BOTH channels; channel is not encoded in the PO number, it lives in
+   ct_orders.source_channel, which is the reconciliation join key against
+   Walmart payouts. Do not reintroduce GCI-W-/GCI-S- prefixes — CT does not
+   recognise them.
    If claimOrder returns claimed:false → do not submit, log, stop.
 
 3. CTInsufficientStockError is a ROUTINE outcome, not an error:

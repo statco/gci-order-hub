@@ -1,11 +1,15 @@
 // api/tests/ct-order-ledger.unit.test.ts
 // ─────────────────────────────────────────────────────────────
 // Unit tests for the CT order idempotency ledger's pure logic:
-// PO number construction, status transitions, and secret redaction.
+// PO number formatting, status transitions, and secret redaction.
 //
-// These tests never touch Canada Tire and never touch Supabase. Everything
-// under test is a pure function; the transport paths are deliberately not
-// exercised here.
+// These tests never touch Canada Tire and never touch Supabase. buildPoNumber()
+// itself now calls Supabase (via nextPoSequence()) to mint the atomic sequence
+// value, so only its validation guards are exercised here — both throw before
+// any await, so no network call ever happens. The pure part of PO number
+// construction, formatPoNumber(), is fully covered. The happy path (a real
+// sequence value from the live ct_po_number_seq) is not unit-testable without
+// a database and is left to integration testing.
 //
 // Run:
 //   npx tsc api/tests/ct-order-ledger.unit.test.ts api/lib/ct-order-ledger.ts \
@@ -20,6 +24,8 @@
 import assert from 'node:assert/strict';
 import {
   buildPoNumber,
+  formatPoNumber,
+  CANONICAL_PO_NUMBER_PATTERN,
   canTransition,
   assertTransition,
   isTerminal,
@@ -32,8 +38,20 @@ import {
 } from '../lib/ct-order-ledger.js';
 
 let passed = 0;
-function test(name: string, fn: () => void): void {
-  fn();
+function test(name: string, fn: () => void | Promise<void>): void {
+  const result = fn();
+  if (result instanceof Promise) {
+    throw new Error(
+      `test '${name}' returned a Promise — use asyncTest() instead so a forgotten ` +
+      `'await' can't let a failing assertion pass silently.`
+    );
+  }
+  passed++;
+  console.log(`  ✓ ${name}`);
+}
+
+async function asyncTest(name: string, fn: () => Promise<void>): Promise<void> {
+  await fn();
   passed++;
   console.log(`  ✓ ${name}`);
 }
@@ -42,71 +60,63 @@ const ALL_STATUSES: CTOrderStatus[] = [
   'claimed', 'submitted', 'indeterminate', 'failed', 'manual_required', 'cancelled',
 ];
 
-// ── buildPoNumber ───────────────────────────────────────────────────────────
+async function main(): Promise<void> {
 
-console.log('\nbuildPoNumber');
+// ── formatPoNumber ───────────────────────────────────────────────────────────
+// The pure half of PO number construction: the actual shape CT enforces.
 
-test('shopify strips the leading # from the order name', () => {
-  assert.equal(buildPoNumber('shopify', '#1042'), 'GCI-S-1042');
+console.log('\nformatPoNumber');
+
+test('formats the canonical CT PO number shape', () => {
+  assert.equal(formatPoNumber(447300, 2026), 'GCI-2026-447300');
 });
 
-test('shopify handles an order name with no #', () => {
-  assert.equal(buildPoNumber('shopify', '1042'), 'GCI-S-1042');
+test('defaults to the current calendar year when none is given', () => {
+  const year = new Date().getFullYear();
+  assert.equal(formatPoNumber(447300), `GCI-${year}-447300`);
 });
 
-test('walmart uses the purchase order id verbatim', () => {
-  assert.equal(buildPoNumber('walmart', '1796277083022'), 'GCI-W-1796277083022');
+test('matches CANONICAL_PO_NUMBER_PATTERN — the same shape the invoice parser looks for', () => {
+  assert.ok(CANONICAL_PO_NUMBER_PATTERN.test(formatPoNumber(447300, 2026)));
+  // Real, already-issued manual PO numbers must also satisfy this pattern —
+  // it is CT's format, not a format this codebase invented.
+  assert.ok(CANONICAL_PO_NUMBER_PATTERN.test('GCI-2026-447267'));
+  assert.ok(CANONICAL_PO_NUMBER_PATTERN.test('GCI-2026-447269'));
 });
 
-test('is deterministic — same input always yields the same PO number', () => {
-  const a = buildPoNumber('shopify', '#1042');
-  const b = buildPoNumber('shopify', '#1042');
-  assert.equal(a, b);
+test('two different sequence values never format to the same PO number', () => {
+  assert.notEqual(formatPoNumber(447300, 2026), formatPoNumber(447301, 2026));
 });
 
-test('is stable across surrounding whitespace, so a replayed webhook collides', () => {
-  assert.equal(buildPoNumber('shopify', '  #1042 '), 'GCI-S-1042');
-  assert.equal(buildPoNumber('walmart', ' 1796277083022'), 'GCI-W-1796277083022');
+test('the year label changes across a rollover but the sequence keeps counting', () => {
+  // GCI-2027-447301 continuing GCI-2026-447300 — the year is a label chosen
+  // at generation time, not a partition of the sequence.
+  assert.equal(formatPoNumber(447300, 2026), 'GCI-2026-447300');
+  assert.equal(formatPoNumber(447301, 2027), 'GCI-2027-447301');
 });
 
-test('shopify and walmart namespaces never collide on the same id', () => {
-  assert.notEqual(buildPoNumber('shopify', '447268'), buildPoNumber('walmart', '447268'));
+test('rejects a non-positive or non-integer sequence value', () => {
+  assert.throws(() => formatPoNumber(0), CTLedgerError);
+  assert.throws(() => formatPoNumber(-1), CTLedgerError);
+  assert.throws(() => formatPoNumber(1.5), CTLedgerError);
 });
 
-test('cannot collide with the human-assigned manual format GCI-2026-447268', () => {
-  // The manual format is GCI-<4-digit year>-<seq>. Ours is GCI-<letter>-<id>.
-  // A single letter is never a four-digit year, so the namespaces are disjoint
-  // no matter what the ids are.
-  const manual = 'GCI-2026-447268';
-  assert.notEqual(buildPoNumber('shopify', '447268'), manual);
-  assert.notEqual(buildPoNumber('walmart', '447268'), manual);
-  assert.notEqual(buildPoNumber('shopify', '2026-447268'), manual);
+// ── buildPoNumber ────────────────────────────────────────────────────────────
+//
+// Only the validation guards are exercised here — channel === 'manual' and an
+// empty sourceOrderNumber. Both throw before buildPoNumber() ever awaits
+// nextPoSequence(), so these stay true to this file's no-network contract.
 
-  for (const po of [buildPoNumber('shopify', '447268'), buildPoNumber('walmart', '447268')]) {
-    const segment = po.split('-')[1];
-    assert.equal(segment.length, 1, `expected a single-letter segment, got '${segment}'`);
-    assert.ok(!/^\d{4}$/.test(segment), 'segment must never look like a year');
-  }
+console.log('\nbuildPoNumber (validation guards)');
+
+await asyncTest('refuses to invent a manual PO number', async () => {
+  await assert.rejects(buildPoNumber('manual', '447268'), CTLedgerError);
 });
 
-test('preserves case — folding it would merge two distinct order names', () => {
-  assert.notEqual(buildPoNumber('shopify', 'abc'), buildPoNumber('shopify', 'ABC'));
-});
-
-test('sanitizes characters that would break a URL or CSV', () => {
-  assert.equal(buildPoNumber('shopify', '10 42'), 'GCI-S-1042');
-  assert.equal(buildPoNumber('shopify', 'A/B'), 'GCI-S-A-B');
-});
-
-test('refuses to invent a manual PO number', () => {
-  assert.throws(() => buildPoNumber('manual', '447268'), CTLedgerError);
-});
-
-test('rejects an empty or unusable source order number', () => {
-  assert.throws(() => buildPoNumber('shopify', ''), CTLedgerError);
-  assert.throws(() => buildPoNumber('shopify', '   '), CTLedgerError);
-  assert.throws(() => buildPoNumber('shopify', '#'), CTLedgerError);
-  assert.throws(() => buildPoNumber('walmart', '///'), CTLedgerError);
+await asyncTest('rejects an empty or blank source order number', async () => {
+  await assert.rejects(buildPoNumber('shopify', ''), CTLedgerError);
+  await assert.rejects(buildPoNumber('shopify', '   '), CTLedgerError);
+  await assert.rejects(buildPoNumber('shopify', '#'), CTLedgerError);
 });
 
 // ── Status transitions ──────────────────────────────────────────────────────
@@ -206,9 +216,9 @@ test('strips customerToken at the top level', () => {
 });
 
 test('strips customerToken nested inside the payload', () => {
-  const out = redactSecrets({ orderDetails: { poNumber: 'GCI-S-1042', customerToken: 'secret' } });
+  const out = redactSecrets({ orderDetails: { poNumber: 'GCI-2026-447267', customerToken: 'secret' } });
   assert.equal((out.orderDetails as any).customerToken, '***REDACTED***');
-  assert.equal((out.orderDetails as any).poNumber, 'GCI-S-1042');
+  assert.equal((out.orderDetails as any).poNumber, 'GCI-2026-447267');
 });
 
 test('strips secrets inside arrays', () => {
@@ -228,7 +238,7 @@ test('leaves the reconciliation-relevant fields intact', () => {
     customerId: '19997',
     customerToken: 'secret',
     orderDetails: {
-      poNumber: 'GCI-S-1042',
+      poNumber: 'GCI-2026-447267',
       location: 'Toronto, ON',
       items: [{ partNumber: '200E1059', quantity: 4 }],
     },
@@ -260,3 +270,10 @@ test('survives a cyclic payload without hanging', () => {
 });
 
 console.log(`\n✅ ${passed} assertions passed\n`);
+
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exitCode = 1;
+});

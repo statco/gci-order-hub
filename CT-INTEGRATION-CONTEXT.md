@@ -216,10 +216,50 @@ States: `claimed` → `submitted` | `indeterminate` | `failed` |
 `claimOrder()` uses a **bare INSERT**, not select-then-insert, and relies on the
 unique constraint to resolve races.
 
-`buildPoNumber()`: Shopify → `GCI-S-<orderNumber>`, Walmart →
+`buildPoNumber()`: originally Shopify → `GCI-S-<orderNumber>`, Walmart →
 `GCI-W-<purchaseOrderId>`, manual → throws (must be passed explicitly).
+**Superseded** — see the canonical-PO-number-format PR below: CT never
+recognised the `GCI-S-`/`GCI-W-` shape. Both channels now go through
+`GCI-<year>-<seq>`, same as the rest of this section describes.
 
 31 unit tests pass — all pure functions, no CT or Supabase calls.
+
+### Canonical PO number format (2026-07-29)
+
+- `supabase/migrations/20260729_ct_po_number_seq.sql` — checked in, **not yet
+  applied** to the live Supabase project (see PR description)
+- `api/lib/ct-order-ledger.ts`, `api/ct-tracking-parser.ts`
+
+CT only ever recognises one PO number shape: `GCI-<year>-<seq>` (e.g.
+`GCI-2026-447267`, `GCI-2026-447269`), the same shape its staff already use
+for manually-issued POs. `buildPoNumber()` now emits exactly that for BOTH
+`shopify` and `walmart` — channel is not encoded in the PO number, it lives
+in `ct_orders.source_channel`, which is the reconciliation join key. The
+`<seq>` portion comes from a new Postgres sequence, `ct_po_number_seq`,
+seeded at 447300 (manual POs were at 447267/447269 as of this PR) and
+fetched atomically via a `ct_next_po_seq()` PostgREST RPC — `buildPoNumber()`
+is now async and non-deterministic per call (each call burns a sequence
+slot), which is fine: the double-submission guard was always
+`claimOrder()`'s INSERT racing the `ct_orders_source_unique` constraint, not
+determinism of the PO number itself. The sequence never resets at year
+rollover.
+
+`api/ct-tracking-parser.ts`'s invoice-PO regex (`parseInvoicePdf()`) could
+not previously match this shape at all — it required digits immediately
+after 2-4 letters, so it hit the literal hyphen in `GCI-2026-447269` and
+capped at 6 digits. Both the canonical shape and the older `GCI0003`-style
+legacy shape (still present in CT invoice history) are now matched, built
+from the same `CANONICAL_PO_NUMBER_SHAPE` constant `buildPoNumber()` uses, so
+producer and consumer cannot silently drift apart again.
+
+**Known gap, not fixed by this PR:** `order-router.ts`'s dormant
+`CT_AUTO_PO_ENABLED` branch calls `submitPurchaseOrder()` →
+`submitOrder({ poNumber: po.gciOrderNumber, ... })` directly, bypassing
+`claimOrder()`/`buildPoNumber()` entirely — it would send CT the raw Shopify
+order name (e.g. `#1042`), not a canonical PO number, if that gate were ever
+flipped on. `CT_AUTO_PO_ENABLED` is unset today so this path is unreachable;
+wiring it through the ledger is Prompt B's job (see
+`CT-SESSION-PROMPTS.md`, updated to reference the corrected format).
 
 ---
 
@@ -283,9 +323,13 @@ manually. Nothing alerted.
   architecture a failed mirror means the order never reaches CT and never
   ships. On failure: loud Telegram alert naming the Walmart PO#, leave the
   order unmarked so the next cron run retries.
-- **PO numbering stays `GCI-W-<walmartPO>`** for Walmart-origin orders even
-  though Shopify triggers them, so CT invoices reconcile against Walmart
-  payouts.
+- **PO numbering** — **superseded 2026-07-29**: this originally said PO
+  numbering stays `GCI-W-<walmartPO>` for Walmart-origin orders so CT
+  invoices reconcile against Walmart payouts. CT never actually recognised
+  that shape; reconciliation instead uses `ct_orders.source_channel` plus the
+  Walmart PO# stored as metadata (both channels now share the single
+  `GCI-<year>-<seq>` PO number format — see the canonical PO number format
+  entry under §5).
 - **Ledger keys on the Shopify order id for BOTH channels** (Shopify is the
   hub). The Walmart PO# rides along as metadata; `source_channel` is retained
   for reporting.
