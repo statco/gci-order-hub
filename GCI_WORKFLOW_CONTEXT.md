@@ -5,11 +5,14 @@
 > identically across all 6 repos below so it's available no matter which one you
 > land in first. If you update it, update all 6 copies.
 >
-> Last written: 2026-07-01, last updated: 2026-07-29 (after the Walmart
-> order-capture root-cause fix + canonical CT PO number format pass —
-> gci-order-hub#50/#51/#52). This update was made from within gci-order-hub
-> only; the other 5 copies have NOT been synced — see §2/§6 for what's now
-> stale in them. Status markers:
+> Last written: 2026-07-01, last updated: 2026-07-29 end-of-session (after
+> the Walmart order-capture root-cause fix + canonical CT PO number format
+> pass — gci-order-hub#50/#51/#52/#54/#55 — and a same-night audit of
+> gci-walmart-sync that led to shadow-mode order capture, now LIVE — see
+> §2's gci-walmart-sync row and §6 item 13). Synced to 3 of 6 copies this
+> session (gci-order-hub, gci-brain, gci-walmart-sync) — gci-command-center,
+> gcitires-chatbot, gci-price-monitor are still stale against everything
+> below. Status markers:
 > ✅ verified working · 🟡 built but not fully live-verified · ⛔ known broken/blocked ·
 > 🔲 not yet built.
 
@@ -41,7 +44,7 @@ actual current purpose (some don't; see §4).
 | **gci-order-hub** | Order automation for GCI's own Shopify store: Shopify `orders/paid` webhook → routes to CT (TIRE- SKUs) → installer dispatch → Walmart price/inventory cron sync (`/api/walmart-sync`, `/api/walmart-sync-cursor`, `/api/walmart-ship`, etc.) → separately, `/api/walmart-order-sync` (Walmart *order capture*, not price/inventory — every 15 min, mirrors new Walmart orders into a Google Sheet, acknowledges them on Walmart, Telegram-alerts the team) — more routes live than the README documents, check the actual `api/` folder. CJ Dropshipping (NUPROZ- SKU) routing removed 2026-07 — see §3/§4. | `gci-order-hub.vercel.app` | ✅ core routing working. ✅ Walmart order capture fixed 2026-07-29 after being silently broken (§6.12) — verify this stays fixed, it has failed silently before. 🟡 CT auto-PO switch built, dormant (§6). |
 | **gci-command-center** | Internal ops dashboard — Sales/Marketing/Finance/IT/Content, one React app. Pulls Shopify + GA4 + Xero into one place. Also runs the Walmart discount-rotation system (`/promotions`). | `gci-command-center-ofzf` (custom domain `ops.gcitires.com`). The old duplicate plain-`.vercel.app` project was **deleted 2026-07-02** — there is now only one. | ✅ Fully verified 2026-07-02: all 4 dashboard widgets confirmed against real source data (Shopify orders/revenue, GA4 sessions, Xero invoices). Xero re-authed + root-cause fixed (§6.10), GA4 re-authed with a new service account (§5). |
 | **gcitires-chatbot** | Customer-facing AI chat widget embedded on the storefront. Memory/conversation history migrated 2026-07 from Airtable to Supabase (`chatbot_customers`/`chatbot_conversations` tables in the shared `gci-walmart-sync` Supabase project) — fixes the old `/api/memory` timeout problem. | `gcitires-chatbot.vercel.app` | ✅ Migration COMPLETE 2026-07-02: code merged (#27, #28), env vars set, and the historical-data migration script actually run against production — 19,275 customer records verified in Supabase (all unique, 0 nulls). The re-run script (`scripts/migrate-airtable-to-supabase.ts`) is upsert-keyed and safe to re-run. |
-| **gci-walmart-sync** | **Standalone commercial Shopify app** (Remix, Shopify App Store template) for Walmart CA Marketplace sync — listings, price, inventory, orders, returns. Built first for GCI, intended to be **published commercially** once ready. **Not activated for GCI's own operations yet** — pre-launch. | `app.gcitires.ca` (+ `gci-walmart-sync.vercel.app`) | 🟡 CC-1 through CC-12 built and compiling, feature-complete on paper, genuinely NOT live-tested with a real merchant yet (including GCI itself). See its own `docs/SESSION-CONTEXT.md` for full build history. |
+| **gci-walmart-sync** | **Standalone commercial Shopify app** (Remix, Shopify App Store template) for Walmart CA Marketplace sync — listings, price, inventory, orders, returns. Built first for GCI, intended to be **published commercially** once ready. **Still not installed on any real Shopify store**, GCI's included. | `app.gcitires.ca` (+ `gci-walmart-sync.vercel.app`) | 🟡 CC-1 through CC-12 built and compiling, feature-complete on paper, no real Shopify merchant has ever installed it. ✅ **2026-07-29**: its order-ingestion cron is now LIVE-capturing GCI's real Walmart orders in **shadow mode** (`docs/SHADOW-MODE.md`) for comparison against gci-order-hub — read that file AND `docs/SCOPE-NOTE.md` before assuming either "just a test app" or "the real pipeline now": both are wrong on their own, see §6 item 13. See its own `docs/SESSION-CONTEXT.md` for full build history. |
 | **gci-price-monitor** | Daily competitor tire-price scraper (Python/Playwright), **runs via GitHub Actions, not Vercel** — despite having a `vercel.json`, that file is an unused stub. Reports via Telegram. Persistence migrated 2026-07 from local SQLite to Supabase (`price_monitor_snapshots` table, same shared project) — real day-over-day trend data now possible for the first time. | GitHub Actions cron (`.github/workflows/price_monitor.yml`, daily 8AM EST) | ✅ Merged (gci-price-monitor#4) and verified end-to-end via a real `workflow_dispatch` production run (real scrape, real Supabase insert, confirmed via direct SQL). `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` secrets set on the repo. First real historical trend data started accruing 2026-07-01. |
 
 **Explicitly not part of this system**, despite living in the same Vercel team:
@@ -271,26 +274,56 @@ access (new dedicated service account, §3).
       (`getOrInitAlertCutoffMs()`, bootstrapped ~2026-07-28T02:00 UTC on
       first run after #49 deployed) by about 24h, so the guard will never
       alert on it automatically — that's the guard working as intended, not
-      a bug. Needs a manual one-time Telegram message (proposed in
-      gci-order-hub#52's description, not yet sent).
+      a bug. See item 17.
     LESSON — same shape as §6.4/§4: a per-order alert can be merged, "on"
     according to every log, and still have never fired once, because the
     thing feeding it was broken upstream. Verify by finding a real known
     order and confirming it actually shows up, not by confirming the alert
     code compiles and the cron has no errors.
+13. **Shadow-mode order capture built AND live** (gci-walmart-sync#23,
+    merged 2026-07-29) — evidence-gathering for a question raised the same
+    night: gci-walmart-sync's own `docs/SCOPE-NOTE.md` (2026-07-27, written
+    directly by the account owner) established it as a separate commercial
+    app deliberately in test mode, explicitly NOT GCI's order pipeline; a
+    later same-night session considered activating it as a replacement for
+    gci-order-hub's Walmart plumbing instead. Rather than decide blind, one
+    Shop row (`shopifyDomain: 'shadow-mode.internal'`, `shadowMode: true`)
+    was given real GCI Walmart CA credentials — registered live
+    2026-07-29T05:25 UTC via the new `POST /api/admin/shadow-shop` — but no
+    real Shopify install. `order-ingestion` captures real orders for it
+    into `walmart_orders` exactly like any other shop, then deliberately
+    stops: never creates a Shopify order, never acknowledges on Walmart.
+    Every other cron there (`price-reconcile`, `returns-poll` — which
+    issues real refunds — `feed-status-poll`) stays billing-gated and
+    silently skips it.
+    **This is data collection, not a decision.** `docs/SCOPE-NOTE.md` still
+    stands; gci-order-hub remains the live pipeline until someone actively
+    decides otherwise.
+    Also rotated that night: gci-walmart-sync's `CRON_SECRET` (Vercel
+    marks it "Sensitive" — write-only, unrecoverable — so the old value
+    couldn't be read back to make the registration call; regenerated
+    instead). Gates all 4 crons in that project; Vercel's own cron
+    dispatcher picks up the new value automatically.
+    **Next step, not yet done:** once real orders have accumulated,
+    compare `walmart_orders` (`shop.shadowMode = true`) against
+    gci-order-hub's Sheet log for the same `walmartOrderId`s, then decide
+    on a cutover — which would mean a real Shopify install, disabling
+    gci-order-hub's Walmart order-sync cron, and adding Telegram alerting
+    to gci-walmart-sync (it currently has none; failures just log).
 
 **Still open (code-adjacent):**
-13. **`gci-brain/api/send-email.js`** — CORS-restricted but no server-side
+14. **`gci-brain/api/send-email.js`** — CORS-restricted but no server-side
     auth; same class of issue as the old Airtable proxy, lesser severity.
     Flagged, not yet fixed.
-14. **Xero auth-url/callback endpoints have no caller auth** — lower risk
+15. **Xero auth-url/callback endpoints have no caller auth** — lower risk
     (completing the flow still requires a real Xero login), but worth a
     shared-secret lockdown eventually.
-15. **Blog-publisher 4/4 re-verification** — see item 8; check the Monday
+16. **Blog-publisher 4/4 re-verification** — see item 8; check the Monday
     cron's output or trigger deliberately (publishes real posts).
-16. **Manual one-time alert for PO `309120965612142`** — see item 12's last
-    bullet. Not code — a single Telegram message, or a small reusable
-    one-off endpoint if this class of gap recurs. Not yet done.
+17. **Manual one-time alert for PO `309120965612142`** — see item 12's last
+    bullet. The endpoint now exists (gci-order-hub#55, merged:
+    `POST /api/admin-alert-order?po=<id>`, `Bearer CRON_SECRET`) but has
+    never been invoked — the order is still unalerted. Not yet done.
 
 ---
 
