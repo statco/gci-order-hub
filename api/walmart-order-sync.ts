@@ -14,7 +14,7 @@ const SHEET_ID = process.env.WALMART_ORDER_LOG_SHEET_ID!;
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-interface PostalAddress {
+export interface PostalAddress {
   name: string;
   address1: string;
   address2?: string;
@@ -24,11 +24,11 @@ interface PostalAddress {
   country: string;
 }
 
-interface OrderLineStatus {
+export interface OrderLineStatus {
   status: string;
 }
 
-interface OrderLine {
+export interface OrderLine {
   lineNumber: string;
   item: { sku: string; productName: string };
   charges: {
@@ -41,7 +41,7 @@ interface OrderLine {
   orderLineStatuses?: { orderLineStatus: OrderLineStatus[] };
 }
 
-interface WalmartOrder {
+export interface WalmartOrder {
   purchaseOrderId: string;
   // "Order#" in the ALERT CONTENT spec, distinct from purchaseOrderId (PO#).
   // NOT verified against a live payload anywhere in this repo — no existing
@@ -65,7 +65,7 @@ interface WalmartOrder {
 
 // ── Walmart helpers ────────────────────────────────────────────────────────────────
 
-function walmartHeaders(token: string): Record<string, string> {
+export function walmartHeaders(token: string): Record<string, string> {
   return {
     'WM_SEC.ACCESS_TOKEN': token,
     'WM_GLOBAL_VERSION': '3.1',
@@ -159,7 +159,7 @@ function getLinePrice(line: OrderLine): number {
  * treated as NOT cancelled (fail open on alerting rather than silently
  * swallow an order because of an unexpected payload shape).
  */
-function isFullyCancelled(order: WalmartOrder): boolean {
+export function isFullyCancelled(order: WalmartOrder): boolean {
   const lines = order.orderLines?.orderLine ?? [];
   if (lines.length === 0) return false;
   return lines.every((line) => {
@@ -191,7 +191,7 @@ function formatWalmartDate(value: number | string | undefined): string {
 // Submit" CTA) is built for the Shopify → CT/CJ authorization flow and does
 // not apply to a Walmart order with no such action.
 
-function buildTelegramMessage(orders: WalmartOrder[]): string {
+export function buildTelegramMessage(orders: WalmartOrder[]): string {
   const header =
     orders.length === 1
       ? `🚨 <b>1 New Walmart Order</b>`
