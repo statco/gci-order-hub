@@ -92,32 +92,92 @@ export class CTLedgerUnavailableError extends Error {
 
 // ─── PO number construction ──────────────────────────────────────────────────
 //
-// Must be deterministic (same source order always yields the same PO number,
-// so a replayed webhook collides rather than duplicates) and collision-free
-// with the existing human-assigned manual format, which looks like
-// GCI-2026-447268.
+// CT recognises exactly one PO number shape: GCI-<year>-<seq>, e.g.
+// GCI-2026-447267, GCI-2026-447269 — the same shape CT staff already use for
+// manually-issued POs. That format is fixed by CT, not by us, so it is the
+// only shape this codebase is allowed to emit, for any channel. Channel is
+// deliberately NOT encoded in the PO number: it already lives in
+// ct_orders.source_channel (the Walmart PO# rides along as ct_orders
+// metadata per PR #48), and source_channel is the reconciliation join key.
 //
-// Our shape is GCI-<single letter>-<id>. A single letter can never equal a
-// four-digit year, so the two namespaces are structurally disjoint — no
-// amount of ID collision can make GCI-S-447268 collide with GCI-2026-447268.
+// CANONICAL_PO_NUMBER_SHAPE is exported so ct-tracking-parser.ts — which has
+// to parse this same shape back out of a CT invoice PDF — builds its regex
+// from this single definition instead of an independently-typed copy that
+// could quietly drift out of sync with what this function actually emits.
 
-const PO_PREFIX: Record<'shopify' | 'walmart', string> = {
-  shopify: 'GCI-S-',
-  walmart: 'GCI-W-',
-};
+export const CANONICAL_PO_NUMBER_SHAPE = 'GCI-\\d{4}-\\d{4,8}';
+export const CANONICAL_PO_NUMBER_PATTERN = new RegExp(`^${CANONICAL_PO_NUMBER_SHAPE}$`);
 
 /**
- * Build the CT-facing PO number for a source order.
+ * Pure formatting for the canonical shape. Split out from buildPoNumber() so
+ * the shape itself — the actual contract CT enforces — stays unit-testable
+ * without a live sequence or a Supabase connection.
+ */
+export function formatPoNumber(seq: number, year: number = new Date().getFullYear()): string {
+  if (!Number.isInteger(seq) || seq <= 0) {
+    throw new CTLedgerError(`formatPoNumber requires a positive integer sequence value, got ${seq}.`);
+  }
+  const po = `GCI-${year}-${seq}`;
+  // Self-check: this producer must never emit something its own consumer
+  // (ct-tracking-parser.ts) cannot parse back out of a CT invoice. Only ever
+  // fires if a caller passes a seq outside 4-8 digits — ct_po_number_seq is
+  // seeded at 447300 (6 digits) and only increments, so this is not expected
+  // to trip in practice, but a silent producer/consumer mismatch here is
+  // exactly the class of bug this whole PR exists to close.
+  if (!CANONICAL_PO_NUMBER_PATTERN.test(po)) {
+    throw new CTLedgerError(`Generated PO number '${po}' does not match the canonical CT shape.`);
+  }
+  return po;
+}
+
+/**
+ * Atomically mint the next sequence value from the Postgres sequence
+ * ct_po_number_seq (see supabase/migrations/20260729_ct_po_number_seq.sql),
+ * via a PostgREST RPC call. nextval() is atomic under concurrency by
+ * construction — a read-then-increment counter row could not make that
+ * guarantee, which is the actual requirement: two concurrent orders must
+ * never be handed the same PO number.
+ */
+async function nextPoSequence(): Promise<number> {
+  const res = await rest('/rpc/ct_next_po_seq', {
+    method:  'POST',
+    headers: headers(),
+    body:    '{}',
+  });
+  if (!res.ok) {
+    throw new CTLedgerUnavailableError(
+      `Supabase RPC ct_next_po_seq → ${res.status}: ${(await res.text()).slice(0, 200)}`
+    );
+  }
+  const value = await res.json();
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new CTLedgerUnavailableError(`ct_next_po_seq returned a non-numeric value: ${JSON.stringify(value)}`);
+  }
+  return n;
+}
+
+/**
+ * Build the CT-facing PO number for a source order: GCI-<year>-<seq>, for
+ * both 'shopify' and 'walmart'.
  *
- * shopify → 'GCI-S-<order name without #>'   (#1042           → GCI-S-1042)
- * walmart → 'GCI-W-<walmartPurchaseOrderId>' (1796277083022   → GCI-W-1796277083022)
+ * This makes buildPoNumber() non-deterministic — calling it twice for the
+ * same source order now returns two DIFFERENT PO numbers, unlike the old
+ * GCI-S-/GCI-W- scheme. That is fine: the double-submission guard was never
+ * determinism of the PO number, it is claimOrder()'s bare INSERT racing
+ * against the ct_orders_source_unique constraint on
+ * (source_channel, source_order_id). A replayed webhook still calls
+ * buildPoNumber() and still burns a sequence slot, but its claimOrder()
+ * INSERT is rejected by that constraint before the wasted number is ever
+ * shown to CT — gaps in the sequence are expected and harmless.
  *
  * Deliberately throws for 'manual': manual PO numbers are assigned by a human
- * in the existing GCI-<year>-<seq> format, and inventing a competing scheme
- * for them risks colliding with a number already written on a real PO. Pass
- * the human-assigned number explicitly via claimOrder({ poNumber }) instead.
+ * in this same GCI-<year>-<seq> shape, and minting a fresh one here would
+ * both waste a sequence slot and risk overwriting a number already written
+ * on a real PO. Pass the human-assigned number explicitly via
+ * claimOrder({ poNumber }) instead.
  */
-export function buildPoNumber(channel: CTSourceChannel, sourceOrderNumber: string): string {
+export async function buildPoNumber(channel: CTSourceChannel, sourceOrderNumber: string): Promise<string> {
   if (channel === 'manual') {
     throw new CTLedgerError(
       'buildPoNumber does not generate manual PO numbers — they are human-assigned ' +
@@ -130,18 +190,7 @@ export function buildPoNumber(channel: CTSourceChannel, sourceOrderNumber: strin
     throw new CTLedgerError(`Cannot build a PO number for channel='${channel}': source order number is empty.`);
   }
 
-  // Collapse whitespace and confine to characters that survive a URL, a CSV
-  // and CT's own field validation unchanged. Case is preserved — folding it
-  // would let two genuinely different order names collapse onto one PO number.
-  const cleaned = raw.replace(/\s+/g, '').replace(/[^A-Za-z0-9._-]/g, '-');
-  if (!cleaned.replace(/-/g, '')) {
-    throw new CTLedgerError(
-      `Cannot build a PO number for channel='${channel}': ` +
-      `source order number '${sourceOrderNumber}' has no usable characters.`
-    );
-  }
-
-  return PO_PREFIX[channel] + cleaned;
+  return formatPoNumber(await nextPoSequence());
 }
 
 // ─── Status transitions ──────────────────────────────────────────────────────
@@ -322,7 +371,7 @@ export async function claimOrder(input: ClaimOrderInput): Promise<ClaimResult> {
   }
 
   const poNumber = input.poNumber?.trim()
-    || buildPoNumber(channel, input.sourceOrderNumber ?? '');
+    || await buildPoNumber(channel, input.sourceOrderNumber ?? '');
 
   const insert = {
     source_channel:      channel,
