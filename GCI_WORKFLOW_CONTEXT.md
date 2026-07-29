@@ -5,8 +5,11 @@
 > identically across all 6 repos below so it's available no matter which one you
 > land in first. If you update it, update all 6 copies.
 >
-> Last written: 2026-07-01, last updated: 2026-07-02 (end of day, after the
-> full remediation + third-party re-auth pass). Status markers:
+> Last written: 2026-07-01, last updated: 2026-07-29 (after the Walmart
+> order-capture root-cause fix + canonical CT PO number format pass —
+> gci-order-hub#50/#51/#52). This update was made from within gci-order-hub
+> only; the other 5 copies have NOT been synced — see §2/§6 for what's now
+> stale in them. Status markers:
 > ✅ verified working · 🟡 built but not fully live-verified · ⛔ known broken/blocked ·
 > 🔲 not yet built.
 
@@ -35,7 +38,7 @@ actual current purpose (some don't; see §4).
 | Repo | Role | Deploys to | Status |
 |---|---|---|---|
 | **gci-brain** | Shopify catalog/SEO/marketing engine. Owns: CT→Shopify catalog sync (`shopifySync.ts`), GMC/Microsoft Merchant feeds, SEO backfill, social media scheduler, blog publisher, installer booking UI (AI Match), `/api/airtable` + `/api/send-email` proxies used by other repos. | `gci-brain.vercel.app`, custom domain `match.gcitires.com` | ✅ core catalog/SEO pipeline working. ⛔ GMC account suspended (business action needed, not code). See §5. |
-| **gci-order-hub** | Order automation for GCI's own Shopify store: Shopify `orders/paid` webhook → routes to CT (TIRE- SKUs) → installer dispatch → Walmart price/inventory cron sync (`/api/walmart-sync`, `/api/walmart-sync-cursor`, `/api/walmart-ship`, etc. — more routes live than the README documents, check the actual `api/` folder). CJ Dropshipping (NUPROZ- SKU) routing removed 2026-07 — see §3/§4. | `gci-order-hub.vercel.app` | ✅ core routing working. 🟡 CT auto-PO switch built, dormant (§6). |
+| **gci-order-hub** | Order automation for GCI's own Shopify store: Shopify `orders/paid` webhook → routes to CT (TIRE- SKUs) → installer dispatch → Walmart price/inventory cron sync (`/api/walmart-sync`, `/api/walmart-sync-cursor`, `/api/walmart-ship`, etc.) → separately, `/api/walmart-order-sync` (Walmart *order capture*, not price/inventory — every 15 min, mirrors new Walmart orders into a Google Sheet, acknowledges them on Walmart, Telegram-alerts the team) — more routes live than the README documents, check the actual `api/` folder. CJ Dropshipping (NUPROZ- SKU) routing removed 2026-07 — see §3/§4. | `gci-order-hub.vercel.app` | ✅ core routing working. ✅ Walmart order capture fixed 2026-07-29 after being silently broken (§6.12) — verify this stays fixed, it has failed silently before. 🟡 CT auto-PO switch built, dormant (§6). |
 | **gci-command-center** | Internal ops dashboard — Sales/Marketing/Finance/IT/Content, one React app. Pulls Shopify + GA4 + Xero into one place. Also runs the Walmart discount-rotation system (`/promotions`). | `gci-command-center-ofzf` (custom domain `ops.gcitires.com`). The old duplicate plain-`.vercel.app` project was **deleted 2026-07-02** — there is now only one. | ✅ Fully verified 2026-07-02: all 4 dashboard widgets confirmed against real source data (Shopify orders/revenue, GA4 sessions, Xero invoices). Xero re-authed + root-cause fixed (§6.10), GA4 re-authed with a new service account (§5). |
 | **gcitires-chatbot** | Customer-facing AI chat widget embedded on the storefront. Memory/conversation history migrated 2026-07 from Airtable to Supabase (`chatbot_customers`/`chatbot_conversations` tables in the shared `gci-walmart-sync` Supabase project) — fixes the old `/api/memory` timeout problem. | `gcitires-chatbot.vercel.app` | ✅ Migration COMPLETE 2026-07-02: code merged (#27, #28), env vars set, and the historical-data migration script actually run against production — 19,275 customer records verified in Supabase (all unique, 0 nulls). The re-run script (`scripts/migrate-airtable-to-supabase.ts`) is upsert-keyed and safe to re-run. |
 | **gci-walmart-sync** | **Standalone commercial Shopify app** (Remix, Shopify App Store template) for Walmart CA Marketplace sync — listings, price, inventory, orders, returns. Built first for GCI, intended to be **published commercially** once ready. **Not activated for GCI's own operations yet** — pre-launch. | `app.gcitires.ca` (+ `gci-walmart-sync.vercel.app`) | 🟡 CC-1 through CC-12 built and compiling, feature-complete on paper, genuinely NOT live-tested with a real merchant yet (including GCI itself). See its own `docs/SESSION-CONTEXT.md` for full build history. |
@@ -111,7 +114,7 @@ don't touch without separately confirming scope.
 
 ---
 
-## 5. Known issues open as of 2026-07-02 (business/config, not code)
+## 5. Known issues open as of 2026-07-29 (business/config, not code)
 
 These need a human action outside any repo's code — don't try to "fix" them
 with a code change:
@@ -126,7 +129,15 @@ with a code change:
    1.0a HMAC-SHA256 is **verified working** against production realm 8031691,
    and `api/lib/ct-client.ts` was rewritten (gci-order-hub#47) to the real
    V1.4 contract — **the payload shape is no longer a guess**. An idempotency
-   ledger (`ct_orders`) was added in gci-order-hub#48.
+   ledger (`ct_orders`) was added in gci-order-hub#48. The PO number format
+   was corrected 2026-07-29 (gci-order-hub#51): `buildPoNumber()` previously
+   emitted `GCI-S-<shopifyOrderNumber>` / `GCI-W-<walmartPO>`, a shape CT has
+   never recognized — it now emits CT's actual `GCI-<year>-<seq>` format
+   (matching CT's own manual POs, e.g. `GCI-2026-447267`) via a new atomic
+   Postgres sequence. ⛔ That sequence's migration
+   (`supabase/migrations/20260729_ct_po_number_seq.sql`) is **checked in but
+   NOT YET APPLIED** to the live Supabase project — `buildPoNumber()` will
+   fail for shopify/walmart channels until someone applies it.
    Still blocked on: **CT sandbox credentials** (requested from the rep,
    pending), and the Submit Order endpoint has **never been called** in any
    environment. All three safety gates remain closed
@@ -154,7 +165,7 @@ RESOLVED (formerly here): Xero token expiration (root-caused + fixed in
 code, §6.10 — it was never really a "config" issue) and GA4 service-account
 access (new dedicated service account, §3).
 
-## 6. Known issues (code) — status as of 2026-07-02
+## 6. Known issues (code) — status as of 2026-07-29
 
 **Fixed and merged:**
 1. **`gci-brain`'s `/api/airtable` proxy** — was unauthenticated + open CORS, exposing installer PII (bank info) to any customer's browser during normal AI Match use. Fixed (gci-brain#129, gci-order-hub#44, both merged) — see §3 credential map.
@@ -227,16 +238,55 @@ access (new dedicated service account, §3).
     healthy. Verified live against the real Make.com API. Gotcha for
     future work: Make's logs endpoint requires URL-encoded pagination
     params (`pg%5Blimit%5D`, not `pg[limit]`).
+12. **Walmart order capture was silently broken end-to-end** — a real
+    order (`600000102653105` / PO `309121065891123`, confirmed present in
+    Walmart Seller Center) never appeared in any log, with zero cron
+    errors, `walmart_order_alerts` empty. Two independent bugs stacked, and
+    a per-order Telegram alert (gci-order-hub#49, merged 2026-07-27) had
+    never actually fired because of them:
+    - `fetchCreatedOrders()` filtered client-side for order-line
+      `status === 'Created'`. Live-queried directly against Walmart: this
+      account's CA marketplace orders arrive already `status: 'Acknowledged'`
+      — Walmart never sends `'Created'` here. The filter matched nothing,
+      ever, on every single run. Fixed in gci-order-hub#50 (filter removed
+      entirely; dedup already handled downstream, see next bullet).
+    - Even after that fix, `createdStartDate` was still bounded by the KV
+      sync cursor — a ~15-minute window on a healthy cron. Two live
+      unshipped orders had already aged out of every window the cursor
+      ever produced. Fixed in gci-order-hub#52: `createdStartDate` now
+      comes from a fixed rolling 48h lookback from "now"
+      (`ORDER_SYNC_FETCH_LOOKBACK_HOURS`), decoupled from the cursor (which
+      is kept for heartbeat/observability only). Safe to re-fetch the same
+      window every run because `walmart_order_alerts` (unique constraint on
+      `walmart_po`, claim-before-send) and the Google Sheet dedup both gate
+      on identity, not on the fetch window.
+    - Also in #52: seller-cancelled orders (2 of 6 in this account) are now
+      excluded from alerting (still acknowledged/logged, just not alerted).
+    - **One historical order remains suppressed by design**: PO
+      `309120965612142`'s order date predates the alert backfill cutoff
+      (`getOrInitAlertCutoffMs()`, bootstrapped ~2026-07-28T02:00 UTC on
+      first run after #49 deployed) by about 24h, so the guard will never
+      alert on it automatically — that's the guard working as intended, not
+      a bug. Needs a manual one-time Telegram message (proposed in
+      gci-order-hub#52's description, not yet sent).
+    LESSON — same shape as §6.4/§4: a per-order alert can be merged, "on"
+    according to every log, and still have never fired once, because the
+    thing feeding it was broken upstream. Verify by finding a real known
+    order and confirming it actually shows up, not by confirming the alert
+    code compiles and the cron has no errors.
 
 **Still open (code-adjacent):**
-12. **`gci-brain/api/send-email.js`** — CORS-restricted but no server-side
+13. **`gci-brain/api/send-email.js`** — CORS-restricted but no server-side
     auth; same class of issue as the old Airtable proxy, lesser severity.
     Flagged, not yet fixed.
-13. **Xero auth-url/callback endpoints have no caller auth** — lower risk
+14. **Xero auth-url/callback endpoints have no caller auth** — lower risk
     (completing the flow still requires a real Xero login), but worth a
     shared-secret lockdown eventually.
-14. **Blog-publisher 4/4 re-verification** — see item 8; check the Monday
+15. **Blog-publisher 4/4 re-verification** — see item 8; check the Monday
     cron's output or trigger deliberately (publishes real posts).
+16. **Manual one-time alert for PO `309120965612142`** — see item 12's last
+    bullet. Not code — a single Telegram message, or a small reusable
+    one-off endpoint if this class of gap recurs. Not yet done.
 
 ---
 
