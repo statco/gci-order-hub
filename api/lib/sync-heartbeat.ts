@@ -3,10 +3,10 @@
 // Once-daily "is this cron actually alive" summary for walmart-order-sync,
 // separate from the per-order new-order alert.
 //
-// At ~3 orders/week, "No orders with status=Created" is the expected result
-// on roughly 95 of 96 runs a day. That makes a genuinely broken sync (bad
-// Telegram token, KV outage, Walmart API down, the Created-status filter
-// missing an order) look identical to a normal quiet week — nothing
+// At ~3 orders/week, "No orders in fetch window" is the expected result on
+// roughly 95 of 96 runs a day. That makes a genuinely broken sync (bad
+// Telegram token, KV outage, Walmart API down, a too-narrow fetch window)
+// look identical to a normal quiet week — nothing
 // distinguishes them until a human happens to check days later. This is
 // the class of gap that let PO# 309120965612142 go unnoticed with zero
 // cron errors. The heartbeat doesn't diagnose a specific missed order; it

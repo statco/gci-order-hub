@@ -2,7 +2,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getWalmartToken } from './lib/walmart-client.js';
 import { getSheetOrderIds, appendSheetRows } from './lib/sheets-client.js';
 import { HttpError, retryWithBackoff } from './lib/retry.js';
-import { getSyncSince, setSyncSuccess } from './lib/sync-state.js';
+import { getFetchWindowStart, getSyncSince, setSyncSuccess } from './lib/sync-state.js';
 import { sendTelegramMessage } from './lib/telegram.js';
 import { claimOrderAlert, releaseOrderAlert, getOrInitAlertCutoffMs } from './lib/walmart-order-alerts.js';
 import { recordRunAndMaybeHeartbeat } from './lib/sync-heartbeat.js';
@@ -24,6 +24,10 @@ interface PostalAddress {
   country: string;
 }
 
+interface OrderLineStatus {
+  status: string;
+}
+
 interface OrderLine {
   lineNumber: string;
   item: { sku: string; productName: string };
@@ -34,6 +38,7 @@ interface OrderLine {
     }>;
   };
   orderLineQuantity: { amount: string };
+  orderLineStatuses?: { orderLineStatus: OrderLineStatus[] };
 }
 
 interface WalmartOrder {
@@ -72,9 +77,22 @@ function walmartHeaders(token: string): Record<string, string> {
   };
 }
 
+// Not paginated, deliberately: this account sees ~3 orders/week (see
+// lib/sync-heartbeat.ts), createdStartDate covers a fixed rolling window
+// (default 48h — see getFetchWindowStart()), and this call has no status
+// filter, so `limit` bounds ALL orders of ANY status created in that window,
+// not just unprocessed ones. Expected volume in a 48h window is under 1
+// order; 200 is roughly two orders of magnitude of headroom. If that
+// assumption ever breaks, the length-check below fires a loud, specific
+// warning well before silent truncation could happen — add a real
+// pagination loop at that point rather than pre-emptively building one for
+// a case that has never occurred.
+const PAGE_LIMIT = 200;
+
 async function fetchRecentOrders(token: string, since: string): Promise<WalmartOrder[]> {
-  // Fetch orders created since the last successful sync (catch-up). No
-  // status filter: confirmed via live query (order 600000102653105 /
+  // `since` bounds a rolling window (getFetchWindowStart()), NOT the sync
+  // cursor — see lib/sync-state.ts's module header for why. No status
+  // filter: confirmed via live query (order 600000102653105 /
   // PO 309121065891123, PO 309120965612142) that Walmart's CA marketplace
   // assigns new orders status "Acknowledged" directly — a "Created" filter
   // here matched nothing, ever, silently dropping every order. Dedup is
@@ -83,13 +101,26 @@ async function fetchRecentOrders(token: string, since: string): Promise<WalmartO
   // fetches, so no status filter is needed on this side.
   // Throws HttpError on failure so the retry wrapper can classify transient
   // (5xx/520) vs permanent (4xx) responses.
-  const url = `${WALMART_BASE_URL}/v3/orders?createdStartDate=${encodeURIComponent(since)}&limit=200`;
+  const url = `${WALMART_BASE_URL}/v3/orders?createdStartDate=${encodeURIComponent(since)}&limit=${PAGE_LIMIT}`;
   const res = await fetch(url, { headers: walmartHeaders(token) });
   if (!res.ok) {
     throw new HttpError(res.status, `Walmart orders fetch failed: ${res.status} ${await res.text()}`);
   }
   const data = await res.json();
-  return (data?.list?.elements?.order ?? []) as WalmartOrder[];
+  const orders = (data?.list?.elements?.order ?? []) as WalmartOrder[];
+
+  // Pagination tripwire, not pagination itself (see comment above PAGE_LIMIT).
+  // A full page is the one observable signal that the "under 1 order per 48h"
+  // assumption broke and orders beyond this page may be silently missing.
+  if (orders.length === PAGE_LIMIT) {
+    console.warn(
+      `[order-sync] fetchRecentOrders returned exactly ${PAGE_LIMIT} (the page limit) — ` +
+      `order volume may exceed what a single unpaginated page can hold. Orders beyond this ` +
+      `page would be silently missing. Investigate before this becomes routine.`
+    );
+  }
+
+  return orders;
 }
 async function acknowledgeOrder(token: string, orderId: string): Promise<boolean> {
   const res = await fetch(`${WALMART_BASE_URL}/v3/orders/${orderId}/acknowledge`, {
@@ -118,6 +149,23 @@ function formatAddress(addr: PostalAddress): string {
 function getLinePrice(line: OrderLine): number {
   const productCharge = line.charges?.charge?.find((c) => c.chargeType === 'PRODUCT');
   return productCharge?.chargeAmount?.amount ?? 0;
+}
+
+/**
+ * True if every line on the order is fully Cancelled — order-level, not
+ * line-level, matching how this account's seller-cancelled orders actually
+ * look (2 of 6 orders in this account are fully seller-cancelled; none seen
+ * so far are partially cancelled). A line with no status entries at all is
+ * treated as NOT cancelled (fail open on alerting rather than silently
+ * swallow an order because of an unexpected payload shape).
+ */
+function isFullyCancelled(order: WalmartOrder): boolean {
+  const lines = order.orderLines?.orderLine ?? [];
+  if (lines.length === 0) return false;
+  return lines.every((line) => {
+    const statuses = line.orderLineStatuses?.orderLineStatus ?? [];
+    return statuses.length > 0 && statuses.every((s) => s.status === 'Cancelled');
+  });
 }
 
 function formatWalmartDate(value: number | string | undefined): string {
@@ -188,20 +236,36 @@ function buildTelegramMessage(orders: WalmartOrder[]): string {
  * order is retried on the next run instead of being marked alerted for a
  * message that never went out.
  *
- * Backfill guard: getOrInitAlertCutoffMs() self-bootstraps to "now" on the
- * first run after deploy (persisted in KV, no env var to set by hand) —
- * only orders created after that are ever eligible to alert. Returns null
- * (alert nothing this run) if KV is unavailable, deliberately fail-closed
- * rather than guessing a fallback window.
+ * Two independent filters gate eligibility, in this order:
+ *
+ * 1. Cancelled orders are never alerted — a seller-cancelled order needs no
+ *    action and would be pure noise (2 of 6 orders in this account are
+ *    fully seller-cancelled). See isFullyCancelled(). This is scoped to
+ *    alerting only: cancelled orders still flow through acknowledge/Sheet
+ *    logging below unchanged.
+ *
+ * 2. Backfill guard: getOrInitAlertCutoffMs() self-bootstraps to "now" on the
+ *    first run after deploy (persisted in KV, no env var to set by hand) —
+ *    only orders created after that are ever eligible to alert. Returns null
+ *    (alert nothing this run) if KV is unavailable, deliberately fail-closed
+ *    rather than guessing a fallback window.
  */
 async function alertNewOrders(orders: WalmartOrder[]): Promise<void> {
+  const notCancelled = orders.filter((o) => !isFullyCancelled(o));
+  if (notCancelled.length < orders.length) {
+    console.log(
+      `[order-sync] ${orders.length - notCancelled.length} order(s) fully cancelled — not alerted`
+    );
+  }
+  if (notCancelled.length === 0) return;
+
   const cutoff = await getOrInitAlertCutoffMs();
   if (cutoff === null) return;
 
-  const eligible = orders.filter((o) => o.orderDate > cutoff);
-  if (eligible.length < orders.length) {
+  const eligible = notCancelled.filter((o) => o.orderDate > cutoff);
+  if (eligible.length < notCancelled.length) {
     console.log(
-      `[order-sync] ${orders.length - eligible.length} order(s) at/before cutoff — not alerted (backfill guard)`
+      `[order-sync] ${notCancelled.length - eligible.length} order(s) at/before cutoff — not alerted (backfill guard)`
     );
   }
   if (eligible.length === 0) return;
@@ -242,17 +306,25 @@ async function alertNewOrders(orders: WalmartOrder[]): Promise<void> {
 export default async function handler(_req: VercelRequest, res: VercelResponse) {
   // Capture the cursor at the START of the run; we only persist it after a
   // clean completion so a failed pass self-heals on the next successful one.
+  // The cursor itself is observability-only now — see fetchWindowStart below.
   const runStartedAt = new Date().toISOString();
   try {
     const token = await getWalmartToken();
 
-    // Catch-up: fetch orders created since the last SUCCESSFUL sync, not since
-    // the last run. retryWithBackoff retries transient failures (5xx/520/network)
-    // 2s/4s/8s before giving up.
-    const since = await getSyncSince();
-    const orders = await retryWithBackoff(() => fetchRecentOrders(token, since), {
+    // The actual fetch bound: a fixed rolling lookback from "now" (default
+    // 48h), NOT the sync cursor. A forward-only cursor window is what let two
+    // live unshipped orders (PO 309120965612142, PO 309121065891123) become
+    // permanently unreachable — see lib/sync-state.ts's module header.
+    // retryWithBackoff retries transient failures (5xx/520/network) 2s/4s/8s
+    // before giving up.
+    const fetchWindowStart = getFetchWindowStart();
+    const orders = await retryWithBackoff(() => fetchRecentOrders(token, fetchWindowStart), {
       label: 'fetchRecentOrders',
     });
+
+    // Cursor read AFTER the fetch, purely for heartbeat/observability — it no
+    // longer gates what was just fetched above.
+    const since = await getSyncSince();
 
     // Runs on every invocation (all ~96/day), independent of everything
     // below — a broken alert or ack step must not suppress the one signal
@@ -260,10 +332,10 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     await recordRunAndMaybeHeartbeat(orders.length, since, sendTelegramMessage);
 
     if (orders.length === 0) {
-      // Nothing to process is itself a clean pass — advance the cursor so we
-      // don't re-scan an ever-growing window.
+      // Nothing to process this run — still advance the observability cursor
+      // so the heartbeat can tell a live-but-quiet sync from a stuck one.
       await setSyncSuccess(runStartedAt);
-      console.log('[order-sync] No orders in sync window');
+      console.log('[order-sync] No orders in fetch window');
       return res.status(200).json({ message: 'No new orders', processed: 0 });
     }
 
@@ -331,8 +403,9 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     await appendSheetRows(SHEET_ID, rows);
     console.log(`[order-sync] Logged ${rows.length} row(s) to sheet`);
 
-    // 5. Clean completion — advance the catch-up cursor. Persisting at
-    //    runStartedAt (not now) keeps any orders created mid-run in range.
+    // 5. Clean completion — advance the observability cursor. Persisting at
+    //    runStartedAt (not now) is harmless belt-and-braces consistency with
+    //    the other call sites now that the cursor no longer bounds a fetch.
     await setSyncSuccess(runStartedAt);
 
     return res.status(200).json({
