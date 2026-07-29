@@ -71,7 +71,7 @@ function parseState(raw: string | null): HeartbeatState {
 /**
  * Record this run and, roughly once every 24h, send a summary Telegram
  * message and reset the counting window.
- * @param ordersSeenThisRun orders returned by fetchCreatedOrders this run
+ * @param ordersSeenThisRun orders returned by fetchRecentOrders this run
  *   (pre-Sheet-dedup — the raw "did Walmart's API give us anything" signal)
  * @param cursorIso the sync cursor value in effect for this run, so the
  *   heartbeat also surfaces a stuck/stale cursor
