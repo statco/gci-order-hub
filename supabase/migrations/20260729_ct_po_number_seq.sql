@@ -22,9 +22,11 @@
 -- the sequence at year rollover would reintroduce exactly the collision risk
 -- this migration exists to remove.
 --
--- This file is the checked-in copy; it has not yet been applied to the live
--- Supabase project as of this PR (see PR description) — apply it before
--- buildPoNumber() is exercised against a live claimOrder() call.
+-- Applied to Supabase project enhbckomwdelktdhnuzq on 2026-07-29 (via MCP,
+-- not a follow-up commit). Verified live: sequence exists, start value
+-- 447300, NO CYCLE, last_value 447300 with is_called false — meaning
+-- nextval() has never been drawn, so the first real call returns exactly
+-- 447300, not 447301.
 
 create sequence if not exists public.ct_po_number_seq
   as bigint
