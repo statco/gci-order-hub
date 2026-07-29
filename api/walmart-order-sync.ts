@@ -72,23 +72,24 @@ function walmartHeaders(token: string): Record<string, string> {
   };
 }
 
-async function fetchCreatedOrders(token: string, since: string): Promise<WalmartOrder[]> {
-  // Fetch orders created since the last successful sync (catch-up), filter
-  // Created status in code. Throws HttpError on failure so the retry wrapper
-  // can classify transient (5xx/520) vs permanent (4xx) responses.
+async function fetchRecentOrders(token: string, since: string): Promise<WalmartOrder[]> {
+  // Fetch orders created since the last successful sync (catch-up). No
+  // status filter: confirmed via live query (order 600000102653105 /
+  // PO 309121065891123, PO 309120965612142) that Walmart's CA marketplace
+  // assigns new orders status "Acknowledged" directly — a "Created" filter
+  // here matched nothing, ever, silently dropping every order. Dedup is
+  // handled downstream by walmart_order_alerts (per-PO claim table) and the
+  // Sheet-ID check, both of which are safe against repeated/overlapping
+  // fetches, so no status filter is needed on this side.
+  // Throws HttpError on failure so the retry wrapper can classify transient
+  // (5xx/520) vs permanent (4xx) responses.
   const url = `${WALMART_BASE_URL}/v3/orders?createdStartDate=${encodeURIComponent(since)}&limit=200`;
   const res = await fetch(url, { headers: walmartHeaders(token) });
   if (!res.ok) {
     throw new HttpError(res.status, `Walmart orders fetch failed: ${res.status} ${await res.text()}`);
   }
   const data = await res.json();
-  const allOrders: WalmartOrder[] = data?.list?.elements?.order ?? [];
-  // Filter to only Created status orders
-  return allOrders.filter((o) =>
-    o.orderLines?.orderLine?.some((line: any) =>
-      line.orderLineStatuses?.orderLineStatus?.some((s: any) => s.status === 'Created')
-    )
-  );
+  return (data?.list?.elements?.order ?? []) as WalmartOrder[];
 }
 async function acknowledgeOrder(token: string, orderId: string): Promise<boolean> {
   const res = await fetch(`${WALMART_BASE_URL}/v3/orders/${orderId}/acknowledge`, {
@@ -249,8 +250,8 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     // the last run. retryWithBackoff retries transient failures (5xx/520/network)
     // 2s/4s/8s before giving up.
     const since = await getSyncSince();
-    const orders = await retryWithBackoff(() => fetchCreatedOrders(token, since), {
-      label: 'fetchCreatedOrders',
+    const orders = await retryWithBackoff(() => fetchRecentOrders(token, since), {
+      label: 'fetchRecentOrders',
     });
 
     // Runs on every invocation (all ~96/day), independent of everything
@@ -262,7 +263,7 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
       // Nothing to process is itself a clean pass — advance the cursor so we
       // don't re-scan an ever-growing window.
       await setSyncSuccess(runStartedAt);
-      console.log('[order-sync] No orders with status=Created');
+      console.log('[order-sync] No orders in sync window');
       return res.status(200).json({ message: 'No new orders', processed: 0 });
     }
 
