@@ -63,7 +63,7 @@ don't touch without separately confirming scope.
 | **Microsoft Merchant Center** (store 50034512 "GCI Tires Canada") | gci-brain (feed endpoint `api/feed/microsoft` — live TSV, ~1,963 active products) | Feed pulled by Microsoft from a public URL, no auth; Ads managed in the Microsoft Advertising UI | ✅ Connected 2026-07-02. Feed live + validated (1,963 active, 0 rejected). A minimal Standard Shopping campaign ("GCI - Shopping - Starter", $5 CAD/day, Enhanced CPC $1, Canada-only, all products) exists because Microsoft requires ≥1 active campaign even for FREE listings. 🟡 Watch item: "not targeted products" store warning attributed to ~12h sync lag — confirm it cleared. |
 | **Make.com** (team 2205971, zone us2) | gci-brain's social-scheduler posts to its webhook; the Make scenario (id 4867071) is what ACTUALLY publishes to Instagram/Facebook/Pinterest — no repo calls those platforms directly | Webhook URL in `MAKE_WEBHOOK_URL` (gci-brain); API token in `MAKE_API_TOKEN` (gci-order-hub, for the health check) | ⚠️ READ §4 — this was the biggest blind spot found in the whole audit. The scenario was OFF from creation (Apr 26) to Jul 2 with zero error signal anywhere, because Vercel only sees "webhook accepted". Now monitored by a daily health check (gci-order-hub#46, `/api/health-check-make`, cron 10:00 UTC) that alerts via Telegram if the scenario is paused OR hasn't executed in 3 days. |
 | **Telegram + Resend** | gci-order-hub, gci-command-center, gci-price-monitor, **and gci-brain as of 2026-07-02** (outreach missing-email alerts — `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` had to be added to gci-brain's Vercel env vars; they are per-project, not shared) | Bot token / API key per repo | Straightforward. Note: env vars do NOT propagate across Vercel projects — a repo "having Telegram" means ITS project has the vars set. |
-| **Supabase** (project `gci-walmart-sync`, ref `enhbckomwdelktdhnuzq`, region `ca-central-1`) | gci-walmart-sync (original owner — `shops`/`products`/`walmart_orders`/`sync_logs`/`sessions`/`walmart_sync_cursor` tables), gcitires-chatbot (`chatbot_customers`/`chatbot_conversations`, added 2026-07), gci-price-monitor (`price_monitor_snapshots`, added 2026-07) | Service role key, held server-side only per repo | Reused deliberately across all three rather than provisioning separate paid projects. RLS enabled on every table, no permissive policies for anon/authenticated — service_role-only access pattern, consistent across all tenants of this project. If you add a new table here for a new use case, follow the same pattern. |
+| **Supabase** (project `gci-walmart-sync`, ref `enhbckomwdelktdhnuzq`, region `ca-central-1`) | gci-walmart-sync (original owner — `shops`/`products`/`walmart_orders`/`sync_logs`/`sessions`/`walmart_sync_cursor` tables), gcitires-chatbot (`chatbot_customers`/`chatbot_conversations`, added 2026-07), gci-price-monitor (`price_monitor_snapshots`, added 2026-07), **and gci-order-hub** (`ct_orders`, `walmart_order_alerts`, added 2026-07-27/28 — despite `gci-order-hub`'s own env-var naming, its data actually lives in the `gci-walmart-sync`-named project) | Service role key, held server-side only per repo | Reused deliberately across all four rather than provisioning separate paid projects. RLS enabled on every table, no permissive policies for anon/authenticated — service_role-only access pattern, consistent across all tenants of this project. If you add a new table here for a new use case, follow the same pattern. ⚠️ **Found 2026-07-29**: a SECOND, separate, entirely empty Supabase project literally named `gci-order-hub` (ref `gqaylwkfiokwsccibvxg`, created 2026-07-29) also exists in this org — a real trap for "apply the migration to the gci-order-hub project" without checking which one actually has the tables first. Always verify with `list_tables` before applying a migration by project *name* alone. |
 | **CJ Dropshipping** | none — removed 2026-07 | — | **Was dead code (`NUPROZ-` SKU path in gci-order-hub), now fully removed** (gci-order-hub#45). nuprozone.com was discontinued due to brand conflicts; confirmed permanent, not paused. |
 
 ---
@@ -134,10 +134,14 @@ with a code change:
    emitted `GCI-S-<shopifyOrderNumber>` / `GCI-W-<walmartPO>`, a shape CT has
    never recognized — it now emits CT's actual `GCI-<year>-<seq>` format
    (matching CT's own manual POs, e.g. `GCI-2026-447267`) via a new atomic
-   Postgres sequence. ⛔ That sequence's migration
-   (`supabase/migrations/20260729_ct_po_number_seq.sql`) is **checked in but
-   NOT YET APPLIED** to the live Supabase project — `buildPoNumber()` will
-   fail for shopify/walmart channels until someone applies it.
+   Postgres sequence. ✅ That sequence's migration
+   (`supabase/migrations/20260729_ct_po_number_seq.sql`) **has been applied**
+   to the live Supabase project (2026-07-29, `ct_po_number_seq` seeded at
+   447300, verified `is_called: false` so the first real PO will be exactly
+   447300) — applied to the project *named* `gci-walmart-sync`
+   (`enhbckomwdelktdhnuzq`), where `gci-order-hub`'s tables actually live,
+   not the separate empty project literally named `gci-order-hub` — see §3's
+   Supabase entry.
    Still blocked on: **CT sandbox credentials** (requested from the rep,
    pending), and the Submit Order endpoint has **never been called** in any
    environment. All three safety gates remain closed
