@@ -165,6 +165,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         `💰 Prices corrected: ${priceCorrected}\n` +
         `❓ Skipped (no price): ${skippedNoPrice.length}` +
         errLine,
+        'info',
       );
     }
 

@@ -77,7 +77,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({ message: `PO ${po} was already claimed for alert — no-op`, po, alerted: false });
     }
 
-    const sent = await sendTelegramMessage(buildTelegramMessage([order]));
+    const sent = await sendTelegramMessage(buildTelegramMessage([order]), 'actionable');
     if (!sent) {
       await releaseOrderAlert(order.purchaseOrderId);
       return res.status(502).json({ error: `Telegram send failed for PO ${po} — claim released, safe to retry`, po });

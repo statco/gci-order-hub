@@ -310,7 +310,7 @@ async function alertOrders(orders: WalmartOrder[], cutoffMs: number | null): Pro
   }
   if (claimed.length === 0) return;
 
-  const sent = await sendTelegramMessage(buildTelegramMessage(claimed));
+  const sent = await sendTelegramMessage(buildTelegramMessage(claimed), 'actionable');
   if (!sent) {
     console.error(
       `[order-sync] Telegram alert send failed for ${claimed.length} order(s) — releasing claims so they retry next run`
@@ -359,8 +359,9 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
 
     // Runs on every invocation (all ~96/day), independent of everything
     // below — a broken alert or ack step must not suppress the one signal
-    // that would show the sync itself has gone quiet. Never throws.
-    await recordRunAndMaybeHeartbeat(orders.length, since, sendTelegramMessage);
+    // that would show the sync itself has gone quiet. Never throws. Routed
+    // to the INFO channel — a periodic summary, not a per-order action item.
+    await recordRunAndMaybeHeartbeat(orders.length, since, (text) => sendTelegramMessage(text, 'info'));
 
     if (orders.length === 0) {
       // Nothing to process this run — still advance the observability cursor
@@ -482,8 +483,10 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     });
   } catch (err: any) {
     console.error('[order-sync] Error:', err);
-    // Alert on Telegram so you know the cron is broken
-    await sendTelegramMessage(`⚠️ <b>walmart-order-sync ERROR</b>\n${err.message}`);
+    // Alert on Telegram so you know the cron is broken. Routed ACTIONABLE
+    // (not in the original bucket list — a crashed sync needs the same
+    // attention as a health-check-make failure, so treated the same way).
+    await sendTelegramMessage(`⚠️ <b>walmart-order-sync ERROR</b>\n${err.message}`, 'actionable');
     return res.status(500).json({ error: err.message });
   }
 }

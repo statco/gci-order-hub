@@ -2,14 +2,13 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
 import { getOrderIdByPoNumber } from './lib/sheets-client.js';
 import { CANONICAL_PO_NUMBER_SHAPE } from './lib/ct-order-ledger.js';
+import { sendTelegramMessage } from './lib/telegram.js';
 
 const PDFParser = require('pdf2json');
 
 export const config = { maxDuration: 60 };
 
 const SHEET_ID = process.env.WALMART_ORDER_LOG_SHEET_ID!;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 const SHIP_ENDPOINT = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}/api/walmart-ship`
   : 'https://gci-order-hub.vercel.app/api/walmart-ship';
@@ -23,20 +22,6 @@ function getGmailClient() {
   );
   auth.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN! });
   return google.gmail({ version: 'v1', auth });
-}
-
-// ── Telegram ───────────────────────────────────────────────────────────────
-
-async function sendTelegram(message: string): Promise<void> {
-  await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: TELEGRAM_CHAT_ID,
-      text: message,
-      parse_mode: 'HTML',
-    }),
-  });
 }
 
 // ── PDF parser ─────────────────────────────────────────────────────────────
@@ -160,8 +145,9 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
 
         if (!pdfPart?.body?.attachmentId) {
           console.warn(`[ct-parser] No PDF attachment in message ${msgId}`);
-          await sendTelegram(
-            `⚠️ <b>CT Invoice: No PDF found</b>\nMessage ID: <code>${msgId}</code>\nCheck manually.`
+          await sendTelegramMessage(
+            `⚠️ <b>CT Invoice: No PDF found</b>\nMessage ID: <code>${msgId}</code>\nCheck manually.`,
+            'actionable',
           );
           continue;
         }
@@ -185,11 +171,12 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
 
         // Validate parsed fields
         if (!poNumber || !trackingNumber) {
-          await sendTelegram(
+          await sendTelegramMessage(
             `⚠️ <b>CT Invoice: Parse Failed</b>\n` +
             `PO #: ${poNumber ?? 'NOT FOUND'}\n` +
             `Tracking: ${trackingNumber ?? 'NOT FOUND'}\n` +
-            `Please enter manually via Brain dashboard.`
+            `Please enter manually via Brain dashboard.`,
+            'actionable',
           );
           failed++;
           continue;
@@ -199,11 +186,12 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
         const orderId = await getOrderIdByPoNumber(SHEET_ID, poNumber);
 
         if (!orderId) {
-          await sendTelegram(
+          await sendTelegramMessage(
             `⚠️ <b>CT Invoice: Order Not Found</b>\n` +
             `PO #: <code>${poNumber}</code> not in Sheet.\n` +
             `Tracking: <code>${trackingNumber}</code>\n` +
-            `Please match manually.`
+            `Please match manually.`,
+            'actionable',
           );
           failed++;
           continue;
@@ -231,8 +219,9 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
 
       } catch (msgErr: any) {
         console.error(`[ct-parser] Error processing message ${msgId}:`, msgErr);
-        await sendTelegram(
-          `⚠️ <b>CT Parser ERROR</b>\nMessage: ${msgId}\n${msgErr.message}\nPlease process manually.`
+        await sendTelegramMessage(
+          `⚠️ <b>CT Parser ERROR</b>\nMessage: ${msgId}\n${msgErr.message}\nPlease process manually.`,
+          'actionable',
         ).catch(() => {});
         failed++;
       }
@@ -242,7 +231,7 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
 
   } catch (err: any) {
     console.error('[ct-parser] Fatal error:', err);
-    await sendTelegram(`⚠️ <b>ct-tracking-parser FATAL ERROR</b>\n${err.message}`).catch(() => {});
+    await sendTelegramMessage(`⚠️ <b>ct-tracking-parser FATAL ERROR</b>\n${err.message}`, 'actionable').catch(() => {});
     return res.status(500).json({ error: err.message });
   }
 }
