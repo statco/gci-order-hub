@@ -99,16 +99,25 @@ export async function releaseOrderAlert(walmartPo: string): Promise<void> {
 
 // ── Deploy-time backfill cutoff ───────────────────────────────────────────
 //
-// Self-bootstrapping: no env var to set by hand. The first time this code
-// runs after deploy (no cutoff yet persisted in KV), "now" is written and
-// used as the cutoff for that same run. Every run after that reads the same
-// persisted value forever — it's a one-time "since deploy" boundary, not a
-// rolling window. At ~3 orders/week there's no meaningful backlog to guard
-// against, so bootstrapping to first-run time (rather than requiring an
-// exact deploy timestamp) is close enough in practice: worst case is the
-// handful of orders created in the gap between deploy and the next 15-min
-// cron tick, which is the same order of magnitude as the polling interval
-// itself already tolerates.
+// Self-bootstrapping: no env var to set by hand. Called unconditionally on
+// every invocation of the sync (see walmart-order-sync.ts's handler), right
+// after the order fetch and before any dedup/filtering — not lazily deferred
+// until a run happens to find an order. The first call after deploy (or
+// after any KV reset/outage/migration wipes the stored value) bootstraps it;
+// every call after that reads the same persisted value forever. It's a
+// one-time "since deploy" boundary, not a rolling window.
+//
+// Bootstrapping used to write Date.now() as the cutoff. That's wrong: orders
+// already exist by the time this code runs, so their orderDate is always
+// <= "now", meaning the very order(s) present in the bootstrapping run would
+// be immediately excluded by the cutoff their own arrival just created. This
+// bit the very first real alert on 2026-07-29 (see the incident writeup in
+// gci-order-hub's history). Fixed by taking the candidate orders from the
+// triggering run and, when bootstrapping, setting the cutoff to just before
+// the earliest of them — so everything already in hand this run passes
+// `orderDate > cutoff`, and only orders older than the whole run's fetch
+// window remain excluded. Falls back to Date.now() only when the run found
+// no orders at all (nothing to protect from suppression).
 //
 // Uses the same Vercel KV (Upstash) instance as lib/sync-state.ts and
 // lib/sync-heartbeat.ts, via its own small client — this repo's existing
@@ -143,29 +152,51 @@ async function kvSet(key: string, value: string): Promise<void> {
 
 /**
  * Returns the epoch-ms cutoff below which orders are never alerted,
- * bootstrapping it to "now" on first call if none is persisted yet. Returns
- * null (fail closed — alert nothing) if KV is unavailable or the bootstrap
- * itself fails, so a KV outage can't accidentally alert the whole backlog.
+ * bootstrapping it if none is persisted yet. Call unconditionally on every
+ * run (not only when orders are present) so the cutoff is established at
+ * deploy time rather than lazily on the first order-bearing run.
+ *
+ * `candidateOrderDatesMs` should be the orderDate (epoch ms) of every order
+ * fetched in the calling run, even ones later filtered out downstream (e.g.
+ * already logged, cancelled) — pass `[]` when the run found no orders. On
+ * bootstrap, if there are candidates, the cutoff is set to just before the
+ * earliest one so nothing already fetched this run is retroactively
+ * suppressed by the cutoff its own arrival just created; with no candidates
+ * it falls back to Date.now() (nothing to protect from suppression).
+ *
+ * Returns null (fail closed — alert nothing) if KV is unavailable or
+ * resolution otherwise fails, so a KV outage can't accidentally alert the
+ * whole backlog once it recovers.
  */
-export async function getOrInitAlertCutoffMs(): Promise<number | null> {
+export async function getOrInitAlertCutoffMs(candidateOrderDatesMs: number[] = []): Promise<number | null> {
   if (!kvAvailable()) {
-    console.warn('[walmart-order-alerts] KV not configured — cannot bootstrap cutoff, alerting nothing this run');
+    console.warn('[walmart-order-alerts] KV not configured — cannot resolve cutoff, alerting nothing this run');
     return null;
   }
   try {
     const stored = await kvGet(CUTOFF_KEY);
     if (stored) {
       const ms = Number(stored);
-      if (Number.isFinite(ms)) return ms;
+      if (Number.isFinite(ms)) {
+        console.log(`[walmart-order-alerts] cutoff: ${new Date(ms).toISOString()} (${ms}ms)`);
+        return ms;
+      }
       console.warn(`[walmart-order-alerts] stored cutoff not a number (${stored}) — re-bootstrapping`);
     }
-    const now = Date.now();
-    await kvSet(CUTOFF_KEY, String(now));
-    console.log(`[walmart-order-alerts] cutoff bootstrapped at ${new Date(now).toISOString()}`);
-    return now;
+    const bootstrapMs = candidateOrderDatesMs.length > 0
+      ? Math.min(...candidateOrderDatesMs) - 1
+      : Date.now();
+    await kvSet(CUTOFF_KEY, String(bootstrapMs));
+    console.log(
+      `[walmart-order-alerts] cutoff bootstrapped at ${new Date(bootstrapMs).toISOString()} ` +
+      (candidateOrderDatesMs.length > 0
+        ? `(1ms before the earliest of ${candidateOrderDatesMs.length} order(s) already fetched this run)`
+        : `(no orders fetched this run — using now)`)
+    );
+    return bootstrapMs;
   } catch (err) {
     console.error(
-      '[walmart-order-alerts] cutoff bootstrap failed — alerting nothing this run:',
+      '[walmart-order-alerts] cutoff resolution failed — alerting nothing this run:',
       err instanceof Error ? err.message : String(err)
     );
     return null;
