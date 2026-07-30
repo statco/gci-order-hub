@@ -4,7 +4,7 @@ import { getSheetOrderIds, appendSheetRows } from './lib/sheets-client.js';
 import { HttpError, retryWithBackoff } from './lib/retry.js';
 import { getFetchWindowStart, getSyncSince, setSyncSuccess } from './lib/sync-state.js';
 import { sendTelegramMessage } from './lib/telegram.js';
-import { claimOrderAlert, releaseOrderAlert, getOrInitAlertCutoffMs } from './lib/walmart-order-alerts.js';
+import { claimOrderAlert, releaseOrderAlert, getOrInitAlertCutoffMs, isOrderAlerted } from './lib/walmart-order-alerts.js';
 import { recordRunAndMaybeHeartbeat } from './lib/sync-heartbeat.js';
 
 export const config = { maxDuration: 300 };
@@ -229,12 +229,29 @@ export function buildTelegramMessage(orders: WalmartOrder[]): string {
 }
 
 /**
- * Claim + alert on newly-seen orders, independent of everything else in the
+ * Claim + alert on eligible orders, independent of everything else in the
  * run: called before acknowledge/sheet-log/cursor-advance, and a failure
  * here (claim error, send failure) never throws, so it can't break the sync
  * or block those later steps. A send failure releases its claims so the
  * order is retried on the next run instead of being marked alerted for a
  * message that never went out.
+ *
+ * Deliberately called with the FULL set of orders fetched this run — NOT
+ * filtered against the Google Sheet. The Sheet answers "has this order been
+ * processed" (dedupes acknowledge + Sheet-row-append, below); it must never
+ * answer "has this order been alerted" — that question belongs to
+ * walmart_order_alerts alone. An order that got Sheet-logged during a run
+ * where alerting was suppressed or failed (the class of bug that
+ * permanently orphaned PO 309121065891123 from ever alerting) still needs a
+ * path to alert on a later run once it's no longer suppressed; gating this
+ * call on Sheet-newness is exactly what closed off that path. Idempotency
+ * against re-alerting the same order every run is entirely
+ * claimOrderAlert()'s unique constraint on walmart_po (below) — not this
+ * function's input set. This also matches the invariant sync-state.ts's
+ * module header already documents: re-fetching the same window on every run
+ * is safe specifically because "the Telegram alert itself is gated by
+ * walmart_order_alerts' unique constraint... repeated fetches of the same
+ * order produce exactly one alert, never zero and never more than one."
  *
  * Two independent filters gate eligibility, in this order:
  *
@@ -251,7 +268,7 @@ export function buildTelegramMessage(orders: WalmartOrder[]): string {
  *    resolution failed) means alert nothing this run, deliberately
  *    fail-closed rather than guessing a fallback window.
  */
-async function alertNewOrders(orders: WalmartOrder[], cutoffMs: number | null): Promise<void> {
+async function alertOrders(orders: WalmartOrder[], cutoffMs: number | null): Promise<void> {
   const notCancelled = orders.filter((o) => !isFullyCancelled(o));
   if (notCancelled.length < orders.length) {
     console.log(
@@ -353,25 +370,61 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
       return res.status(200).json({ message: 'No new orders', processed: 0 });
     }
 
-    // Dedup against sheet
+    // Sheet lookup — used for two DIFFERENT, now-decoupled purposes below:
+    // (a) reconciliation logging (every fetched order), (b) gating
+    // acknowledge/Sheet-row-append (Sheet-new orders only). It does NOT gate
+    // alerting — see alertOrders()'s docstring for why.
     const existingIds = await getSheetOrderIds(SHEET_ID);
+
+    // Reconciliation: log sheet/ledger/cutoff/cancelled state for every
+    // order fetched this run, independent of what gates alerting or
+    // Sheet-logging below — so state is externally verifiable from the log
+    // line itself instead of inferred from an aggregate message like "All
+    // orders already processed" (which conflated "in the Sheet" with
+    // "alerted" and is exactly how PO 309121065891123 stayed silently
+    // orphaned). isOrderAlerted() here is read-only observability, never
+    // used to gate the actual alert decision — that stays with
+    // claimOrderAlert()'s atomic INSERT inside alertOrders() below.
+    for (const order of orders) {
+      const sheetPresent = existingIds.has(order.purchaseOrderId);
+      const cancelled = isFullyCancelled(order);
+      const cutoffEligible = alertCutoffMs !== null && order.orderDate > alertCutoffMs;
+      let ledgerPresent: string;
+      try {
+        ledgerPresent = (await isOrderAlerted(order.purchaseOrderId)) ? 'yes' : 'no';
+      } catch (err) {
+        ledgerPresent = `unknown (${err instanceof Error ? err.message : String(err)})`;
+      }
+      console.log(
+        `[order-sync] reconcile PO=${order.purchaseOrderId} ` +
+        `sheet=${sheetPresent ? 'yes' : 'no'} ledger=${ledgerPresent} ` +
+        `cancelled=${cancelled ? 'yes' : 'no'} cutoff-eligible=${cutoffEligible ? 'yes' : 'no'}`
+      );
+    }
+
+    // 1. Alert every fetched order eligible per alertOrders()'s own filters
+    //    (cancelled + cutoff) and claimOrderAlert()'s unique constraint —
+    //    NOT gated by Sheet presence, so an order already Sheet-logged from
+    //    an earlier suppressed/failed attempt still gets a chance here.
+    //    Fires before acknowledge/sheet log so it reaches the team even if
+    //    any downstream step fails. A send failure releases its claims so
+    //    it's retried, not permanently marked alerted. Never throws.
+    await alertOrders(orders, alertCutoffMs);
+
+    // Sheet dedup — decoupled from alerting above. Only gates duplicate
+    // acknowledge calls and duplicate Sheet rows; see reconcile log lines
+    // above for per-order alert state.
     const newOrders = orders.filter((o) => !existingIds.has(o.purchaseOrderId));
 
     if (newOrders.length === 0) {
-      // Clean pass (all already deduped) — advance the cursor.
+      // Every fetched order already has a Sheet row — nothing left to
+      // acknowledge or log. Says nothing about whether any of them alerted.
       await setSyncSuccess(runStartedAt);
-      console.log('[order-sync] All orders already processed');
+      console.log('[order-sync] All orders already in sheet — nothing to acknowledge/log this run');
       return res.status(200).json({ message: 'All orders already logged', processed: 0 });
     }
 
-    console.log(`[order-sync] ${newOrders.length} new order(s) to process`);
-
-    // 1. Alert fires immediately — before acknowledge or sheet log — so it
-    //    reaches the team even if any downstream step fails. Per-PO claimed
-    //    via walmart_order_alerts (survives overlapping cron runs); a send
-    //    failure releases its claims so it's retried, not permanently
-    //    marked alerted. Never throws.
-    await alertNewOrders(newOrders, alertCutoffMs);
+    console.log(`[order-sync] ${newOrders.length} order(s) new to the sheet — acknowledging + logging`);
 
     const ackedIds = new Set<string>();
     const rows: string[][] = [];

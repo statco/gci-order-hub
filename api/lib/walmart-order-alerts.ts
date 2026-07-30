@@ -63,6 +63,35 @@ export async function claimOrderAlert(walmartPo: string): Promise<boolean> {
 }
 
 /**
+ * Read-only check for whether a PO already has a walmart_order_alerts row.
+ * NOT part of the alert-eligibility decision — that must stay with
+ * claimOrderAlert()'s atomic INSERT (a preceding SELECT here would be a
+ * check-then-act race under overlapping cron runs, exactly what
+ * claimOrderAlert's INSERT-not-SELECT design avoids). This exists solely so
+ * callers can log ledger state per order for external verifiability, e.g.
+ * "is this order alerted already, independent of whether it's in the Sheet."
+ */
+export async function isOrderAlerted(walmartPo: string): Promise<boolean> {
+  requireEnv();
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/walmart_order_alerts?walmart_po=eq.${encodeURIComponent(walmartPo)}&select=walmart_po`,
+    {
+      headers: {
+        'apikey':        SERVICE_ROLE_KEY,
+        'Authorization': `Bearer ${SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+  if (!res.ok) {
+    throw new Error(
+      `Supabase GET walmart_order_alerts → ${res.status}: ${(await res.text()).slice(0, 200)}`
+    );
+  }
+  const rows: unknown[] = await res.json();
+  return rows.length > 0;
+}
+
+/**
  * Undo a claim after the alert send that followed it failed. Leaves the PO
  * retryable on the next run instead of permanently marked "alerted" for a
  * message that never actually went out.
