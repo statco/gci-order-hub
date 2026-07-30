@@ -244,13 +244,14 @@ export function buildTelegramMessage(orders: WalmartOrder[]): string {
  *    alerting only: cancelled orders still flow through acknowledge/Sheet
  *    logging below unchanged.
  *
- * 2. Backfill guard: getOrInitAlertCutoffMs() self-bootstraps to "now" on the
- *    first run after deploy (persisted in KV, no env var to set by hand) —
- *    only orders created after that are ever eligible to alert. Returns null
- *    (alert nothing this run) if KV is unavailable, deliberately fail-closed
- *    rather than guessing a fallback window.
+ * 2. Backfill guard: the cutoff is resolved once per run by the handler
+ *    (getOrInitAlertCutoffMs(), called unconditionally right after the
+ *    order fetch — see below) and passed in here — only orders created
+ *    after it are ever eligible to alert. A null cutoff (KV unavailable or
+ *    resolution failed) means alert nothing this run, deliberately
+ *    fail-closed rather than guessing a fallback window.
  */
-async function alertNewOrders(orders: WalmartOrder[]): Promise<void> {
+async function alertNewOrders(orders: WalmartOrder[], cutoffMs: number | null): Promise<void> {
   const notCancelled = orders.filter((o) => !isFullyCancelled(o));
   if (notCancelled.length < orders.length) {
     console.log(
@@ -259,10 +260,12 @@ async function alertNewOrders(orders: WalmartOrder[]): Promise<void> {
   }
   if (notCancelled.length === 0) return;
 
-  const cutoff = await getOrInitAlertCutoffMs();
-  if (cutoff === null) return;
+  if (cutoffMs === null) {
+    console.warn('[order-sync] alert cutoff unavailable this run — not alerting (fail closed)');
+    return;
+  }
 
-  const eligible = notCancelled.filter((o) => o.orderDate > cutoff);
+  const eligible = notCancelled.filter((o) => o.orderDate > cutoffMs);
   if (eligible.length < notCancelled.length) {
     console.log(
       `[order-sync] ${notCancelled.length - eligible.length} order(s) at/before cutoff — not alerted (backfill guard)`
@@ -322,6 +325,17 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
       label: 'fetchRecentOrders',
     });
 
+    // Resolve (and, on the first run after deploy or a KV reset, bootstrap)
+    // the alert backfill cutoff on EVERY invocation, regardless of whether
+    // this run found any orders — deploy-time bootstrap, not lazily deferred
+    // until a run happens to find one. Passing this run's order dates lets a
+    // first-ever bootstrap set the cutoff just before the earliest of them,
+    // so nothing already fetched this run gets retroactively suppressed by
+    // the cutoff its own arrival just created. Logs the resolved value every
+    // run either way (see getOrInitAlertCutoffMs) so its state is visible
+    // without having to infer it from silence.
+    const alertCutoffMs = await getOrInitAlertCutoffMs(orders.map((o) => o.orderDate));
+
     // Cursor read AFTER the fetch, purely for heartbeat/observability — it no
     // longer gates what was just fetched above.
     const since = await getSyncSince();
@@ -357,7 +371,7 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     //    via walmart_order_alerts (survives overlapping cron runs); a send
     //    failure releases its claims so it's retried, not permanently
     //    marked alerted. Never throws.
-    await alertNewOrders(newOrders);
+    await alertNewOrders(newOrders, alertCutoffMs);
 
     const ackedIds = new Set<string>();
     const rows: string[][] = [];
