@@ -79,4 +79,42 @@ test('is null when there is no PO # label at all', () => {
   assert.equal(parseInvoicePdf(text).poNumber, null);
 });
 
+test('matches the underscore-separated variant CT renders on Sales Orders and normalizes it to the canonical hyphenated form', () => {
+  // Confirmed live 2026-07-29: the SAME order's PO number renders as
+  // "GCI_2026_447268" on a Sales Order vs "GCI-2026-447269" (different
+  // order) on an Invoice. getOrderIdByPoNumber() does an exact-string
+  // lookup against the Sheet's canonical (hyphenated) column, so the
+  // extracted value must come out hyphenated regardless of source format.
+  const text = 'PO #: GCI_2026_447268 Tracking Number: 3353100000001001';
+  assert.equal(parseInvoicePdf(text).poNumber, 'GCI-2026-447268');
+});
+
+console.log('\nparseInvoicePdf — carrier + tracking URL');
+
+test('Midland Courier resolves to OTHER and gets its confirmed tracking-URL pattern', () => {
+  const text =
+    'PO #: GCI-2026-447269 Tracking Number: 3353100000001001 Mode of Delivery: MIDLAND COURRIER';
+  const parsed = parseInvoicePdf(text);
+  assert.equal(parsed.carrier, 'OTHER');
+  assert.equal(parsed.rawCarrier, 'midland');
+  assert.equal(
+    parsed.trackingUrl,
+    'https://ship.midlandtransport.com/Tracking/TrackClientTrackings?TrackingNumber=3353100000001001&Lang=0',
+  );
+});
+
+test('a mapped carrier (Purolator) gets no trackingUrl — walmart-ship.ts derives its own', () => {
+  const text = 'PO #: GCI-2026-447269 Tracking Number: 1Z999AA10123456784 Mode of Delivery: PUROLATOR';
+  const parsed = parseInvoicePdf(text);
+  assert.equal(parsed.carrier, 'PUROLATOR');
+  assert.equal(parsed.trackingUrl, null);
+});
+
+test('an unrecognized carrier resolves to OTHER with no trackingUrl — caller must treat this as a parse failure, not a silent fallback', () => {
+  const text = 'PO #: GCI-2026-447269 Tracking Number: 1Z999AA10123456784 Mode of Delivery: SOMENEWCOURIER';
+  const parsed = parseInvoicePdf(text);
+  assert.equal(parsed.carrier, 'OTHER');
+  assert.equal(parsed.trackingUrl, null);
+});
+
 console.log(`\n✅ ${passed} assertions passed\n`);

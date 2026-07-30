@@ -100,12 +100,20 @@ export class CTLedgerUnavailableError extends Error {
 // ct_orders.source_channel (the Walmart PO# rides along as ct_orders
 // metadata per PR #48), and source_channel is the reconciliation join key.
 //
+// The separator is hyphen OR underscore: CT renders the SAME PO number with
+// different separators depending on document type — confirmed live 2026-07-29
+// on the same order: "GCI-2026-447269" on an Invoice vs "GCI_2026_447268" on
+// a Sales Order. This shape is a MATCHING pattern for parsing either
+// rendering back out of a document, not a new emission format — formatPoNumber()
+// below always emits hyphens; only ct-tracking-parser.ts's consumption side
+// needed to widen.
+//
 // CANONICAL_PO_NUMBER_SHAPE is exported so ct-tracking-parser.ts — which has
 // to parse this same shape back out of a CT invoice PDF — builds its regex
 // from this single definition instead of an independently-typed copy that
 // could quietly drift out of sync with what this function actually emits.
 
-export const CANONICAL_PO_NUMBER_SHAPE = 'GCI-\\d{4}-\\d{4,8}';
+export const CANONICAL_PO_NUMBER_SHAPE = 'GCI[-_]\\d{4}[-_]\\d{4,8}';
 export const CANONICAL_PO_NUMBER_PATTERN = new RegExp(`^${CANONICAL_PO_NUMBER_SHAPE}$`);
 
 /**
