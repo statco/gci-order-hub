@@ -253,6 +253,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         `❓ Missing CT cost: ${missingCtCost.length}\n` +
         `🕒 Stale (>${COST_MAX_AGE_DAYS}d): ${staleCost.length}\n` +
         `<i>Read-only — review before the reconcile run.</i>`,
+        'info',
       );
     }
 

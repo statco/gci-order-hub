@@ -22,14 +22,12 @@
 //   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID — already set, reused from notify.ts
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { sendTelegramMessage } from './lib/telegram.js';
 
 const MAKE_API_TOKEN  = process.env.MAKE_API_TOKEN  || '';
 const MAKE_TEAM_ID    = process.env.MAKE_TEAM_ID    || '';
 const MAKE_SCENARIO_ID = process.env.MAKE_SCENARIO_ID || '';
 const MAKE_ZONE        = process.env.MAKE_ZONE || 'us2'; // from the scenario URL (us2.make.com)
-
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID   || '';
 
 // Loosest posting schedule is Pinterest (Mon-Fri). A 3-day gap comfortably
 // covers a normal weekend without a real cron run, while still catching a
@@ -38,19 +36,7 @@ const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID   || '';
 const MAX_STALE_DAYS = 3;
 
 async function sendTelegramAlert(text: string): Promise<void> {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT) {
-    console.error('[health-check-make] Telegram not configured, cannot alert:', text);
-    return;
-  }
-  await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: TELEGRAM_CHAT,
-      text: `🚨 *Make.com Health Check*\n\n${text}`,
-      parse_mode: 'Markdown',
-    }),
-  });
+  await sendTelegramMessage(`🚨 *Make.com Health Check*\n\n${text}`, 'actionable', 'Markdown');
 }
 
 async function makeApiGet(path: string): Promise<any> {

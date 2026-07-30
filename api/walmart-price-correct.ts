@@ -205,7 +205,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         `💰 Corrected: ${corrected}\n` +
         `🔍 Unmatched (no Shopify SKU): ${skippedUnmatched.length}\n` +
         `❓ Skipped (no cost): ${skippedNoCost.length}` +
-        errLine
+        errLine,
+        'info',
       );
     }
 
