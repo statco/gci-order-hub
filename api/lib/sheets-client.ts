@@ -179,3 +179,34 @@ export async function getOrderIdByPoNumber(
 
   return null;
 }
+
+/**
+ * Read-only lookup of an order's current status (column H) by order_id
+ * (column A). Separate from getOrderIdByPoNumber() — a different column,
+ * a different purpose (guard against re-shipping, not PO-number matching)
+ * — added so ct-tracking-parser.ts can skip an order already marked
+ * SHIPPED before calling walmart-ship.ts again for it. Returns null if the
+ * order_id isn't found or has no status recorded.
+ */
+export async function getOrderStatus(
+  sheetId: string,
+  orderId: string
+): Promise<string | null> {
+  const auth = getAuth();
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `${SHEET_TAB}!A:H`,
+  });
+
+  const rows = response.data.values ?? [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (row[0] === orderId) {
+      return row[7] ?? null; // column H = status
+    }
+  }
+
+  return null;
+}

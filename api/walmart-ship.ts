@@ -102,7 +102,15 @@ async function markShipped(
   trackingNumber: string,
   rawCarrier: string,
   normalizedCarrier: string,
+  // Caller-supplied tracking URL, preferred over this file's own
+  // carrier→URL derivation when present. Needed for carriers this file
+  // doesn't know a portal URL for but the caller does (e.g. Midland
+  // Courier, resolved by ct-tracking-parser.ts) — without this, an
+  // unmapped OTHER carrier would silently get the generic OTHER fallback
+  // (GLS's tracker), a real but wrong link.
+  trackingUrlOverride?: string,
 ): Promise<void> {
+  const trackingURL = trackingUrlOverride || getTrackingUrl(rawCarrier, normalizedCarrier, trackingNumber);
   const payload = {
     orderShipment: {
       orderLines: {
@@ -118,7 +126,7 @@ async function markShipped(
                   carrierName:   { carrier: normalizedCarrier },
                   methodCode:    'Standard',
                   trackingNumber,
-                  trackingURL:   getTrackingUrl(rawCarrier, normalizedCarrier, trackingNumber),
+                  trackingURL,
                 },
               },
             ],
@@ -155,7 +163,7 @@ async function sendTelegram(message: string): Promise<void> {
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const params = req.method === 'POST' ? req.body : req.query;
-  const { orderId, trackingNumber, carrier = 'PUROLATOR' } = params;
+  const { orderId, trackingNumber, carrier = 'PUROLATOR', trackingUrl: trackingUrlOverride } = params;
 
   if (!orderId || !trackingNumber) {
     return res.status(400).json({ error: 'orderId and trackingNumber are required' });
@@ -181,6 +189,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       trackingNumber as string,
       rawCarrier,
       normalizedCarrier,
+      trackingUrlOverride as string | undefined,
     );
     console.log(`[walmart-ship] Order ${orderId} marked shipped — tracking: ${trackingNumber}`);
 
@@ -194,7 +203,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     console.log(`[walmart-ship] Sheet updated for order ${orderId}`);
 
     // 4. Telegram confirmation
-    const trackingUrl = getTrackingUrl(rawCarrier, normalizedCarrier, trackingNumber as string);
+    const trackingUrl = (trackingUrlOverride as string) || getTrackingUrl(rawCarrier, normalizedCarrier, trackingNumber as string);
     await sendTelegram(
       `✅ <b>Order Shipped</b>\n` +
       `📦 Order: <code>${orderId}</code>\n` +
