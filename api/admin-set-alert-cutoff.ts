@@ -49,12 +49,16 @@ async function kvSet(key: string, value: string): Promise<void> {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed — POST only' });
+  if (req.method !== 'POST' && req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed — GET or POST only' });
+  }
 
   const cronSecret = process.env.CRON_SECRET;
   if (!cronSecret) return res.status(500).json({ error: 'CRON_SECRET not configured' });
   const authHeader = req.headers['authorization'];
-  if (authHeader !== `Bearer ${cronSecret}`) return res.status(401).json({ error: 'Unauthorized' });
+  const secretParam = req.query.secret as string | undefined;
+  const authorized = authHeader === `Bearer ${cronSecret}` || secretParam === cronSecret;
+  if (!authorized) return res.status(401).json({ error: 'Unauthorized' });
 
   if (!KV_URL || !KV_TOKEN) return res.status(500).json({ error: 'KV not configured' });
 
