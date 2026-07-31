@@ -324,6 +324,84 @@ async function alertOrders(orders: WalmartOrder[], cutoffMs: number | null): Pro
   console.log(`[order-sync] Telegram alert sent for ${claimed.length} order(s)`);
 }
 
+// ── CT routing after a successful mirror ─────────────────────────────────
+//
+// Extracted verbatim from the handler's per-order loop so it's callable (and
+// stubbable) in isolation — see api/tests/walmart-order-sync.unit.test.ts.
+// `routeFn` defaults to the real routeOrderToCT() import; only tests pass a
+// stub. `ctAutoPoEnabled` defaults to the real CT_AUTO_PO_ENABLED constant;
+// only tests pass an explicit override. Neither default changes any real
+// caller's behavior — the handler below calls this with no `opts`, so
+// production behavior is byte-for-byte the same as the inline block it
+// replaced.
+//
+// Only when CT_AUTO_PO_ENABLED (same gate api/order-router.ts already reads
+// for the Shopify path; not modified here). routeOrderToCT() itself
+// (api/lib/ct-order-routing.ts, PR #65) is not modified by this change —
+// called exactly as documented there. Any outcome other than 'submitted' is
+// logged; routeOrderToCT() sends its own Telegram alert per outcome (see
+// ct-order-routing.ts) and never throws for expected outcomes, so a CT
+// routing problem here never blocks the Sheet log that follows in the
+// handler, which reflects the mirror having already succeeded.
+export async function maybeRouteToCT(
+  order: WalmartOrder,
+  shopifyOrderId: string,
+  shopifyOrderNumber: string,
+  opts: { ctAutoPoEnabled?: boolean; routeFn?: typeof routeOrderToCT } = {},
+): Promise<void> {
+  const ctAutoPoEnabled = opts.ctAutoPoEnabled ?? CT_AUTO_PO_ENABLED;
+  if (!ctAutoPoEnabled) return;
+  const routeFn = opts.routeFn ?? routeOrderToCT;
+
+  try {
+    const walmartLines = order.orderLines?.orderLine ?? [];
+    const ctOutcome = await routeFn({
+      channel:           'walmart',
+      // Ledger keys on the Shopify order id for BOTH channels — see
+      // CT-INTEGRATION-CONTEXT.md §7 ("Shopify is the hub"). The Walmart
+      // PO# rides along as meta below, not as the ledger key.
+      sourceOrderId:     shopifyOrderId,
+      sourceOrderNumber: shopifyOrderNumber,
+      lineItems: walmartLines.map((line) => ({
+        sku:      normalizePartNumber(line.item.sku),
+        quantity: parseInt(line.orderLineQuantity?.amount ?? '1', 10) || 1,
+      })),
+      shipTo: {
+        name:       order.shippingInfo.postalAddress.name,
+        address1:   order.shippingInfo.postalAddress.address1,
+        address2:   order.shippingInfo.postalAddress.address2,
+        city:       order.shippingInfo.postalAddress.city,
+        province:   order.shippingInfo.postalAddress.state,
+        postalCode: order.shippingInfo.postalAddress.postalCode,
+        country:    order.shippingInfo.postalAddress.country,
+        // phone unavailable from this repo's WalmartOrder type — see
+        // api/lib/walmart-shopify-mirror.ts's module header.
+      },
+      // Walmart marketplace orders never carry installer metadata — that
+      // only exists on Shopify orders via note_attributes set by GCI's own
+      // checkout/app flow.
+      shipToInstaller: false,
+      meta: {
+        walmartPoNumber:             order.purchaseOrderId,
+        walmartOrderNumber:          order.customerOrderId,
+        resultingShopifyOrderNumber: shopifyOrderNumber,
+        // Matches column A in the Walmart order-log Sheet — drives
+        // ct-order-routing.ts's column-N CT-PO-number write on a confirmed
+        // submission.
+        walmartSheetOrderId:         order.purchaseOrderId,
+        shipByDate:                  formatWalmartDate(order.shippingInfo?.estimatedShipDate),
+        deliverByDate:               formatWalmartDate(order.shippingInfo?.estimatedDeliveryDate),
+        revenue:                     walmartLines.reduce((sum, l) => sum + getLinePrice(l), 0),
+      },
+    });
+    console.log(`[order-sync] CT routing for ${order.purchaseOrderId} (Shopify ${shopifyOrderNumber}): ${ctOutcome.kind}`);
+  } catch (err: any) {
+    console.error(`[order-sync] CT routing threw for ${order.purchaseOrderId}, Shopify ${shopifyOrderNumber} still mirrored:`, err);
+    // Deliberately not re-thrown — the mirror already succeeded and is
+    // Sheet-logged by the caller regardless of CT routing's outcome.
+  }
+}
+
 // ── Handler ────────────────────────────────────────────────────────────────
 
 export default async function handler(_req: VercelRequest, res: VercelResponse) {
@@ -491,65 +569,12 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
         (mirrorOutcome.freshlyCreated ? '' : ' (already existed — not re-created)')
       );
 
-      // 2.6 Route to Canada Tire — only when CT_AUTO_PO_ENABLED (same gate,
-      //     read the same way api/order-router.ts already reads it for the
-      //     Shopify path; not modified here). routeOrderToCT() itself
-      //     (api/lib/ct-order-routing.ts, PR #65) is not modified by this
-      //     change — called exactly as documented there. Any outcome other
-      //     than 'submitted' is logged; routeOrderToCT() sends its own
-      //     Telegram alert per outcome (see ct-order-routing.ts) and never
-      //     throws for expected outcomes, so a CT routing problem here never
-      //     blocks the Sheet log below, which reflects the mirror having
-      //     already succeeded.
-      if (CT_AUTO_PO_ENABLED) {
-        try {
-          const walmartLines = order.orderLines?.orderLine ?? [];
-          const ctOutcome = await routeOrderToCT({
-            channel:           'walmart',
-            // Ledger keys on the Shopify order id for BOTH channels — see
-            // CT-INTEGRATION-CONTEXT.md §7 ("Shopify is the hub"). The
-            // Walmart PO# rides along as meta below, not as the ledger key.
-            sourceOrderId:     shopifyOrderId,
-            sourceOrderNumber: shopifyOrderNumber,
-            lineItems: walmartLines.map((line) => ({
-              sku:      normalizePartNumber(line.item.sku),
-              quantity: parseInt(line.orderLineQuantity?.amount ?? '1', 10) || 1,
-            })),
-            shipTo: {
-              name:       order.shippingInfo.postalAddress.name,
-              address1:   order.shippingInfo.postalAddress.address1,
-              address2:   order.shippingInfo.postalAddress.address2,
-              city:       order.shippingInfo.postalAddress.city,
-              province:   order.shippingInfo.postalAddress.state,
-              postalCode: order.shippingInfo.postalAddress.postalCode,
-              country:    order.shippingInfo.postalAddress.country,
-              // phone unavailable from this repo's WalmartOrder type — see
-              // api/lib/walmart-shopify-mirror.ts's module header.
-            },
-            // Walmart marketplace orders never carry installer metadata —
-            // that only exists on Shopify orders via note_attributes set by
-            // GCI's own checkout/app flow.
-            shipToInstaller: false,
-            meta: {
-              walmartPoNumber:             order.purchaseOrderId,
-              walmartOrderNumber:          order.customerOrderId,
-              resultingShopifyOrderNumber: shopifyOrderNumber,
-              // Matches column A in the Walmart order-log Sheet — drives
-              // ct-order-routing.ts's column-N CT-PO-number write on a
-              // confirmed submission.
-              walmartSheetOrderId:         order.purchaseOrderId,
-              shipByDate:                  formatWalmartDate(order.shippingInfo?.estimatedShipDate),
-              deliverByDate:               formatWalmartDate(order.shippingInfo?.estimatedDeliveryDate),
-              revenue:                     walmartLines.reduce((sum, l) => sum + getLinePrice(l), 0),
-            },
-          });
-          console.log(`[order-sync] CT routing for ${order.purchaseOrderId} (Shopify ${shopifyOrderNumber}): ${ctOutcome.kind}`);
-        } catch (err: any) {
-          console.error(`[order-sync] CT routing threw for ${order.purchaseOrderId}, Shopify ${shopifyOrderNumber} still mirrored:`, err);
-          // Deliberately not re-thrown — the mirror already succeeded and is
-          // Sheet-logged below regardless of CT routing's outcome.
-        }
-      }
+      // 2.6 Route to Canada Tire — only when CT_AUTO_PO_ENABLED. Extracted
+      //     to maybeRouteToCT() above (real args, real defaults — this call
+      //     is behaviorally identical to the inline block it replaced) so
+      //     the gate can be tested in isolation; see
+      //     api/tests/walmart-order-sync.unit.test.ts.
+      await maybeRouteToCT(order, shopifyOrderId, shopifyOrderNumber);
 
       const addr = order.shippingInfo?.postalAddress;
       const customerName = addr?.name ?? 'Unknown';
