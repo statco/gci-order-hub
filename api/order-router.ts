@@ -26,7 +26,8 @@
 import crypto                                       from 'crypto';
 import type { VercelRequest, VercelResponse }        from '@vercel/node';
 import { sendOrderNotification, NotifyPayload }      from './lib/notify.js';
-import { submitPurchaseOrder, CTNotConfiguredError, CT_AUTO_PO_ENABLED } from './lib/ct-client.js';
+import { CT_AUTO_PO_ENABLED }                        from './lib/ct-client.js';
+import { routeOrderToCT }                            from './lib/ct-order-routing.js';
 import { dispatchInstaller }                         from './lib/installer-dispatch.js';
 
 export const config = { maxDuration: 30 };
@@ -218,46 +219,53 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const totalCost = notifyItems.reduce((s, i) => s + i.unitCost * i.quantity, 0);
 
       // ── The switch ──────────────────────────────────────────
-      // Only attempted when CT_AUTO_PO_ENABLED=true. Until Canada Tire
-      // provides a real order-creation RESTlet (CT_PO_SCRIPT/CT_PO_DEPLOY),
-      // this will always throw CTNotConfiguredError, which is caught below
-      // and falls through to the existing manual-authorize notification --
-      // exactly today's behavior, unchanged. Nothing here is a hard
-      // dependency on CT being ready.
+      // Only attempted when CT_AUTO_PO_ENABLED=true. routeOrderToCT() runs
+      // the shared classify → claim → submit flow (ct-order-routing.ts),
+      // which handles the ship_to_installer case as an explicit refusal
+      // BEFORE any ledger claim (no more sending CT an empty address and
+      // letting it throw). Any outcome other than 'submitted' falls through
+      // to the existing manual-authorize notification below -- exactly
+      // today's behavior for "CT auto-PO didn't happen". Nothing here is a
+      // hard dependency on CT being ready.
       let autoSubmittedCtPoId: string | undefined;
       if (CT_AUTO_PO_ENABLED) {
         try {
-          const result = await submitPurchaseOrder({
-            gciOrderNumber: order.name,
-            lines: tireItems.map(i => ({
-              partNumber: i.sku.replace(new RegExp(`^${TIRE_PREFIX}`, 'i'), ''),
-              quantity:   i.quantity,
+          const outcome = await routeOrderToCT({
+            channel:           'shopify',
+            sourceOrderId:     String(order.id),
+            sourceOrderNumber: order.name,
+            lineItems: tireItems.map(i => ({
+              sku:      i.sku.replace(new RegExp(`^${TIRE_PREFIX}`, 'i'), ''),
+              quantity: i.quantity,
             })),
-            shipTo: installer.fulfillmentType === 'ship_to_installer'
-              ? {
-                  name: `${installer.installerName} (installer for ${custName})`,
-                  address1: '', city: '', province: '', postalCode: '', country: 'CA',
-                  note: `Ship to installer: ${installer.installerName} (id: ${installer.installerId})`,
-                }
-              : {
-                  name:       custName,
-                  address1:   addr.address1 ?? '',
-                  address2:   addr.address2,
-                  city:       addr.city ?? '',
-                  province:   addr.province_code ?? addr.province ?? '',
-                  postalCode: addr.zip ?? '',
-                  country:    addr.country_code ?? 'CA',
-                  phone:      addr.phone,
-                },
+            shipTo: {
+              name:       custName,
+              address1:   addr.address1,
+              address2:   addr.address2,
+              city:       addr.city,
+              province:   addr.province_code ?? addr.province,
+              postalCode: addr.zip,
+              country:    addr.country_code ?? 'CA',
+              phone:      addr.phone,
+            },
+            shipToInstaller: installer.fulfillmentType === 'ship_to_installer',
+            installerName:   installer.installerName,
+            installerId:     installer.installerId,
+            meta: { resultingShopifyOrderNumber: order.name },
           });
-          autoSubmittedCtPoId = result.ctPurchaseOrderId;
-          console.log(`✅ CT auto-PO submitted for order ${order.name}: ${autoSubmittedCtPoId}`);
-        } catch (err: any) {
-          if (err instanceof CTNotConfiguredError) {
+
+          if (outcome.kind === 'submitted') {
+            autoSubmittedCtPoId = outcome.ctOrderNumber;
+            console.log(`✅ CT auto-PO submitted for order ${order.name}: ${autoSubmittedCtPoId}`);
+          } else if (outcome.kind === 'not_configured') {
             console.log(`ℹ️  CT auto-PO not yet configured — falling back to manual authorize flow for ${order.name}`);
+          } else if (outcome.kind === 'already_claimed') {
+            console.log(`ℹ️  CT routing for order ${order.name}: already claimed as ${outcome.poNumber} (status=${outcome.existingStatus}) — falling back to manual authorize flow.`);
           } else {
-            console.error(`⚠️  CT auto-PO submit failed for ${order.name}, falling back to manual:`, err);
+            console.log(`ℹ️  CT routing for order ${order.name}: ${outcome.kind} (${outcome.reason}) — falling back to manual authorize flow.`);
           }
+        } catch (err: any) {
+          console.error(`⚠️  CT routing threw for ${order.name}, falling back to manual:`, err);
           // Deliberately not re-thrown -- manual flow below is the safety net.
         }
       }

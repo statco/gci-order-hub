@@ -634,10 +634,12 @@ export async function healthCheck(): Promise<{ ok: boolean; environment: CTEnvir
 }
 
 // ─── BACKWARD-COMPATIBLE SHIM ────────────────────────────────────────────────
-// order-router.ts imports submitPurchaseOrder / CTNotConfiguredError /
-// CT_AUTO_PO_ENABLED. Names and signatures are unchanged so the existing
-// dormant branch compiles and behaves identically. New code should call
-// submitOrder() directly.
+// order-router.ts now goes through ct-order-routing.ts's routeOrderToCT()
+// (classify → claim → submit via the ct_orders ledger) instead of calling
+// this directly — that path bypassed claimOrder()/buildPoNumber() entirely.
+// Nothing in this repo calls submitPurchaseOrder() anymore. Retained,
+// unmodified, in case anything external still depends on it; safe to delete
+// once that's confirmed. New code should call submitOrder() directly.
 
 export interface CTPurchaseOrderInput {
   gciOrderNumber: string;

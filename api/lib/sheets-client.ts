@@ -181,6 +181,48 @@ export async function getOrderIdByPoNumber(
 }
 
 /**
+ * Writes the CT PO number into column N for the row(s) matching order_id
+ * (column A). Must be called ONLY on a confirmed markSubmitted outcome —
+ * every other CT routing outcome (manual_required/failed/indeterminate/
+ * already_claimed) leaves column N blank, exactly as today. Never call this
+ * speculatively before CT actually confirms the order.
+ */
+export async function writePoNumberByOrderId(
+  sheetId: string,
+  orderId: string,
+  poNumber: string
+): Promise<void> {
+  const auth = getAuth();
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `${SHEET_TAB}!A:A`,
+  });
+
+  const rows = response.data.values ?? [];
+  const matchingRows: number[] = [];
+  rows.forEach((row, index) => {
+    if (index === 0) return;
+    if (row[0] === orderId) matchingRows.push(index + 1);
+  });
+
+  if (matchingRows.length === 0) {
+    console.warn(`[sheets] writePoNumberByOrderId: no rows found for orderId ${orderId}`);
+    return;
+  }
+
+  for (const rowIndex of matchingRows) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: `${SHEET_TAB}!N${rowIndex}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[poNumber]] },
+    });
+  }
+}
+
+/**
  * Read-only lookup of an order's current status (column H) by order_id
  * (column A). Separate from getOrderIdByPoNumber() — a different column,
  * a different purpose (guard against re-shipping, not PO-number matching)
