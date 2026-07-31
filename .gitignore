@@ -3,6 +3,7 @@ node_modules/
 .env
 .vercel/
 dist/
+scratchpad/compiled/
 *.js.map
 __pycache__/
 *.pyc
