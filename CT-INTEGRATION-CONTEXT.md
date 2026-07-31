@@ -1,8 +1,8 @@
 # Canada Tire (CT) Order Automation — Working Context
 
 **Repo:** `gci-order-hub`
-**Last updated:** 2026-07-27
-**Status:** Client + ledger merged. Routing NOT yet wired. All safety gates CLOSED.
+**Last updated:** 2026-07-31
+**Status:** Client + ledger merged. Routing NOT yet wired. Verification gap #1 (ledger concurrency, § 6) CLOSED 2026-07-31 — all other safety gates unchanged.
 **Nothing in this repo can place a real CT order today.** See § Safety Gates.
 
 > **Read this before touching anything CT-related.** This document is the
@@ -267,12 +267,13 @@ wiring it through the ledger is Prompt B's job (see
 
 **These are the highest-risk items in this document.**
 
-1. **`claimOrder()` has never executed against a real database.**
-   The DB *constraints* were verified under real concurrency (5 parallel
-   INSERTs → exactly 1 winner, 4 rejected with `23505`). The **code path** —
-   PostgREST returning 409 and `claimOrder()` returning `claimed:false` — is
-   verified by code inspection only. This must be proven before
-   `CT_DRY_RUN=false`.
+1. ✅ **CLOSED 2026-07-31.** `claimOrder()` proven against real Supabase
+   (project enhbckomwdelktdhnuzq). 5 concurrent calls via
+   scratchpad/ledger-race-test.mjs → exactly 1 claimed:true, 4 clean
+   claimed:false, 0 thrown exceptions. Row count verified independently
+   post-cleanup: 0. PostgREST's 409 on unique-constraint conflict is
+   correctly translated into claimed:false by the real code path, not
+   just by DB-level inspection. No longer blocks CT_DRY_RUN=false.
 
 2. **`ct_orders` is empty and nothing imports `ct-order-ledger.ts`.**
    The ledger is dead code until routing is wired.
@@ -287,11 +288,10 @@ wiring it through the ledger is Prompt B's job (see
    guard is harmless belt-and-braces; if one does, it is load-bearing.
    **Assume it is load-bearing.**
 
-5. **`scratchpad/ledger-race-test.mjs` was lost** when its container was
-   reclaimed. It must be rebuilt before item 1 can be closed. Step 3 of that
-   script (concurrent `Promise.all` claims) is the actual test; the script was
-   self-cleaning. Requires `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`
-   (Supabase dashboard → project `enhbckomwdelktdhnuzq` → Settings → API).
+5. ✅ **CLOSED 2026-07-31.** `scratchpad/ledger-race-test.mjs` rebuilt and
+   committed (PR #63). Compiles the real ct-order-ledger.ts via tsc rather
+   than reimplementing it; self-cleaning; documented recompile step if the
+   source changes. See item 1 for the run result.
 
 ---
 
