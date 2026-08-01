@@ -2,6 +2,11 @@
 
 **Repo:** `gci-order-hub`
 **Drafted:** 2026-07-27
+**Status (2026-07-31):** A and B superseded by PR #65/#66's actual
+implementation (see status notes below each, and
+`CT-INTEGRATION-CONTEXT.md` § 5a). C completed (PR #63). D and E added this
+session — see their entries at the end of this file.
+
 **Read `CT-INTEGRATION-CONTEXT.md` first.** These prompts assume that
 document's architecture decisions and encode them; changing one without the
 other will produce duplicate real orders.
@@ -48,6 +53,7 @@ BUILD, in this order per new Walmart order:
    a failed mirror means the order never ships. On failure: loud Telegram
    alert naming the Walmart PO#, and leave the order unmarked so the next cron
    run retries it. Never swallow this error.
+
    Requirements:
      a. Idempotent on Walmart PO#. One PO → at most one Shopify order, across
         overlapping cron runs. Check before create.
@@ -91,6 +97,13 @@ CONSTRAINTS
   api/ct-tracking-parser.ts actually do today. I need that to review.
 ```
 
+**Status: superseded, 2026-07-31.** Not built exactly as specified above —
+the acknowledge/notify half shipped across PRs #49–61, and the actual
+Shopify mirror shipped later as PR #66 (`claude/walmart-shopify-mirror`,
+draft), using tag `gci-walmart-mirror` rather than the `walmart-import` name
+this prompt specifies. See `CT-INTEGRATION-CONTEXT.md` § 5a for what
+actually exists. Kept here for historical record, not as a to-do.
+
 ---
 
 ## Prompt B — CT routing
@@ -117,6 +130,7 @@ Do NOT let walmart-order-sync call CT itself. Keep the Prompt A webhook guard
 intact — the mirror invokes the router directly, so the webhook must not.
 
 BUILD
+
 1. Replace the TIRE- prefix gate with classifyLineItems() from ct-client.ts.
    SKUs are mixed and CT part numbers follow no pattern — the catalog is the
    only source of truth. INSTALL-FEE-* is already excluded there. Route
@@ -163,6 +177,14 @@ CONSTRAINTS
 - npx tsc --noEmit must pass. Draft PR, do not merge.
 ```
 
+**Status: superseded, 2026-07-31.** Built as PR #65 (`claude/ct-order-routing`,
+draft) — `routeOrderToCT()` in `api/lib/ct-order-routing.ts`, matching this
+prompt's design closely (classifyLineItems → claimOrder → error mapping →
+ship_to_installer refusal). Wired into the Walmart mirror path via
+`maybeRouteToCT()` in PR #66, called synchronously right after a successful
+mirror rather than via the webhook path — see `CT-INTEGRATION-CONTEXT.md`
+§ 5a. Kept here for historical record, not as a to-do.
+
 ---
 
 ## Prompt C — rebuild the ledger race test
@@ -199,3 +221,79 @@ Never commit the key.
 Report the raw output. Do not mark the verification gap closed in
 docs/CT-INTEGRATION-CONTEXT.md unless step 3 passes.
 ```
+
+**Status: ✅ completed, 2026-07-31.** Script rebuilt, run against real
+Supabase: 5 concurrent claims → exactly 1 claimed:true, 4 clean
+claimed:false, 0 thrown. Independently re-verified via direct SQL (0 rows
+post-cleanup). Merged as PR #63. Gap #1 in `CT-INTEGRATION-CONTEXT.md` § 6
+marked closed.
+
+---
+
+## Prompt D — investigate whether routeOrderToCT() reaches the mirror path
+
+**Status: premise was wrong, no code changed, 2026-07-31.** This prompt was
+written on the assumption that `routeOrderToCT()` was only called from
+`order-router.ts`'s webhook handler (confirmed true for PR #65 alone) and
+therefore never reached a mirrored Walmart order. That assumption was based
+on a `git grep` run against the wrong branch. In fact
+`claude/walmart-shopify-mirror` (PR #66) already called `routeOrderToCT()`
+synchronously via `maybeRouteToCT()` in `walmart-order-sync.ts`, wired
+earlier in the same session that produced PR #66 — this prompt rediscovered
+work that already existed.
+
+Claude Code correctly refused to build a duplicate/conflicting fix,
+re-verified the one genuinely new claim (`orders/paid` doesn't fire) against
+the same Vercel log window, and recorded that finding in PR #66's body
+instead. No branch was created for this prompt. Kept here so a future
+session doesn't retrace the same investigation.
+
+The one live-verified fact this prompt DID produce, which is real and now
+recorded in `CT-INTEGRATION-CONTEXT.md` § 6 gap #4 and the Trigger Mechanism
+section: Shopify does not fire `orders/paid` for an order created via Admin
+API with `financial_status` derived as paid from a `transactions` array.
+Order id `7163049082928`, created 2026-07-31T14:59:46Z, deleted immediately
+after test. Vercel logs for gci-order-hub checked twice, independently, over
+2026-07-31T14:58:30Z–15:05:00Z: only scheduled crons fired, no `orders/paid`
+request received either time.
+
+---
+
+## Prompt E — test coverage for the CT_AUTO_PO_ENABLED gate on the mirror path
+
+**Status: ✅ completed, 2026-07-31.** Merged into PR #66 as commit `bbebdcd`.
+
+```
+TASK: Add test coverage for the CT_AUTO_PO_ENABLED gate on the mirror path
+(the maybeRouteToCT() call in walmart-order-sync.ts, PR #66). No behavior
+change -- tests only.
+
+BUILD: Two test cases -- gate true calls routeOrderToCT() exactly once with
+the correct Shopify order id; gate false/unset does not call it at all.
+Mock routeOrderToCT() itself via dependency injection; do not build a
+full-handler mocking harness.
+
+CONSTRAINT (relaxed during execution, with sign-off): the gate+call logic
+was originally inline inside handler(), with no way to reach it in
+isolation short of mocking the Walmart API, Google Sheets SDK, Supabase
+REST, and Telegram. Claude Code flagged this conflict before acting, rather
+than silently expanding scope or building a disproportionate mock. Approved
+fix: extract the ~15-line block into a small, named, exported function
+(maybeRouteToCT()) taking routeFn/ctAutoPoEnabled as optional injected
+overrides -- real callers (the handler) pass neither, so production
+behavior is unchanged, confirmed byte-for-byte via diff review.
+
+VERIFICATION done, not just claimed: mutation-tested both assertions --
+disabling the gate's early-return only broke the "does NOT call" test (the
+"calls" test still passed, correctly, since that path fires either way);
+inverting the gate's condition broke both, as expected. Real code restored
+and re-confirmed byte-identical via git status --short afterward. tsc and
+all pre-existing suites (9 + 28 assertions) unaffected.
+```
+
+Extraction diff and full test file reviewed directly (not from summary) —
+confirmed the extraction is behavior-preserving (comments reworded only to
+reflect the new function boundary, no logic changed) and the two test
+assertions check field-level mapping (`sourceOrderId`, `sourceOrderNumber`,
+`channel`, `meta.walmartPoNumber`), not just call-count. New file:
+`api/tests/walmart-order-sync.unit.test.ts`.

@@ -2,7 +2,8 @@
 
 **Repo:** `gci-order-hub`
 **Last updated:** 2026-07-31
-**Status:** Client + ledger merged (Shopify path, PR #65, still an unmerged draft). Walmart→Shopify mirror + webhook guard now built (draft PR, see §13) — the §1/§7 "aspirational" gap PR #65 found is closed in that draft, not yet on `main`. Verification gap #1 (ledger concurrency, § 6) CLOSED 2026-07-31 — all other safety gates unchanged.
+**Status:** Client + ledger merged. Routing wired on draft branches (PR #65 + #66 — see § 5a), held pending review, not yet on `main`. Verification gaps #1 (ledger concurrency) and #4 (orders/paid webhook behavior) in § 6 both CLOSED 2026-07-31 — remaining gaps unchanged.
+
 **Nothing in this repo can place a real CT order today.** See § Safety Gates.
 
 > **Read this before touching anything CT-related.** This document is the
@@ -35,15 +36,24 @@ CT is called from exactly one implementation, always keyed off a Shopify order.
 ### Trigger mechanism — "Option 2", decided 2026-07-27
 
 `walmart-order-sync` mirrors the order into Shopify, then **invokes the shared
-routing function in-process**. It does *not* wait for a Shopify webhook.
+routing function in-process** (`maybeRouteToCT()`, wired 2026-07-31 — see
+§ 5a). It does *not* wait for a Shopify webhook.
 
 Rejected alternative ("Option 1"): let the mirrored order's `orders/paid`
 webhook drive routing. Rejected because:
 
-- It is **unverified** whether Shopify fires `orders/paid` for an order created
-  via Admin API and marked paid *without a processed transaction* (Walmart
-  collects payment, so Shopify processes none). If it does not fire, Walmart
-  orders silently never reach CT.
+- ✅ **CONFIRMED 2026-07-31, not merely assumed.** Shopify does NOT fire
+  `orders/paid` for an order created via Admin API with `financial_status`
+  derived as paid from a `transactions` array (no real transaction processed
+  — Walmart already collected payment). Live-tested against production
+  Shopify: order id `7163049082928` created 2026-07-31T14:59:46Z, deleted
+  immediately after. Vercel runtime logs for gci-order-hub
+  (`prj_anvgQttOhkbESYZImTMUvV4qB8Fk`) checked over
+  2026-07-31T14:58:30Z–15:05:00Z: only the two scheduled crons
+  (`walmart-sync-cursor`, `ct-tracking-parser`) fired — no `orders/paid`
+  request received. Independently re-checked a second time over the same
+  window with the same result. Option 1 would have silently never routed a
+  single Walmart order to CT.
 - It adds an async hop of unpredictable latency against Walmart's 4-hour
   acknowledgment SLA.
 
@@ -54,24 +64,25 @@ also route automatically. That is not a current requirement.
 
 | Layer | Guarantees | Key |
 |---|---|---|
-| Mirror idempotency | one Walmart PO → at most one Shopify order | Walmart PO# (`walmart_shopify_mirror` table) |
+| Mirror idempotency | one Walmart PO → at most one Shopify order | Walmart PO# |
 | `gci-walmart-mirror` webhook guard | one router invocation per order | Shopify tag |
 | `ct_orders` claim | one CT submission per Shopify order | Shopify order id |
 
 Any one layer can fail and two remain.
 
-**Naming correction (2026-07-31):** this section originally named the guard
-tag `walmart-import`. That was always aspirational — PR #65 found zero code
-implementing it. The draft PR that actually built it (see §13) used
-`gci-walmart-mirror` instead (chosen to be unambiguous against
-`gci-walmart-sync`'s own, unrelated `walmart-canada` tag on the same-shaped
-field). `gci-walmart-mirror` is the real tag; `walmart-import` never existed
-in code and should not be searched for or assumed anywhere below.
-
 ### 🔴 The `gci-walmart-mirror` guard — do not "fix" this
 
-`order-router.ts` returns 200 early, without supplier routing, for any Shopify
-order tagged `gci-walmart-mirror`.
+**Tag name correction (2026-07-31):** this section previously called the tag
+`walmart-import`. That name was never actually built — a repo-wide grep found
+zero hits before PR #66 existed. When the real mirror shipped, it used
+`gci-walmart-mirror` instead (not to be confused with `gci-walmart-sync`'s
+own, unrelated `walmart-canada` tag on a different app entirely). If you're
+grepping for `walmart-import` anywhere in this repo, stop — it doesn't exist
+and never did.
+
+`order-router.ts` (PR #65/#66, currently draft — not yet on `main`) returns
+200 early, without supplier routing, for any Shopify order tagged
+`gci-walmart-mirror`.
 
 **This looks like a bug and is not.** The mirror calls the routing function
 *directly*; if the webhook were also allowed to route the same order, the tire
@@ -80,6 +91,13 @@ would be submitted to Canada Tire **twice against a live credit line**.
 The guard's rationale inverted mid-design (it originally existed to stop a
 passive bookkeeping copy from ordering at all). The code is identical either
 way. Removing it causes duplicate real orders.
+
+**Update 2026-07-31:** live-tested — the `orders/paid` webhook this guard
+protects never actually fires for a mirrored order in the first place (see
+Trigger Mechanism above), so today this guard is not exercised in practice.
+Keep it anyway: it is zero-cost belt-and-braces against Shopify's webhook
+behavior changing in the future. `ct_orders`'s own claim constraint is the
+real backstop regardless.
 
 ---
 
@@ -169,7 +187,6 @@ condition — design for it. See § Error mapping.
 ## 4. SKU classification
 
 Shopify and Walmart SKUs are **mixed**:
-
 - some carry a legacy `TIRE-` prefix — `TIRE-166028008`
 - some are bare CT part numbers — `200E1059`
 
@@ -260,16 +277,71 @@ legacy shape (still present in CT invoice history) are now matched, built
 from the same `CANONICAL_PO_NUMBER_SHAPE` constant `buildPoNumber()` uses, so
 producer and consumer cannot silently drift apart again.
 
-**✅ CLOSED 2026-07-31 (Prompt B, Shopify side only — see item below).**
-`order-router.ts`'s dormant `CT_AUTO_PO_ENABLED` branch used to call
-`submitPurchaseOrder()` → `submitOrder({ poNumber: po.gciOrderNumber, ... })`
-directly, bypassing `claimOrder()`/`buildPoNumber()` entirely. It now calls
-`routeOrderToCT()` (new: `api/lib/ct-order-routing.ts`), which runs
-`classifyLineItems()` → `claimOrder()` → `submitOrder()` and always gets a
-real `GCI-<year>-<seq>` PO number from the ledger. `submitPurchaseOrder()` is
-unused dead code now, kept only as a shim (see its header comment in
-`ct-client.ts`). **Still only reachable via the Shopify webhook path** —
-see §6 item 2 and §7 for the Walmart-side gap this does not close.
+**Known gap, not fixed by this PR:** `order-router.ts`'s dormant
+`CT_AUTO_PO_ENABLED` branch calls `submitPurchaseOrder()` →
+`submitOrder({ poNumber: po.gciOrderNumber, ... })` directly, bypassing
+`claimOrder()`/`buildPoNumber()` entirely — it would send CT the raw Shopify
+order name (e.g. `#1042`), not a canonical PO number, if that gate were ever
+flipped on. `CT_AUTO_PO_ENABLED` is unset today so this path is unreachable.
+**Fixed 2026-07-31** by PR #65 (`api/lib/ct-order-routing.ts`'s
+`routeOrderToCT()`), which replaces this dormant branch entirely — see § 5a.
+PR #65 is currently draft, not yet merged to `main`.
+
+---
+
+## 5a. Drafted, not yet merged — PR #65 and #66 (2026-07-31)
+
+Both held pending review; neither is on `main`. `CT_AUTO_PO_ENABLED` remains
+unset regardless, so neither changes live behavior yet.
+
+### PR #65 — `claude/ct-order-routing` — CT order routing (Shopify path)
+
+`api/lib/ct-order-routing.ts`: `routeOrderToCT()` — single shared function,
+`classifyLineItems()` → `claimOrder()` → `submitOrder()`, full error mapping
+per § 8. Replaces `order-router.ts`'s dormant, ledger-bypassing
+`CT_AUTO_PO_ENABLED` branch entirely (see § 5's canonical-PO-number entry).
+
+`ship_to_installer` is refused **before** `claimOrder()`/`classifyLineItems()`
+run — the § 9 open bug ("empty address fields") is fixed by refusing auto-PO
+on that branch and routing to manual notify, not by populating the fields
+(installer drop-ship stays out of scope). Column N (`po_number`) is written
+only on a confirmed `markSubmitted` outcome.
+
+Wired only to the existing `orders/paid` webhook at this point — real
+Shopify-checkout orders. `walmart-order-sync.ts` untouched by this PR.
+
+### PR #66 — `claude/walmart-shopify-mirror` (stacks on #65) — Walmart mirror
+
+New table `walmart_shopify_mirror` (migration checked in, **not applied
+live**). Guard tag `gci-walmart-mirror` (see the guard section above — not
+`walmart-import`). Mirrors a Walmart order into Shopify
+(`financial_status: paid` via a `transactions` array, no Customer record, no
+retry on timeout/5xx — same reasoning as `submitOrder()`, see the "NEVER
+BLIND-RETRY" header comment in `walmart-shopify-mirror.ts`). Mirror is
+CRITICAL PATH per § 7 — failure alerts loudly and leaves the order for the
+next cron run to retry.
+
+`maybeRouteToCT()` (`api/walmart-order-sync.ts`) calls `routeOrderToCT()`
+**synchronously, in-process, immediately after a successful mirror** —
+extracted into a named, injectable function specifically so this gate has
+real test coverage (`api/tests/walmart-order-sync.unit.test.ts`, 2
+assertions, mutation-tested: both pass/fail correctly under an
+inverted-gate mutation). This is the mechanism the Trigger Mechanism section
+above describes — it does not depend on any webhook, which is exactly what
+the live `orders/paid` test confirmed is necessary.
+
+**Three open items, not resolved, block merge:**
+1. Inventory decrement on the mirrored order — Pat's decision, two real
+   options with consequences documented in the PR body, still open.
+2. QST marketplace-facilitator status for Quebec Walmart orders — GST/HST is
+   confirmed (Walmart CA is marketplace facilitator, GCI never holds tax
+   liability, $0 tax on the mirror is correct), but Quebec specifically has
+   not been separately confirmed. Do not let a Quebec order flow through the
+   mirror until this is checked.
+3. `walmart_shopify_mirror` migration is checked in but not applied to the
+   live Supabase project — deliberate, gated on the above two decisions plus
+   at least one day's review before merge, given the stakes (a live credit
+   line and duplicate-order risk).
 
 ---
 
@@ -284,29 +356,25 @@ see §6 item 2 and §7 for the Walmart-side gap this does not close.
    post-cleanup: 0. PostgREST's 409 on unique-constraint conflict is
    correctly translated into claimed:false by the real code path, not
    just by DB-level inspection. No longer blocks CT_DRY_RUN=false.
-
-2. **Partially closed 2026-07-31, further closed in draft PR — see §13.**
-   `ct-order-ledger.ts` is now imported and called — by
-   `api/lib/ct-order-routing.ts`, wired into `order-router.ts`'s Shopify
-   `orders/paid` webhook. `ct_orders` will start getting rows the moment
-   `CT_AUTO_PO_ENABLED=true` (still unset today). A separate draft PR (§13)
-   builds the mirror this item originally said was missing and wires
-   `walmart-order-sync.ts` to call `routeOrderToCT()` for the resulting
-   Shopify order — **not yet on `main`**, so as of the last commit to `main`
-   itself, the ledger is still never reached for Walmart orders there.
-
+2. **`ct_orders` is empty; the ledger is wired on draft branches, not yet
+   live.** `claimOrder()`/`buildPoNumber()` are now called from
+   `routeOrderToCT()` (PR #65) and, for the mirror path, from
+   `maybeRouteToCT()` (PR #66) — see § 5a. Neither PR is merged to `main`,
+   and `CT_AUTO_PO_ENABLED` is unset regardless, so the ledger remains
+   unexercised in production until both merge and that gate is explicitly
+   flipped on.
 3. **Submit Order has never been called** in any environment.
    `customerId 19997` is unconfirmed for that endpoint specifically.
-
-4. **Shopify webhook behaviour for Admin-API-created paid orders is unknown.**
-   Whether `orders/paid`, `orders/create`, both, or neither fires is
-   **still untested** — the draft PR in §13 does not close this item, it
-   only builds the guard on the assumption below. Option 2 was chosen partly
-   to avoid depending on this, but the `gci-walmart-mirror` guard's necessity
-   depends on it — if no webhook fires, the guard is harmless
-   belt-and-braces; if one does, it is load-bearing. **Assume it is
-   load-bearing.**
-
+4. ✅ **CLOSED 2026-07-31 (partially — see caveat).** `orders/paid` confirmed
+   NOT to fire for an Admin-API-created paid order (live test, order id
+   `7163049082928` — full evidence in the Trigger Mechanism section, § 1).
+   Independently re-confirmed by a second check of the same Vercel log
+   window. **Caveat: `orders/create` was not tested** — only `orders/paid`
+   was checked, since that's the only webhook this repo currently listens
+   for. If a future need arises to know whether `orders/create` fires too,
+   that is still open. The `gci-walmart-mirror` guard (§ 1) is confirmed
+   currently non-load-bearing for this specific path, but is kept regardless
+   as zero-cost defense against Shopify's behavior changing.
 5. ✅ **CLOSED 2026-07-31.** `scratchpad/ledger-race-test.mjs` rebuilt and
    committed (PR #63). Compiles the real ct-order-ledger.ts via tsc rather
    than reimplementing it; self-cleaning; documented recompile step if the
@@ -316,9 +384,12 @@ see §6 item 2 and §7 for the Walmart-side gap this does not close.
 
 ## 7. Walmart channel
 
-### Telegram has NEVER fired for a Walmart order
+### Telegram has NEVER fired for a Walmart order in production
 
-This is an **unbuilt feature, not a regression.** Do not go bug-hunting.
+Was an **unbuilt feature, not a regression**, through 2026-07-30. **Built on
+PR #66 (draft, not merged)** as of 2026-07-31 — notification is wired into
+the mirror flow described in § 5a. Still does not fire in production until
+#66 merges.
 
 `/api/walmart-order-sync` runs every 15 min (96 runs/24h, zero errors over 7
 days). `/api/ct-tracking-parser` runs 48×/day, zero errors — **its actual
@@ -341,11 +412,7 @@ manually. Nothing alerted.
 - **Mirror into Shopify is CRITICAL PATH, not best-effort.** Under the hub
   architecture a failed mirror means the order never reaches CT and never
   ships. On failure: loud Telegram alert naming the Walmart PO#, leave the
-  order unmarked so the next cron run retries. **Built 2026-07-31 — see §13**
-  (`api/lib/walmart-shopify-mirror.ts`, draft PR, not yet on `main`). Always
-  attempted independent of `CT_AUTO_PO_ENABLED` — that gate only controls
-  whether the *resulting* Shopify order is then routed to CT, per this
-  decision being about mirroring, not CT auto-submission.
+  order unmarked so the next cron run retries.
 - **PO numbering** — **superseded 2026-07-29**: this originally said PO
   numbering stays `GCI-W-<walmartPO>` for Walmart-origin orders so CT
   invoices reconcile against Walmart payouts. CT never actually recognised
@@ -364,12 +431,6 @@ Mirrored orders must set `send_receipt:false` and
 record. Walmart's Marketplace agreement restricts using their customer data for
 marketing. This is a compliance constraint, not a preference.
 
-**Built 2026-07-31 — see §13.** `buildMirrorOrderPayload()` in
-`api/lib/walmart-shopify-mirror.ts` sets both flags and omits `email`/
-`customer` entirely (Shopify only creates/links a Customer record when an
-email is present on the order-creation payload) — enforced by a unit test,
-not just a comment.
-
 ### Telegram alert contents (agreed)
 
 Walmart PO#, Walmart order#, resulting Shopify order#, SKU + qty, customer
@@ -377,27 +438,24 @@ city/province, **ship-by and deliver-by dates**, revenue, CT cost, chosen CT
 warehouse, stock status, and either `✅ CT order SO###### placed` or
 `⚠️ manual PO required — <reason>`.
 
-**Implemented 2026-07-31** as `buildCtRoutingAlert()` /
-`sendCtRoutingAlert()` in `api/lib/ct-order-routing.ts` — this exact field
-list, rendered generically so any field a caller doesn't supply (all the
-Walmart-only ones, today) is simply omitted rather than shown blank. It only
-fires when `routeOrderToCT()` runs, which today means Shopify orders only
-(see §6 item 2). The pre-existing per-order alert in
-`walmart-order-sync.ts`'s `buildTelegramMessage()` — sent at ingestion time,
-before any CT routing would happen — still has its
-`CT cost / warehouse / stock: placeholder, filled by a later PR` line
-unfilled, deliberately: filling it in would mean fabricating a CT routing
-result that never actually ran for that order.
-
 ### 🔴 `gci-walmart-sync` is NOT this pipeline
 
 `gci-walmart-sync` is a **separate commercial Shopify app**, intentionally in
 test mode against `gci-walmart-test.myshopify.com`. It has nothing to do with
 GCI's own Walmart orders. Ignore it entirely when working on this.
 
+**Historical note (found 2026-07-31):** gci-walmart-sync's mirror code did
+fire for real exactly once, 2026-06-26 (shadowMode: false at the time),
+creating Shopify order `gid://shopify/Order/4651989270577` for a genuine GCI
+Walmart order (`600000100319395`, Aasiyah Haq, Toronto ON, PO GCI0004).
+Already shipped and logged in the Sheet — not a live incident, nothing to
+action. gci-walmart-sync has since added a shadow-mode row
+(`docs/SHADOW-MODE.md`) that captures real orders for comparison without
+creating Shopify orders or acknowledging on Walmart.
+
 ---
 
-## 8. Error mapping (✅ implemented 2026-07-31 — `api/lib/ct-order-routing.ts`)
+## 8. Error mapping (to implement)
 
 | Outcome | Ledger action | Notes |
 |---|---|---|
@@ -406,25 +464,18 @@ GCI's own Walmart orders. Ignore it entirely when working on this.
 | `CTValidationError` | `markFailed` | Safe to fix and resubmit |
 | `CTAuthError` | `markFailed` | |
 | `CTServerError` / timeout | `markIndeterminate` | 🔴 **LOUD alert. NEVER auto-retry.** CT may have committed the order. |
-| `CTNotConfiguredError` | *(none — no claim taken)* | Surfaces from `classifyLineItems()`, before any `claimOrder()` call, so a config problem never occupies a ledger row. Not in the original table above; added because `classifyLineItems()`, like `submitOrder()`, calls a CT RESTlet. |
-| `ship_to_installer` | *(none — no claim taken)* | Explicit refusal before `classifyLineItems()`/`claimOrder()` — see §9. |
-| 100% unknown/excluded line items | *(none — no claim taken)* | Nothing CT-eligible to submit; unknown SKUs still alert per §4. |
-| already claimed (`claimed:false`) | *(none — existing row untouched)* | Idempotent replay (e.g. a retried webhook) — not resubmitted. |
 
 ---
 
 ## 9. Open bugs
 
-- **✅ CLOSED 2026-07-31.** `order-router.ts` `ship_to_installer` branch used
-  to send empty `address1`/`city`/`province`/`postalCode` into
-  `submitPurchaseOrder()`, throwing `CTValidationError` deep inside — AFTER a
-  ledger row would already have been claimed for it, once that path was
-  wired. `routeOrderToCT()` now checks `shipToInstaller` first and refuses
-  explicitly (`manual_required`, no CT call, **no ledger claim at all** —
-  confirmed by code order: the check runs before `classifyLineItems()`/
-  `claimOrder()`) instead of synthesizing empty address fields. Installer
-  drop-ship shipping is still deferred until a real installer address list
-  exists.
+- **`order-router.ts` `ship_to_installer` branch** sends empty
+  `address1`/`city`/`province`/`postalCode`. Since PR #47 this throws
+  `CTValidationError` when auto-PO is attempted. **Fixed 2026-07-31 by PR #65**
+  (draft, not merged) — explicitly refuses auto-PO on that branch, confirmed
+  refused **before** `classifyLineItems()`/`claimOrder()` run, routes to
+  manual notify. Installer drop-ship remains deferred until a real installer
+  list exists — the fields themselves are still never populated.
 - **~10 Walmart SKUs** get a persistent 400 "Data error" on price/inventory
   updates via `/api/walmart-sync-cursor` (43 error groups; also transient
   520s). Likely invalid or delisted SKUs. **Separate issue from order sync** —
@@ -459,167 +510,39 @@ Supabase project `enhbckomwdelktdhnuzq` (ca-central-1) is shared across repos.
 
 ---
 
-## 11. Where this left off — 2026-07-27
+## 11. Where this left off — 2026-07-31
 
 ### Blocked
-- **CT sandbox credentials.** Requested from the CT rep by email (informal
-  French). Awaiting reply, expected 2026-07-28. Required to exercise Submit
-  Order without creating a real billable order.
+
+- **CT sandbox credentials.** Requested from the CT rep 2026-07-27, still
+  pending. Required to exercise Submit Order without creating a real
+  billable order.
+
+### Held for explicit decision (not blocked, just not decided)
+
+- **PR #65** (CT order routing, Shopify path) and **PR #66** (Walmart
+  mirror, stacks on #65) — both draft, both mergeable, both hold no live
+  effect since `CT_AUTO_PO_ENABLED` is unset. See § 5a for full detail.
+  Do not merge either until:
+  - Inventory decrement decision made (Pat's call, PR #66 body)
+  - QST marketplace-facilitator status confirmed for Quebec orders
+  - At least one day's sit/review time given the stakes (live credit line)
+
+  Merge order: #65 first, then #66 (or squash both together).
 
 ### Ready to do
-- **Rebuild and run the ledger race test** (see § 6, item 5). Blocking for
-  `CT_DRY_RUN=false`.
-- **Prompt A** — Walmart → Shopify: acknowledge, mirror, notify, webhook
-  guard. Ships independently of CT; ends the manual-dashboard-checking problem
-  and protects the acknowledgment metric. **Do this first.**
-- **Prompt B** — extract shared routing fn, wire `classifyLineItems()` +
-  `claimOrder()`, error mapping, installer refusal, enrich Telegram. Requires
-  Prompt A merged **and** the ledger race test passed.
 
-Both prompts are recorded in `CT-SESSION-PROMPTS.md`.
+- Nothing currently blocked on this repo's own code — the remaining open
+  items are either external (CT sandbox creds) or deliberate holds (above).
 
 ### Standing questions to CT rep
+
 - ✅ Credit line active — confirmed
 - ✅ Blind drop-ship configured account-level — confirmed
 - ⏳ Sandbox credentials — pending
 - ⏳ Confirm `customerId 19997` is correct for **Submit Order** specifically
 
 ### Do not touch
+
 - `gci-brain/api/shopifySync.ts` — live catalog integration.
 - `gci-walmart-sync` — unrelated commercial app in intentional test mode.
-
----
-
-## 12. Prompt B — 2026-07-31 (draft PR, not merged)
-
-Built `api/lib/ct-order-routing.ts` (`routeOrderToCT()`): classify → claim →
-submit → ledger-status-write per §8's error mapping, `ship_to_installer`
-refusal before any claim (§9), the `buildCtRoutingAlert()` Telegram format
-from §7, and a Sheet column-N PO writer (`writePoNumberByOrderId()` in
-`sheets-client.ts`) that only fires on a confirmed `markSubmitted`.
-`order-router.ts`'s dormant `CT_AUTO_PO_ENABLED` branch now calls it instead
-of `submitPurchaseOrder()` directly (§5, §6 item 2, §8, §9 above all updated
-in this same PR).
-
-**What this PR found, and did NOT build:** the premise that Prompt A shipped
-a Walmart-order → Shopify mirror plus a `walmart-import` webhook-guard tag
-(§1, §7 "Mirror into Shopify is CRITICAL PATH") turned out not to match the
-actual code — `api/walmart-order-sync.ts` has zero Shopify API calls, and a
-repo-wide search for `walmart-import` found nothing. `CT-SESSION-PROMPTS.md`
-frames Prompt B as depending on that mirror; it does not exist. Rather than
-build it as an assumption or invent a different trigger unasked, this PR
-routes only the one real, already-existing call site that has a real Shopify
-order to work with (the Shopify webhook itself) and leaves the Walmart side
-unwired. **`walmart-order-sync.ts` still never calls `routeOrderToCT()`.**
-Building the mirror, or deciding to route Walmart orders to CT some other
-way, is unstarted work — not a subtle gap, a whole missing piece.
-
----
-
-## 13. Prompt A (built retroactively) — 2026-07-31, on top of §12's draft PR (draft, not merged)
-
-Built on the `claude/ct-order-routing` branch (§12's PR #65 head — that PR is
-still open/unmerged; `routeOrderToCT()` does not exist on `main` yet, so this
-work branches off #65 rather than `main` so the function it calls actually
-exists). Closes the exact gap §6 item 2 and §12 described.
-
-**New:**
-- `supabase/migrations/20260731_walmart_shopify_mirror.sql` +
-  `api/lib/walmart-shopify-mirror.ts` — `walmart_shopify_mirror` table
-  (own idempotency ledger, one row per Walmart PO, independent of
-  `ct_orders`) and `mirrorWalmartOrderToShopify()`: builds the Shopify
-  order-creation payload (`financial_status: 'paid'`, no `email`/`customer`
-  per the §7 compliance restriction, tagged `gci-walmart-mirror`) and POSTs
-  it as a **single, never-auto-retried** attempt — a blind retry on a
-  timeout/5xx could create a second real order the same way a blind CT
-  retry could double-submit (see `ct-order-ledger.ts`'s own header comment
-  for the identical reasoning on the CT side). `claimed`/`failed` are
-  retryable next cron run; `indeterminate` is not — a human must check
-  Shopify (tag `gci-walmart-mirror` + the Walmart PO# in the order note)
-  before it moves again.
-- `api/order-router.ts` — the `gci-walmart-mirror` guard from §1 is now real
-  code: any Shopify order carrying that tag gets a 200 with no routing,
-  before any TIRE- item processing runs.
-- `api/walmart-order-sync.ts` — now calls `mirrorWalmartOrderToShopify()`
-  for every new order (right after Walmart acknowledgment, unconditional —
-  not gated by `CT_AUTO_PO_ENABLED`, matching the §7 decision that mirroring
-  is CRITICAL PATH independent of CT auto-submission), then, only when
-  `CT_AUTO_PO_ENABLED` is true, calls `routeOrderToCT()` — unmodified,
-  channel `'walmart'`, **`sourceOrderId`/`sourceOrderNumber` set to the new
-  Shopify order's id/name, not the Walmart PO** (per §7: "Ledger keys on the
-  Shopify order id for BOTH channels"), Walmart identifiers carried as
-  `meta.walmartPoNumber`/`walmartOrderNumber`. `meta.walmartSheetOrderId` is
-  set to the Walmart PO#, so `ct-order-routing.ts`'s existing (§12)
-  column-N Sheet writer now actually fires for Walmart-originated CT
-  submissions too — it was wired but unreachable before this PR since
-  nothing called `routeOrderToCT()` with that field set.
-- On mirror failure/indeterminate: loud Telegram alert naming the Walmart
-  PO#, and that order's Sheet row(s) are deliberately not appended — exactly
-  the §7 "leave the order unmarked so the next cron run retries" decision.
-  Walmart acknowledgment itself is unaffected either way (unconditional,
-  unchanged, ahead of the mirror call, to protect the 4-hour SLA metric).
-- `api/tests/walmart-shopify-mirror.unit.test.ts` — 9 assertions on
-  `buildMirrorOrderPayload()` (paid-at-creation, no Customer record, guard
-  tag, field mapping, no fabricated phone number). Pure/no-network, same
-  style as `ct-order-routing.unit.test.ts`. `mirrorWalmartOrderToShopify()`
-  itself (claim → attempt → ledger write) is integration-only, same
-  boundary `ct-order-ledger.ts`/`ct-order-routing.ts` already draw.
-
-**What this PR did NOT resolve:**
-- §6 item 4 (`orders/paid` firing behaviour for Admin-API-created paid
-  orders) is **still unverified** — this PR assumes it is load-bearing (per
-  §6 item 4's own instruction) and builds the guard accordingly, but cannot
-  confirm it from a sandboxed environment with no live Shopify store to test
-  against. If a future session confirms the webhook does NOT fire for these
-  orders, the guard becomes harmless belt-and-braces, not a correction.
-- **Line-item tax and shipping cost are not mapped** onto the mirrored
-  order — this repo's own `WalmartOrder`/`OrderLine` types (in
-  `api/walmart-order-sync.ts`) have never captured either, and nothing in
-  this codebase has verified whether/where Walmart's live payload carries
-  them. No `tax_lines`/`shipping_lines` are sent rather than guessing a
-  shape. See `api/lib/walmart-shopify-mirror.ts`'s module header for the
-  full list of fields treated this way (also: no buyer phone number).
-- **Whether the mirrored order should decrement Shopify inventory is
-  unresolved and deliberately left that way** — `buildMirrorOrderPayload()`
-  does not touch inventory at all (Shopify's default order-creation
-  behaviour applies, whatever that is for this store's tracked/untracked
-  variant settings). Two real options exist and this PR does not choose
-  between them:
-  - **Decrement it.** Correct if GCI's Shopify inventory is meant to
-    reflect total sellable stock across both channels (a tire sold via
-    Walmart is no longer available to sell via Shopify). Risk: if Shopify
-    inventory also independently feeds a Walmart quantity push elsewhere
-    in this repo (`api/walmart-sync-cursor.ts` — see §9), a decrement
-    triggered by a Walmart sale could feed back into a Walmart quantity
-    update, which is at best redundant and at worst a feedback loop
-    depending on timing/idempotency there. Not analyzed here — out of
-    scope for this PR.
-  - **Don't decrement it.** Correct if Walmart-side stock is managed
-    separately and Shopify inventory should only reflect Shopify's own
-    channel. Simpler, but risks Shopify showing available-to-sell stock
-    that Walmart has already sold, if the two channels share physical
-    inventory GCI expects to be unified.
-  This is a business decision (how GCI's actual warehouse/channel
-  inventory model works), not an engineering one — **Pat's call**, not
-  assumed either way by this PR.
-- **Not applied live.** `supabase/migrations/20260731_walmart_shopify_mirror.sql`
-  is checked in only, not yet run against project `enhbckomwdelktdhnuzq` —
-  same "checked in first" precedent as `20260729_ct_po_number_seq.sql` (§5).
-  Confirmed via `list_tables` against the live project before writing this
-  migration: the name does not collide with any existing table there,
-  including `gci-walmart-sync`'s (`shops`/`products`/`walmart_orders`/
-  `sync_logs`/`sessions`), `gcitires-chatbot`'s
-  (`chatbot_customers`/`chatbot_conversations`), `gci-command-center`'s
-  (`xero_tokens`/`price_monitor_snapshots`), or this repo's own
-  (`ct_orders`/`walmart_order_alerts`/`walmart_sync_cursor`). No query
-  added by this PR reads or writes any of those other tables.
-- **The genuinely-empty, correctly-named `gci-order-hub` Supabase project**
-  (`gqaylwkfiokwsccibvxg`) is a real, separate project that exists but holds
-  none of this repo's actual tables — everything real still lives in the
-  project named `gci-walmart-sync` (`enhbckomwdelktdhnuzq`), which is shared
-  infrastructure across at least four repos (see §10). Migrating this
-  repo's tables to the correctly-named, currently-empty project is **NOT
-  in scope for this PR** — it is a separate, deliberate migration effort
-  (schema export, data copy or fresh start, cutting over every repo's
-  `SUPABASE_URL` at once, not something to fold into a feature PR touching
-  unrelated tables). Understood, not attempted, not touched here.
