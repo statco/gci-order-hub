@@ -29,6 +29,7 @@ import { sendOrderNotification, NotifyPayload }      from './lib/notify.js';
 import { CT_AUTO_PO_ENABLED }                        from './lib/ct-client.js';
 import { routeOrderToCT }                            from './lib/ct-order-routing.js';
 import { dispatchInstaller }                         from './lib/installer-dispatch.js';
+import { MIRROR_GUARD_TAG }                          from './lib/walmart-shopify-mirror.js';
 
 export const config = { maxDuration: 30 };
 
@@ -83,6 +84,17 @@ interface ShopifyOrder {
   shipping_address?: ShopifyAddress;
   billing_address?:  ShopifyAddress;
   note_attributes?:  Array<{ name: string; value: string }>;
+  // Comma-separated on the REST webhook payload, e.g. "gci-walmart-mirror, foo".
+  tags?:            string;
+}
+
+/** True if this order carries the mirror's guard tag — see the guard check
+ *  in the handler below for why this must short-circuit before any routing. */
+function hasMirrorGuardTag(order: ShopifyOrder): boolean {
+  return (order.tags ?? '')
+    .split(',')
+    .map((t) => t.trim())
+    .includes(MIRROR_GUARD_TAG);
 }
 
 // ─── INSTALLER METADATA ───────────────────────────────────────
@@ -179,6 +191,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const topic = req.headers['x-shopify-topic'] as string ?? '';
   if (topic && topic !== 'orders/paid') {
     return res.status(200).json({ skipped: true, topic });
+  }
+
+  // ── Walmart mirror guard ─────────────────────────────────────
+  // api/lib/walmart-shopify-mirror.ts creates Shopify orders tagged
+  // MIRROR_GUARD_TAG ('gci-walmart-mirror') and calls routeOrderToCT()
+  // in-process, directly, right after creation — see
+  // api/walmart-order-sync.ts. Whether Shopify's Admin API fires
+  // orders/paid for an order created via that API and marked paid WITHOUT
+  // a processed transaction (Walmart collects payment; Shopify processes
+  // none) is UNVERIFIED — see CT-INTEGRATION-CONTEXT.md §6 item 4.
+  // Assume it does. If this webhook were also allowed to route a
+  // mirrored order, the tire would be submitted to Canada Tire TWICE
+  // against a live credit line. Returns 200 early, without any routing,
+  // for any order carrying the tag — this looks like a bug and is not;
+  // see CT-INTEGRATION-CONTEXT.md §1.
+  if (hasMirrorGuardTag(order)) {
+    console.log(`⏭️  Order ${order.name} carries '${MIRROR_GUARD_TAG}' — mirror already routed it in-process, skipping webhook routing.`);
+    return res.status(200).json({ skipped: true, reason: 'walmart-mirror-guard', order: order.name });
   }
 
   console.log(`📦 Order received: ${order.name} (id=${order.id})`);
