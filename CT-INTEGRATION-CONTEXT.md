@@ -252,14 +252,16 @@ legacy shape (still present in CT invoice history) are now matched, built
 from the same `CANONICAL_PO_NUMBER_SHAPE` constant `buildPoNumber()` uses, so
 producer and consumer cannot silently drift apart again.
 
-**Known gap, not fixed by this PR:** `order-router.ts`'s dormant
-`CT_AUTO_PO_ENABLED` branch calls `submitPurchaseOrder()` →
-`submitOrder({ poNumber: po.gciOrderNumber, ... })` directly, bypassing
-`claimOrder()`/`buildPoNumber()` entirely — it would send CT the raw Shopify
-order name (e.g. `#1042`), not a canonical PO number, if that gate were ever
-flipped on. `CT_AUTO_PO_ENABLED` is unset today so this path is unreachable;
-wiring it through the ledger is Prompt B's job (see
-`CT-SESSION-PROMPTS.md`, updated to reference the corrected format).
+**✅ CLOSED 2026-07-31 (Prompt B, Shopify side only — see item below).**
+`order-router.ts`'s dormant `CT_AUTO_PO_ENABLED` branch used to call
+`submitPurchaseOrder()` → `submitOrder({ poNumber: po.gciOrderNumber, ... })`
+directly, bypassing `claimOrder()`/`buildPoNumber()` entirely. It now calls
+`routeOrderToCT()` (new: `api/lib/ct-order-routing.ts`), which runs
+`classifyLineItems()` → `claimOrder()` → `submitOrder()` and always gets a
+real `GCI-<year>-<seq>` PO number from the ledger. `submitPurchaseOrder()` is
+unused dead code now, kept only as a shim (see its header comment in
+`ct-client.ts`). **Still only reachable via the Shopify webhook path** —
+see §6 item 2 and §7 for the Walmart-side gap this does not close.
 
 ---
 
@@ -275,8 +277,18 @@ wiring it through the ledger is Prompt B's job (see
    correctly translated into claimed:false by the real code path, not
    just by DB-level inspection. No longer blocks CT_DRY_RUN=false.
 
-2. **`ct_orders` is empty and nothing imports `ct-order-ledger.ts`.**
-   The ledger is dead code until routing is wired.
+2. **Partially closed 2026-07-31.** `ct-order-ledger.ts` is now imported and
+   called — by `api/lib/ct-order-routing.ts`, wired into `order-router.ts`'s
+   Shopify `orders/paid` webhook. `ct_orders` will start getting rows the
+   moment `CT_AUTO_PO_ENABLED=true` (still unset today). **The ledger is
+   still never reached for Walmart orders** — no code anywhere mirrors a
+   Walmart order into Shopify or calls `routeOrderToCT()` for one; the
+   `walmart-import` guard described in §1 and the "mirror is CRITICAL PATH"
+   decision in §7 were never actually implemented despite `CT-SESSION-PROMPTS.md`
+   listing Prompt A as a precondition for this work. Wiring a Walmart caller
+   is still open — needs either the mirror built or a deliberate
+   architecture change (routing directly off Walmart data without a Shopify
+   mirror in between).
 
 3. **Submit Order has never been called** in any environment.
    `customerId 19997` is unconfirmed for that endpoint specifically.
@@ -348,6 +360,18 @@ city/province, **ship-by and deliver-by dates**, revenue, CT cost, chosen CT
 warehouse, stock status, and either `✅ CT order SO###### placed` or
 `⚠️ manual PO required — <reason>`.
 
+**Implemented 2026-07-31** as `buildCtRoutingAlert()` /
+`sendCtRoutingAlert()` in `api/lib/ct-order-routing.ts` — this exact field
+list, rendered generically so any field a caller doesn't supply (all the
+Walmart-only ones, today) is simply omitted rather than shown blank. It only
+fires when `routeOrderToCT()` runs, which today means Shopify orders only
+(see §6 item 2). The pre-existing per-order alert in
+`walmart-order-sync.ts`'s `buildTelegramMessage()` — sent at ingestion time,
+before any CT routing would happen — still has its
+`CT cost / warehouse / stock: placeholder, filled by a later PR` line
+unfilled, deliberately: filling it in would mean fabricating a CT routing
+result that never actually ran for that order.
+
 ### 🔴 `gci-walmart-sync` is NOT this pipeline
 
 `gci-walmart-sync` is a **separate commercial Shopify app**, intentionally in
@@ -356,7 +380,7 @@ GCI's own Walmart orders. Ignore it entirely when working on this.
 
 ---
 
-## 8. Error mapping (to implement)
+## 8. Error mapping (✅ implemented 2026-07-31 — `api/lib/ct-order-routing.ts`)
 
 | Outcome | Ledger action | Notes |
 |---|---|---|
@@ -365,17 +389,25 @@ GCI's own Walmart orders. Ignore it entirely when working on this.
 | `CTValidationError` | `markFailed` | Safe to fix and resubmit |
 | `CTAuthError` | `markFailed` | |
 | `CTServerError` / timeout | `markIndeterminate` | 🔴 **LOUD alert. NEVER auto-retry.** CT may have committed the order. |
+| `CTNotConfiguredError` | *(none — no claim taken)* | Surfaces from `classifyLineItems()`, before any `claimOrder()` call, so a config problem never occupies a ledger row. Not in the original table above; added because `classifyLineItems()`, like `submitOrder()`, calls a CT RESTlet. |
+| `ship_to_installer` | *(none — no claim taken)* | Explicit refusal before `classifyLineItems()`/`claimOrder()` — see §9. |
+| 100% unknown/excluded line items | *(none — no claim taken)* | Nothing CT-eligible to submit; unknown SKUs still alert per §4. |
+| already claimed (`claimed:false`) | *(none — existing row untouched)* | Idempotent replay (e.g. a retried webhook) — not resubmitted. |
 
 ---
 
 ## 9. Open bugs
 
-- **`order-router.ts` `ship_to_installer` branch** sends empty
-  `address1`/`city`/`province`/`postalCode`. Since PR #47 this throws
-  `CTValidationError` when auto-PO is attempted. Intended fix: **explicitly
-  refuse auto-PO** on that branch and route to manual notify. Installer
-  drop-ship is deferred until a real installer list exists — do not attempt to
-  populate those fields.
+- **✅ CLOSED 2026-07-31.** `order-router.ts` `ship_to_installer` branch used
+  to send empty `address1`/`city`/`province`/`postalCode` into
+  `submitPurchaseOrder()`, throwing `CTValidationError` deep inside — AFTER a
+  ledger row would already have been claimed for it, once that path was
+  wired. `routeOrderToCT()` now checks `shipToInstaller` first and refuses
+  explicitly (`manual_required`, no CT call, **no ledger claim at all** —
+  confirmed by code order: the check runs before `classifyLineItems()`/
+  `claimOrder()`) instead of synthesizing empty address fields. Installer
+  drop-ship shipping is still deferred until a real installer address list
+  exists.
 - **~10 Walmart SKUs** get a persistent 400 "Data error" on price/inventory
   updates via `/api/walmart-sync-cursor` (43 error groups; also transient
   520s). Likely invalid or delisted SKUs. **Separate issue from order sync** —
@@ -438,3 +470,29 @@ Both prompts are recorded in `CT-SESSION-PROMPTS.md`.
 ### Do not touch
 - `gci-brain/api/shopifySync.ts` — live catalog integration.
 - `gci-walmart-sync` — unrelated commercial app in intentional test mode.
+
+---
+
+## 12. Prompt B — 2026-07-31 (draft PR, not merged)
+
+Built `api/lib/ct-order-routing.ts` (`routeOrderToCT()`): classify → claim →
+submit → ledger-status-write per §8's error mapping, `ship_to_installer`
+refusal before any claim (§9), the `buildCtRoutingAlert()` Telegram format
+from §7, and a Sheet column-N PO writer (`writePoNumberByOrderId()` in
+`sheets-client.ts`) that only fires on a confirmed `markSubmitted`.
+`order-router.ts`'s dormant `CT_AUTO_PO_ENABLED` branch now calls it instead
+of `submitPurchaseOrder()` directly (§5, §6 item 2, §8, §9 above all updated
+in this same PR).
+
+**What this PR found, and did NOT build:** the premise that Prompt A shipped
+a Walmart-order → Shopify mirror plus a `walmart-import` webhook-guard tag
+(§1, §7 "Mirror into Shopify is CRITICAL PATH") turned out not to match the
+actual code — `api/walmart-order-sync.ts` has zero Shopify API calls, and a
+repo-wide search for `walmart-import` found nothing. `CT-SESSION-PROMPTS.md`
+frames Prompt B as depending on that mirror; it does not exist. Rather than
+build it as an assumption or invent a different trigger unasked, this PR
+routes only the one real, already-existing call site that has a real Shopify
+order to work with (the Shopify webhook itself) and leaves the Walmart side
+unwired. **`walmart-order-sync.ts` still never calls `routeOrderToCT()`.**
+Building the mirror, or deciding to route Walmart orders to CT some other
+way, is unstarted work — not a subtle gap, a whole missing piece.
