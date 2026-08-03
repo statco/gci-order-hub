@@ -314,9 +314,9 @@ Shopify-checkout orders. `walmart-order-sync.ts` untouched by this PR.
 
 ### PR #66 (stacked on #65) — Walmart mirror
 
-New table `walmart_shopify_mirror` (migration checked in, **not yet applied
-live** — see § 11). Guard tag `gci-walmart-mirror` (see the guard section
-above — not `walmart-import`). Mirrors a Walmart order into Shopify
+New table `walmart_shopify_mirror` (migration checked in, applied live —
+see § 11). Guard tag `gci-walmart-mirror` (see the guard section above — not
+`walmart-import`). Mirrors a Walmart order into Shopify
 (`financial_status: paid` via a `transactions` array, no Customer record, no
 retry on timeout/5xx — same reasoning as `submitOrder()`, see the "NEVER
 BLIND-RETRY" header comment in `walmart-shopify-mirror.ts`). Mirror is
@@ -359,10 +359,7 @@ the live `orders/paid` test confirmed is necessary.
    further check needed before routing Quebec Walmart orders through the
    mirror.
 
-`walmart_shopify_mirror` migration is checked in but **not yet applied** to
-the live Supabase project — that's a separate, still-open step (§ 11), not a
-merge blocker; it only matters once `CT_AUTO_PO_ENABLED` is actually
-flipped.
+`walmart_shopify_mirror` migration is now applied live — see § 11.
 
 ---
 
@@ -543,17 +540,30 @@ Supabase project `enhbckomwdelktdhnuzq` (ca-central-1) is shared across repos.
 
 ## 11. Where this left off — 2026-08-02
 
-### Merged today
+### Merged and applied today
 
 PR #65 and PR #66 both merged to `main`. Both merge-gate decisions resolved
-— see § 5a. `CT_AUTO_PO_ENABLED` is still unset, so `main` is still
-behaviorally inert on the CT-submission path; only the plumbing changed.
+— see § 5a. The `walmart_shopify_mirror` migration is now applied and
+independently verified live on `enhbckomwdelktdhnuzq` (the only Supabase
+project on the account — confirmed via `list_organizations`, one org, one
+project): 13 columns matching `walmart-shopify-mirror.ts` exactly, PK on
+`walmart_po`, CHECK constraint on the 4-value status enum, RLS enabled with
+0 policies (same deliberate service-role-only pattern as `ct_orders`,
+`walmart_order_alerts`, `walmart_sync_cursor`, `xero_tokens`,
+`price_monitor_snapshots`, `chatbot_customers`, `chatbot_conversations`),
+0 rows. Security advisor's `rls_enabled_no_policy` (INFO) flag on it is
+expected and correct, not a gap — same as `ct_orders` already showed before
+this. A pre-existing, unrelated advisor WARN
+(`walmart_shopify_mirror_touch_updated_at`'s mutable `search_path`) mirrors
+`ct_orders_touch_updated_at`'s identical existing pattern — not a new
+issue, no action taken.
+
+`CT_AUTO_PO_ENABLED` is still unset, so `main` remains behaviorally inert on
+the CT-submission path — everything above is plumbing, not live automation
+yet.
 
 ### Left to do before flipping `CT_AUTO_PO_ENABLED` on
 
-- **Apply `walmart_shopify_mirror` migration** to the live Supabase project
-  (checked in, not yet run — this was gated on the PR #66 decisions above,
-  which are now resolved, so this is unblocked).
 - **CT sandbox credentials** — still pending from the CT rep, requested
   2026-07-27. `submitOrder()` has never been called in any environment.
   `customerId 19997` is confirmed for catalog/ship-to search but not yet
@@ -562,7 +572,7 @@ behaviorally inert on the CT-submission path; only the plumbing changed.
   and `CT_DRY_RUN` are independent gates (§ 2) — flipping
   `CT_AUTO_PO_ENABLED=true` while leaving `CT_DRY_RUN` at its default
   (`true`) exercises the whole `classifyLineItems()` → `claimOrder()` →
-  `submitOrder()` path, including a real ledger row, without ever
+  `submitOrder()` path, including real ledger and mirror rows, without ever
   transmitting to CT. That's a safe way to get first telemetry on real
   order traffic before sandbox creds or a real dry-run-off call exist.
 - **First `CT_DRY_RUN=false` call is untested territory regardless.**
