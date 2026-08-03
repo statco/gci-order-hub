@@ -2,7 +2,7 @@
 
 **Repo:** `gci-order-hub`
 **Last updated:** 2026-07-31
-**Status:** Client + ledger merged. Routing wired on draft branches (PR #65 + #66 — see § 5a), held pending review, not yet on `main`. Verification gaps #1 (ledger concurrency) and #4 (orders/paid webhook behavior) in § 6 both CLOSED 2026-07-31 — remaining gaps unchanged.
+**Status:** Client + ledger merged. Routing merged (PR #65 + #66, both merged to `main` 2026-08-02). `CT_AUTO_PO_ENABLED` still unset — automation is wired end-to-end but not yet live. Verification gaps #1 (ledger concurrency) and #4 (orders/paid webhook behavior) in § 6 both CLOSED — remaining gaps unchanged.
 
 **Nothing in this repo can place a real CT order today.** See § Safety Gates.
 
@@ -80,8 +80,8 @@ own, unrelated `walmart-canada` tag on a different app entirely). If you're
 grepping for `walmart-import` anywhere in this repo, stop — it doesn't exist
 and never did.
 
-`order-router.ts` (PR #65/#66, currently draft — not yet on `main`) returns
-200 early, without supplier routing, for any Shopify order tagged
+`order-router.ts` (PR #65/#66, merged to `main` 2026-08-02) returns 200
+early, without supplier routing, for any Shopify order tagged
 `gci-walmart-mirror`.
 
 **This looks like a bug and is not.** The mirror calls the routing function
@@ -289,12 +289,14 @@ PR #65 is currently draft, not yet merged to `main`.
 
 ---
 
-## 5a. Drafted, not yet merged — PR #65 and #66 (2026-07-31)
+## 5a. Merged — PR #65 and #66 (2026-08-02)
 
-Both held pending review; neither is on `main`. `CT_AUTO_PO_ENABLED` remains
-unset regardless, so neither changes live behavior yet.
+Both merged to `main`. `CT_AUTO_PO_ENABLED` remains unset, so this changes
+what the code *can* do, not what it *does* — no behavior change on `main`
+until that gate is explicitly flipped. See § 11 for what's actually left
+before flipping it.
 
-### PR #65 — `claude/ct-order-routing` — CT order routing (Shopify path)
+### PR #65 — CT order routing (Shopify path)
 
 `api/lib/ct-order-routing.ts`: `routeOrderToCT()` — single shared function,
 `classifyLineItems()` → `claimOrder()` → `submitOrder()`, full error mapping
@@ -310,11 +312,11 @@ only on a confirmed `markSubmitted` outcome.
 Wired only to the existing `orders/paid` webhook at this point — real
 Shopify-checkout orders. `walmart-order-sync.ts` untouched by this PR.
 
-### PR #66 — `claude/walmart-shopify-mirror` (stacks on #65) — Walmart mirror
+### PR #66 (stacked on #65) — Walmart mirror
 
-New table `walmart_shopify_mirror` (migration checked in, **not applied
-live**). Guard tag `gci-walmart-mirror` (see the guard section above — not
-`walmart-import`). Mirrors a Walmart order into Shopify
+New table `walmart_shopify_mirror` (migration checked in, **not yet applied
+live** — see § 11). Guard tag `gci-walmart-mirror` (see the guard section
+above — not `walmart-import`). Mirrors a Walmart order into Shopify
 (`financial_status: paid` via a `transactions` array, no Customer record, no
 retry on timeout/5xx — same reasoning as `submitOrder()`, see the "NEVER
 BLIND-RETRY" header comment in `walmart-shopify-mirror.ts`). Mirror is
@@ -330,18 +332,37 @@ inverted-gate mutation). This is the mechanism the Trigger Mechanism section
 above describes — it does not depend on any webhook, which is exactly what
 the live `orders/paid` test confirmed is necessary.
 
-**Three open items, not resolved, block merge:**
-1. Inventory decrement on the mirrored order — Pat's decision, two real
-   options with consequences documented in the PR body, still open.
-2. QST marketplace-facilitator status for Quebec Walmart orders — GST/HST is
-   confirmed (Walmart CA is marketplace facilitator, GCI never holds tax
-   liability, $0 tax on the mirror is correct), but Quebec specifically has
-   not been separately confirmed. Do not let a Quebec order flow through the
-   mirror until this is checked.
-3. `walmart_shopify_mirror` migration is checked in but not applied to the
-   live Supabase project — deliberate, gated on the above two decisions plus
-   at least one day's review before merge, given the stakes (a live credit
-   line and duplicate-order risk).
+### Both merge-gate decisions resolved (2026-08-02)
+
+1. **Inventory decrement on mirrored orders — Option C, no new code.**
+   `gci-brain/api/shopifySync.ts` already runs an hourly (`0 * * * *`,
+   confirmed live in `vercel.json`) `inventory-reconcile` cron that
+   overwrites Shopify's stock with CT's real live quantity, and every synced
+   variant carries `inventory_policy: 'deny'` — Shopify itself refuses to
+   oversell once a SKU hits 0, it isn't just a stale display number. On top
+   of that, `routeOrderToCT()` → `submitOrder()` checks CT's live stock at
+   the moment of submission regardless of what Shopify shows; a race just
+   produces the already-routine `CTInsufficientStockError` → manual-required
+   outcome (§ 8), never a real oversell. A second decrement writer in
+   `gci-order-hub` would only reduce how often that routine outcome fires,
+   in exchange for a second inventory writer fighting the hourly
+   authoritative one in a file explicitly marked "do not touch, live catalog
+   integration" (§ 11). Decided not worth it. Revisit only if live data
+   later shows manual-required firing often enough to be a real drag — that
+   would be a "the numbers say so" call, not a pre-launch one.
+2. **QST marketplace-facilitator status for Quebec — confirmed.** Walmart's
+   own bi-weekly payout statement for a real Quebec-bound sale ($187.99
+   product price) showed `Net tax collected: $0.00` and
+   `Other taxes (fee): $0.00` — Walmart holds 100% of tax collection and
+   remittance and never passes it through the seller payout, same
+   marketplace-facilitator behavior already confirmed for GST/HST. No
+   further check needed before routing Quebec Walmart orders through the
+   mirror.
+
+`walmart_shopify_mirror` migration is checked in but **not yet applied** to
+the live Supabase project — that's a separate, still-open step (§ 11), not a
+merge blocker; it only matters once `CT_AUTO_PO_ENABLED` is actually
+flipped.
 
 ---
 
@@ -356,13 +377,12 @@ the live `orders/paid` test confirmed is necessary.
    post-cleanup: 0. PostgREST's 409 on unique-constraint conflict is
    correctly translated into claimed:false by the real code path, not
    just by DB-level inspection. No longer blocks CT_DRY_RUN=false.
-2. **`ct_orders` is empty; the ledger is wired on draft branches, not yet
-   live.** `claimOrder()`/`buildPoNumber()` are now called from
-   `routeOrderToCT()` (PR #65) and, for the mirror path, from
-   `maybeRouteToCT()` (PR #66) — see § 5a. Neither PR is merged to `main`,
-   and `CT_AUTO_PO_ENABLED` is unset regardless, so the ledger remains
-   unexercised in production until both merge and that gate is explicitly
-   flipped on.
+2. **`ct_orders` is empty; the ledger is merged, not yet live.**
+   `claimOrder()`/`buildPoNumber()` are now called from `routeOrderToCT()`
+   (PR #65) and, for the mirror path, from `maybeRouteToCT()` (PR #66) — see
+   § 5a. Both merged to `main` 2026-08-02. `CT_AUTO_PO_ENABLED` is still
+   unset, so the ledger remains unexercised in production until that gate
+   is explicitly flipped on — see § 11 for what's left before that.
 3. **Submit Order has never been called** in any environment.
    `customerId 19997` is unconfirmed for that endpoint specifically.
 4. ✅ **CLOSED 2026-07-31 (partially — see caveat).** `orders/paid` confirmed
@@ -384,12 +404,12 @@ the live `orders/paid` test confirmed is necessary.
 
 ## 7. Walmart channel
 
-### Telegram has NEVER fired for a Walmart order in production
+### Telegram will fire for a Walmart order once CT_AUTO_PO_ENABLED flips on
 
-Was an **unbuilt feature, not a regression**, through 2026-07-30. **Built on
-PR #66 (draft, not merged)** as of 2026-07-31 — notification is wired into
-the mirror flow described in § 5a. Still does not fire in production until
-#66 merges.
+Was an **unbuilt feature, not a regression**, through 2026-07-30. **Built and
+merged (PR #66)** as of 2026-08-02 — notification is wired into the mirror
+flow described in § 5a. Still won't fire in production until
+`CT_AUTO_PO_ENABLED` is set — see § 11.
 
 `/api/walmart-order-sync` runs every 15 min (96 runs/24h, zero errors over 7
 days). `/api/ct-tracking-parser` runs 48×/day, zero errors — **its actual
@@ -402,6 +422,17 @@ Walmart PO# `309120965612142`, order# `600000112174518`, 2026-07-26,
 SKU `200E1059`, $194.99, Acknowledged/Unshipped, ship-by 07/27,
 deliver-by 07/30. Found by manually checking the dashboard. Acknowledged
 manually. Nothing alerted.
+
+### New-seller payment hold (noted 2026-08-02)
+
+Walmart's bi-weekly payout statements can show a `Seller Payment hold` —
+seen on the Jun 20–Jul 4, 2026 statement (`Amount on Hold: $0.00`,
+`Released amount: $629.37` for that period, i.e. a prior hold being
+released, not a new one). This is a standard new-seller review hold, not an
+account or integration problem — releases automatically once the account
+hits $1,000+ in payments or 90 days, whichever comes first. Don't mistake
+it for a real issue if it shows up on a future statement; confirm current
+status in Seller Center if it ever needs a real answer.
 
 ### Decisions taken 2026-07-27
 
@@ -471,8 +502,8 @@ creating Shopify orders or acknowledging on Walmart.
 
 - **`order-router.ts` `ship_to_installer` branch** sends empty
   `address1`/`city`/`province`/`postalCode`. Since PR #47 this throws
-  `CTValidationError` when auto-PO is attempted. **Fixed 2026-07-31 by PR #65**
-  (draft, not merged) — explicitly refuses auto-PO on that branch, confirmed
+  `CTValidationError` when auto-PO is attempted. **Fixed by PR #65, merged
+  2026-08-02** — explicitly refuses auto-PO on that branch, confirmed
   refused **before** `classifyLineItems()`/`claimOrder()` run, routes to
   manual notify. Installer drop-ship remains deferred until a real installer
   list exists — the fields themselves are still never populated.
@@ -510,30 +541,34 @@ Supabase project `enhbckomwdelktdhnuzq` (ca-central-1) is shared across repos.
 
 ---
 
-## 11. Where this left off — 2026-07-31
+## 11. Where this left off — 2026-08-02
 
-### Blocked
+### Merged today
 
-- **CT sandbox credentials.** Requested from the CT rep 2026-07-27, still
-  pending. Required to exercise Submit Order without creating a real
-  billable order.
+PR #65 and PR #66 both merged to `main`. Both merge-gate decisions resolved
+— see § 5a. `CT_AUTO_PO_ENABLED` is still unset, so `main` is still
+behaviorally inert on the CT-submission path; only the plumbing changed.
 
-### Held for explicit decision (not blocked, just not decided)
+### Left to do before flipping `CT_AUTO_PO_ENABLED` on
 
-- **PR #65** (CT order routing, Shopify path) and **PR #66** (Walmart
-  mirror, stacks on #65) — both draft, both mergeable, both hold no live
-  effect since `CT_AUTO_PO_ENABLED` is unset. See § 5a for full detail.
-  Do not merge either until:
-  - Inventory decrement decision made (Pat's call, PR #66 body)
-  - QST marketplace-facilitator status confirmed for Quebec orders
-  - At least one day's sit/review time given the stakes (live credit line)
-
-  Merge order: #65 first, then #66 (or squash both together).
-
-### Ready to do
-
-- Nothing currently blocked on this repo's own code — the remaining open
-  items are either external (CT sandbox creds) or deliberate holds (above).
+- **Apply `walmart_shopify_mirror` migration** to the live Supabase project
+  (checked in, not yet run — this was gated on the PR #66 decisions above,
+  which are now resolved, so this is unblocked).
+- **CT sandbox credentials** — still pending from the CT rep, requested
+  2026-07-27. `submitOrder()` has never been called in any environment.
+  `customerId 19997` is confirmed for catalog/ship-to search but not yet
+  specifically for Submit Order.
+- **Consider a `CT_DRY_RUN`-still-true test flip first.** `CT_AUTO_PO_ENABLED`
+  and `CT_DRY_RUN` are independent gates (§ 2) — flipping
+  `CT_AUTO_PO_ENABLED=true` while leaving `CT_DRY_RUN` at its default
+  (`true`) exercises the whole `classifyLineItems()` → `claimOrder()` →
+  `submitOrder()` path, including a real ledger row, without ever
+  transmitting to CT. That's a safe way to get first telemetry on real
+  order traffic before sandbox creds or a real dry-run-off call exist.
+- **First `CT_DRY_RUN=false` call is untested territory regardless.**
+  Everything to date (including the 2026-08-02 manual PO `GCI-2026-447270`)
+  has been manual. The first real `submitOrder()` call — sandbox or
+  production — has no precedent to lean on.
 
 ### Standing questions to CT rep
 
