@@ -544,19 +544,36 @@ Supabase project `enhbckomwdelktdhnuzq` (ca-central-1) is shared across repos.
 
 PR #65 and PR #66 both merged to `main`. Both merge-gate decisions resolved
 — see § 5a. The `walmart_shopify_mirror` migration is now applied and
-independently verified live on `enhbckomwdelktdhnuzq` (the only Supabase
-project on the account — confirmed via `list_organizations`, one org, one
-project): 13 columns matching `walmart-shopify-mirror.ts` exactly, PK on
-`walmart_po`, CHECK constraint on the 4-value status enum, RLS enabled with
-0 policies (same deliberate service-role-only pattern as `ct_orders`,
-`walmart_order_alerts`, `walmart_sync_cursor`, `xero_tokens`,
-`price_monitor_snapshots`, `chatbot_customers`, `chatbot_conversations`),
-0 rows. Security advisor's `rls_enabled_no_policy` (INFO) flag on it is
-expected and correct, not a gap — same as `ct_orders` already showed before
-this. A pre-existing, unrelated advisor WARN
-(`walmart_shopify_mirror_touch_updated_at`'s mutable `search_path`) mirrors
-`ct_orders_touch_updated_at`'s identical existing pattern — not a new
-issue, no action taken.
+independently verified live on `enhbckomwdelktdhnuzq` — the only Supabase
+project on the account as of this update.
+
+**Duplicate project note (per Pat, 2026-08-03):** a second, empty duplicate
+Supabase project (`gqaylwkfiokwsccibvxg`) existed briefly — a leftover
+shell from an earlier, never-executed plan to move `gci-order-hub` onto
+its own dedicated project — and Pat deleted it directly via the Supabase
+dashboard. A separate Claude Code session reportedly observed the
+`list_projects` before/after transition live (two projects, then one,
+immediately after deletion); that session's tool-call history is not
+accessible from this one, so that specific observation is relayed here,
+not independently verified by this session. What this session has
+verified directly: `list_projects`, run three times across two separate
+tasks — including once immediately before this note was written — has
+only ever returned `enhbckomwdelktdhnuzq`, consistent with Pat's report
+and with there being no duplicate project today. That backlog item
+(moving off the shared project) is now moot — if it's ever wanted again,
+it would need a fresh project, not a resume of this one.
+
+`walmart_shopify_mirror` itself: 13 columns matching
+`walmart-shopify-mirror.ts` exactly, PK on `walmart_po`, CHECK constraint on
+the 4-value status enum, RLS enabled with 0 policies (same deliberate
+service-role-only pattern as `ct_orders`, `walmart_order_alerts`,
+`walmart_sync_cursor`, `xero_tokens`, `price_monitor_snapshots`,
+`chatbot_customers`, `chatbot_conversations`), 0 rows. Security advisor's
+`rls_enabled_no_policy` (INFO) flag on it is expected and correct, not a
+gap — same as `ct_orders` already showed before this. A pre-existing,
+unrelated advisor WARN (`walmart_shopify_mirror_touch_updated_at`'s mutable
+`search_path`) mirrors `ct_orders_touch_updated_at`'s identical existing
+pattern — not a new issue, no action taken.
 
 `CT_AUTO_PO_ENABLED` is still unset, so `main` remains behaviorally inert on
 the CT-submission path — everything above is plumbing, not live automation
