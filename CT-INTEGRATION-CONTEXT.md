@@ -1,7 +1,7 @@
 # Canada Tire (CT) Order Automation — Working Context
 
 **Repo:** `gci-order-hub`
-**Last updated:** 2026-08-02
+**Last updated:** 2026-08-05
 **Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **New blocker discovered same night, unresolved:** a Shopify plan-tier PII-access gap — see § 10a. Do not consider flipping `CT_DRY_RUN` until § 10a is closed.
 
 **Nothing in this repo can place a real CT order today.** See § Safety Gates.
@@ -460,6 +460,35 @@ hits $1,000+ in payments or 90 days, whichever comes first. Don't mistake
 it for a real issue if it shows up on a future statement; confirm current
 status in Seller Center if it ever needs a real answer.
 
+### Supabase key rotation outage (2026-08-04 to 2026-08-05)
+
+`SUPABASE_SERVICE_ROLE_KEY` was rotated in Supabase but the new value
+wasn't picked up in Vercel production until an explicit redeploy was
+triggered — updating the env var alone does not restart already-running
+serverless functions. Result: every Supabase write from this repo
+(`walmart_sync_cursor`, `walmart_shopify_mirror`, `walmart_order_alerts`)
+failed with `401 Unregistered API key` for ~26 hours
+(`2026-08-04T16:44:11Z` to `2026-08-05T18:34:35Z`, confirmed via
+`get_runtime_errors` — 717 occurrences on `/api/walmart-sync-cursor`
+alone). Cursor tracking, mirroring, and alerting were all silently dead
+for the whole window; at least one real Walmart order
+(`309121867847467`) had to be processed manually as a result, caught only
+because the repeated failure alert was noticed in Telegram.
+
+Fixed by: rotating the key (again, to a value both sides agree on),
+updating Vercel, and triggering an explicit redeploy. Confirmed resolved
+by: zero new `Unregistered API key` errors in the 15 minutes following the
+redeploy, and the next real order (`309121867847467` → Shopify `#1009`)
+mirroring clean on the first attempt (`walmart_shopify_mirror.attempt_count
+= 1`, `error_name = null`).
+
+**No monitoring exists to catch this automatically.** This was caught by a
+human noticing repeated Telegram failure alerts, not by any alerting on
+the underlying error rate. Worth considering: an alert on sustained
+Supabase write failures specifically, independent of any one order's
+retry alert, so a credential-level outage like this doesn't require a
+human to notice a pattern across multiple messages.
+
 ### Decisions taken 2026-07-27
 
 - **Auto-acknowledge on Walmart.** Previously manual. Walmart expects
@@ -564,6 +593,16 @@ creating Shopify orders or acknowledging on Walmart.
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase dashboard | **never commit** |
 
 Supabase project `enhbckomwdelktdhnuzq` (ca-central-1) is shared across repos.
+
+**🔴 Any change to an env var in Vercel requires an explicit redeploy to
+take effect on already-running serverless functions — saving the value in
+Vercel's dashboard alone does nothing until something redeploys.** This
+has caused real confusion twice in one night: once with `CT_AUTO_PO_ENABLED`
+(§ 2) and once with `SUPABASE_SERVICE_ROLE_KEY` (§ 7, "Supabase key
+rotation outage") causing a ~26-hour silent outage. After changing any env
+var here, always trigger an explicit redeploy and verify via
+`get_runtime_errors` or equivalent — do not assume the new value is live
+just because Vercel shows it saved.
 
 ---
 
