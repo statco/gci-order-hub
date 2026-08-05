@@ -1,8 +1,8 @@
 # Canada Tire (CT) Order Automation — Working Context
 
 **Repo:** `gci-order-hub`
-**Last updated:** 2026-07-31
-**Status:** Client + ledger merged. Routing merged (PR #65 + #66, both merged to `main` 2026-08-02). `CT_AUTO_PO_ENABLED` still unset — automation is wired end-to-end but not yet live. Verification gaps #1 (ledger concurrency) and #4 (orders/paid webhook behavior) in § 6 both CLOSED — remaining gaps unchanged.
+**Last updated:** 2026-08-02
+**Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **New blocker discovered same night, unresolved:** a Shopify plan-tier PII-access gap — see § 10a. Do not consider flipping `CT_DRY_RUN` until § 10a is closed.
 
 **Nothing in this repo can place a real CT order today.** See § Safety Gates.
 
@@ -105,16 +105,23 @@ real backstop regardless.
 
 | Variable | Vercel state | Default if unset | Effect |
 |---|---|---|---|
-| `CT_AUTO_PO_ENABLED` | **UNSET** (confirmed 2026-07-27) | `false` | no auto-PO |
+| `CT_AUTO_PO_ENABLED` | **`true`** (flipped 2026-08-02, Vercel production) | `false` | routing engages for real |
 | `CT_DRY_RUN` | unset | `true` | nothing transmitted |
 | `CT_ENVIRONMENT` | unset | `sandbox` | non-production realm |
 
 `CT_DRY_RUN` requires the exact string `'false'` to transmit. Any other value,
 including unset, means dry-run.
 
-**Deploying current `main` is behaviourally identical to before this work
-began.** No real order can be placed. Do not set any of these three without an
-explicit decision recorded in a PR.
+**No longer "identical to before this work began."** With `CT_AUTO_PO_ENABLED`
+now `true`, any real order (Walmart-mirrored or direct Shopify) that comes in
+now genuinely runs `classifyLineItems()` → `claimOrder()` → a real
+`ct_orders` row with a real burned PO number → an attempted `submitOrder()`
+call. `CT_DRY_RUN` intercepts that last step before anything reaches CT, so
+**no real order can be placed** — that guarantee still holds — but `ct_orders`
+is no longer reliably empty, and any real order since the flip should be
+checked next session. Do not set `CT_DRY_RUN` or `CT_ENVIRONMENT` without an
+explicit decision recorded in a PR — same rule as always, now higher-stakes
+given `CT_AUTO_PO_ENABLED` is live.
 
 ---
 
@@ -359,7 +366,29 @@ the live `orders/paid` test confirmed is necessary.
    further check needed before routing Quebec Walmart orders through the
    mirror.
 
-`walmart_shopify_mirror` migration is now applied live — see § 11.
+`walmart_shopify_mirror` migration is now applied and independently
+verified live on `enhbckomwdelktdhnuzq` — the only Supabase project on the
+account. There was briefly a second, empty duplicate project
+(`gqaylwkfiokwsccibvxg`) visible via `list_projects` — created 2026-07-29,
+zero tables, a leftover shell from an earlier, never-executed plan to move
+gci-order-hub onto its own dedicated project. Confirmed via a direct
+before/after: `list_projects` showed two projects, Pat deleted the empty
+one from the Supabase dashboard, `list_projects` immediately after showed
+exactly one remaining (`enhbckomwdelktdhnuzq`). That backlog item (moving
+off the shared project) is now moot — if it's ever wanted again, it would
+need a fresh project, not a resume of this one.
+
+`walmart_shopify_mirror` itself: 13 columns matching
+`walmart-shopify-mirror.ts` exactly, PK on `walmart_po`, CHECK constraint
+on the 4-value status enum, RLS enabled with 0 policies (same deliberate
+service-role-only pattern as `ct_orders`, `walmart_order_alerts`,
+`walmart_sync_cursor`, `xero_tokens`, `price_monitor_snapshots`,
+`chatbot_customers`, `chatbot_conversations`), 0 rows. Security advisor's
+`rls_enabled_no_policy` (INFO) flag on it is expected and correct, not a
+gap — same as `ct_orders` already showed before this. A pre-existing,
+unrelated advisor WARN (`walmart_shopify_mirror_touch_updated_at`'s
+mutable `search_path`) mirrors `ct_orders_touch_updated_at`'s identical
+existing pattern — not a new issue, no action taken.
 
 ---
 
@@ -522,7 +551,7 @@ creating Shopify orders or acknowledging on Walmart.
 | `CT_CUSTOMER_API_TOKEN` | set in Vercel | the `d!U3^…` value; pairs with 19997 |
 | `CT_CUSTOMER_ID` | `19997` | defaults to 19997 with warning if unset |
 | `CT_ENVIRONMENT` | default `sandbox` | `production` to activate |
-| `CT_AUTO_PO_ENABLED` | **UNSET** | `true` to enable |
+| `CT_AUTO_PO_ENABLED` | **`true`** (set 2026-08-02) | routing is live for real orders |
 | `CT_DRY_RUN` | default `true` | must be exact string `'false'` to transmit |
 | `CT_ACCOUNT_ID_PROD` | `8031691` | |
 | `CT_ACCOUNT_ID_SANDBOX` | `8031691_SB1` | |
@@ -538,64 +567,127 @@ Supabase project `enhbckomwdelktdhnuzq` (ca-central-1) is shared across repos.
 
 ---
 
+## 10a. 🔴 Shopify plan/PII access gap — discovered 2026-08-02, unresolved
+
+**This is the current top blocker. Do not flip `CT_DRY_RUN` until this is
+closed and re-verified.**
+
+### What was found
+
+Store is on Shopify **Basic** plan (confirmed live via GraphQL
+`shop.plan.displayName`). Basic plan lacks API access to customer PII
+(name, address, phone) — confirmed on the real, unmodified, merged
+`mirrorWalmartOrderToShopify()`, not just by analogy to manual testing:
+
+- The function's real request payload (captured in
+  `walmart_shopify_mirror.request_payload`) correctly included full
+  synthetic PII.
+- Shopify's own create-response (captured in
+  `walmart_shopify_mirror.response_payload`) had stripped it down to
+  `country`/`province`/`country_code`/`province_code` only.
+- A subsequent independent GraphQL read of the same order returned explicit
+  `ACCESS_DENIED`: *"This app is not approved to access the Customer
+  object. Access to personally identifiable information (PII)... is only
+  available on Shopify, Advanced, and Plus plans."*
+
+Test order (`#1008`, `7169661075504`) and its ledger row were deleted after
+capturing this evidence. Confirmed via `list_tables`/`execute_sql`
+post-cleanup: 0 rows.
+
+### What was confirmed NOT affected — both real production paths, verified via code
+
+**Walmart mirror path:** `maybeRouteToCT()` builds its CT `shipTo` fields
+from `order.shippingInfo.postalAddress` — the original Walmart API data,
+held in memory — never re-reads the address back from Shopify. Not exposed
+to this issue regardless of plan/approval status.
+
+**Direct Shopify order path:** `order-router.ts`'s `orders/paid` webhook
+handler builds `shipTo` directly from the parsed webhook POST body
+(`order.shipping_address`/`billing_address`) — HMAC-verified against that
+same raw body, zero outbound `fetch()` calls anywhere in the file. Never
+re-reads via API either.
+
+**The one genuinely open question, confirmed unverified by two independent
+sources (Claude Code's code read AND a separately-consulted Shopify AI
+agent both said the same thing: don't assume):** whether Shopify's PII
+restriction can also redact fields **inside the webhook payload itself**
+before delivery, as opposed to only Admin API reads/writes. Nothing tested
+tonight exercised a real webhook delivery — only Admin API create + GraphQL
+read. Next real Shopify checkout order's `ct_orders.request_payload` will
+answer this for free, no test needed — check it next session if one has
+come in.
+
+### Plan question — Grow, not Advanced, is very likely sufficient, but not yet empirically confirmed
+
+Shopify renamed its mid-tier "Shopify" plan to **"Grow"** in early 2026 —
+same plan, same price, new name (multiple independent sources confirm
+this). So *"available on Shopify, Advanced, and Plus plans"* in the error
+message means Grow ($79 USD/mo) should qualify, not the $299/mo Advanced
+tier. Confirmed against Shopify's own Help Center, verbatim:
+*"To access Custom Level 2 PII apps, your store must be on the Grow plan or
+higher... If you sign up for or downgrade your plan to either the Basic
+plan or the Starter plan, then you won't have access."*
+(`help.shopify.com/en/manual/apps/app-types/custom-apps`)
+
+**Caveat, found independently, not from either AI source consulted
+tonight:** a Shopify community thread describes a developer whose custom
+app worked fine across multiple Basic-plan stores for nearly a year, then
+hit this exact same error on one new store despite identical permissions —
+suggesting plan tier alone hasn't reliably been the whole story for every
+custom app. **Do not treat the plan upgrade as a guaranteed fix without
+re-testing after.**
+
+### Decided path forward (Pat, 2026-08-02) — holding until plan change made
+
+1. Upgrade store to **Grow** ($79/mo) — not Advanced.
+2. After upgrading: regenerate the Admin API access token (Settings → Apps
+   and sales channels → Develop apps → the custom app → API credentials).
+   A Shopify AI agent flagged this as commonly missed — plan upgrade alone,
+   without token rotation, is a known reason merchants still see PII
+   redacted immediately after upgrading. Unverified independently, but
+   cheap to just do regardless.
+3. Re-test with a **direct GraphQL read** against an existing order (`#1003`
+   or `#1008`'s replacement) — same query used tonight
+   (`shippingAddress { firstName lastName address1 city province zip
+   phone }`). If it comes back full, this gap is closed. If not, escalate
+   to Shopify Support directly with this store's specifics — don't guess a
+   second time.
+4. Only after that: consider whether the webhook-payload question (above)
+   still needs separate verification, or whether the plan fix + a genuine
+   incoming order settles both at once.
+
+**Session paused here at Pat's request pending the plan change — resume
+from step 2 above once upgraded.**
+
+---
+
 ## 11. Where this left off — 2026-08-02
 
-### Merged and applied today
+### The real state, in order of what actually happened tonight
 
-PR #65 and PR #66 both merged to `main`. Both merge-gate decisions resolved
-— see § 5a. The `walmart_shopify_mirror` migration is now applied and
-independently verified live on `enhbckomwdelktdhnuzq` — the only Supabase
-project on the account as of this update.
+1. PR #65 and #66 merged, both merge-gate decisions resolved, migration
+   applied live — see § 5a.
+2. `CT_AUTO_PO_ENABLED` flipped to `true` in Vercel production — see § 2.
+3. Attempted to capture a real CT dry-run payload → discovered the PII
+   access gap along the way — see **§ 10a, now the actual blocker.**
 
-**Duplicate project note (per Pat, 2026-08-03):** a second, empty duplicate
-Supabase project (`gqaylwkfiokwsccibvxg`) existed briefly — a leftover
-shell from an earlier, never-executed plan to move `gci-order-hub` onto
-its own dedicated project — and Pat deleted it directly via the Supabase
-dashboard. A separate Claude Code session reportedly observed the
-`list_projects` before/after transition live (two projects, then one,
-immediately after deletion); that session's tool-call history is not
-accessible from this one, so that specific observation is relayed here,
-not independently verified by this session. What this session has
-verified directly: `list_projects`, run three times across two separate
-tasks — including once immediately before this note was written — has
-only ever returned `enhbckomwdelktdhnuzq`, consistent with Pat's report
-and with there being no duplicate project today. That backlog item
-(moving off the shared project) is now moot — if it's ever wanted again,
-it would need a fresh project, not a resume of this one.
+### Left to do — supersedes anything below that assumed § 10a didn't exist
 
-`walmart_shopify_mirror` itself: 13 columns matching
-`walmart-shopify-mirror.ts` exactly, PK on `walmart_po`, CHECK constraint on
-the 4-value status enum, RLS enabled with 0 policies (same deliberate
-service-role-only pattern as `ct_orders`, `walmart_order_alerts`,
-`walmart_sync_cursor`, `xero_tokens`, `price_monitor_snapshots`,
-`chatbot_customers`, `chatbot_conversations`), 0 rows. Security advisor's
-`rls_enabled_no_policy` (INFO) flag on it is expected and correct, not a
-gap — same as `ct_orders` already showed before this. A pre-existing,
-unrelated advisor WARN (`walmart_shopify_mirror_touch_updated_at`'s mutable
-`search_path`) mirrors `ct_orders_touch_updated_at`'s identical existing
-pattern — not a new issue, no action taken.
+Everything here is gated on § 10a closing first:
 
-`CT_AUTO_PO_ENABLED` is still unset, so `main` remains behaviorally inert on
-the CT-submission path — everything above is plumbing, not live automation
-yet.
-
-### Left to do before flipping `CT_AUTO_PO_ENABLED` on
-
+- **Upgrade to Grow, rotate token, re-verify via direct GraphQL read** —
+  § 10a steps 1-3. This is genuinely the next action, nothing else should
+  happen before it.
+- **Once § 10a is closed:** check whether any real order has landed in
+  `ct_orders` since `CT_AUTO_PO_ENABLED` went live tonight — it may no
+  longer be empty. Review any such row before assuming everything's fine.
 - **CT sandbox credentials** — still pending from the CT rep, requested
-  2026-07-27. `submitOrder()` has never been called in any environment.
-  `customerId 19997` is confirmed for catalog/ship-to search but not yet
-  specifically for Submit Order.
-- **Consider a `CT_DRY_RUN`-still-true test flip first.** `CT_AUTO_PO_ENABLED`
-  and `CT_DRY_RUN` are independent gates (§ 2) — flipping
-  `CT_AUTO_PO_ENABLED=true` while leaving `CT_DRY_RUN` at its default
-  (`true`) exercises the whole `classifyLineItems()` → `claimOrder()` →
-  `submitOrder()` path, including real ledger and mirror rows, without ever
-  transmitting to CT. That's a safe way to get first telemetry on real
-  order traffic before sandbox creds or a real dry-run-off call exist.
-- **First `CT_DRY_RUN=false` call is untested territory regardless.**
-  Everything to date (including the 2026-08-02 manual PO `GCI-2026-447270`)
-  has been manual. The first real `submitOrder()` call — sandbox or
-  production — has no precedent to lean on.
+  2026-07-27, unrelated to § 10a. `submitOrder()` has never been called in
+  any environment; `customerId 19997` unconfirmed for that endpoint
+  specifically.
+- **First `CT_DRY_RUN=false` call is untested territory regardless of § 10a
+  being resolved.** Everything to date, including the 2026-08-02 manual PO
+  `GCI-2026-447270`, has been manual.
 
 ### Standing questions to CT rep
 
