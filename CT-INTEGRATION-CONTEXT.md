@@ -1,7 +1,7 @@
 # Canada Tire (CT) Order Automation — Working Context
 
 **Repo:** `gci-order-hub`
-**Last updated:** 2026-08-05
+**Last updated:** 2026-08-06
 **Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **New blocker discovered same night, unresolved:** a Shopify plan-tier PII-access gap — see § 10a. Do not consider flipping `CT_DRY_RUN` until § 10a is closed.
 
 **Nothing in this repo can place a real CT order today.** See § Safety Gates.
@@ -488,6 +488,33 @@ the underlying error rate. Worth considering: an alert on sustained
 Supabase write failures specifically, independent of any one order's
 retry alert, so a credential-level outage like this doesn't require a
 human to notice a pattern across multiple messages.
+
+### Heartbeat now counts new orders, not raw fetch count (2026-08-06)
+
+`recordRunAndMaybeHeartbeat()` (`api/lib/sync-heartbeat.ts`, called from
+`/api/walmart-order-sync`) previously received the raw count of orders
+returned by `fetchRecentOrders()` for the rolling lookback window — which
+re-includes every order still inside that window on every run (96
+runs/day), not genuinely new ones. Fixed (gci-order-hub#72) to pass
+`newOrders.length` (post-Sheet-dedup) instead, matching what a human means
+by "orders seen today."
+
+**Trade-off, deliberate, not yet resolved either way:** the heartbeat call
+was originally placed before any downstream call specifically so a broken
+alert/ack/Sheet step could never suppress the "sync is alive" signal.
+Computing `newOrders` requires the Google Sheet lookup, which now runs
+before the heartbeat call — so the heartbeat is no longer fully
+independent of a Sheet outage. A Sheet-lookup failure still isn't silent
+(it throws up to the handler's outer catch, which sends its own
+`walmart-order-sync ERROR` Telegram alert) but that run's count won't land
+in the heartbeat's 24h accumulator.
+
+**Open, not decided:** whether a second, Sheet-independent "did the
+Walmart API respond at all" counter is still wanted alongside this one,
+now that the heartbeat's guarantee is narrower than the original design.
+Nobody has asked for it yet; flagged in code comments at both the call
+site (`api/walmart-order-sync.ts`) and `sync-heartbeat.ts`'s JSDoc if it
+comes up later.
 
 ### Decisions taken 2026-07-27
 
