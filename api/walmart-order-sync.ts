@@ -438,11 +438,34 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     // longer gates what was just fetched above.
     const since = await getSyncSince();
 
-    // Runs on every invocation (all ~96/day), independent of everything
-    // below — a broken alert or ack step must not suppress the one signal
-    // that would show the sync itself has gone quiet. Never throws. Routed
-    // to the INFO channel — a periodic summary, not a per-order action item.
-    await recordRunAndMaybeHeartbeat(orders.length, since, (text) => sendTelegramMessage(text, 'info'));
+    // Sheet lookup — used for three purposes below: (a) the heartbeat count
+    // just after this (b) reconciliation logging (every fetched order), (c)
+    // gating acknowledge/Sheet-row-append (Sheet-new orders only). It does
+    // NOT gate alerting — see alertOrders()'s docstring for why. Skipped
+    // entirely when there are no orders to dedupe, so an empty-window run
+    // (~95 of 96/day) still costs zero Sheet API calls, same as before.
+    const existingIds = orders.length > 0 ? await getSheetOrderIds(SHEET_ID) : new Set<string>();
+    const newOrders = orders.filter((o) => !existingIds.has(o.purchaseOrderId));
+
+    // Runs on every invocation (all ~96/day), independent of the
+    // alert/ack/mirror/CT-routing steps below — a broken one of those must
+    // not suppress the one signal that would show the sync itself has gone
+    // quiet. Never throws. Routed to the INFO channel — a periodic summary,
+    // not a per-order action item.
+    //
+    // Counts newOrders (post-Sheet-dedup), NOT the raw Walmart fetch count —
+    // this now depends on the Sheet lookup above succeeding, which is a
+    // narrower guarantee than before (previously this ran before ANY
+    // downstream call, including the Sheet lookup, so a broken Sheet
+    // integration could never suppress it). A Sheet-lookup failure here
+    // throws up to the handler's outer catch, which still sends its own
+    // "walmart-order-sync ERROR" Telegram alert (see bottom of this
+    // function) — so a Sheet outage isn't silent, it just surfaces as that
+    // alert instead of a missing heartbeat count for this run. If a
+    // Sheet-independent "did the Walmart API respond at all" signal is
+    // still wanted alongside this one, that's a second, separate counter —
+    // not implemented here.
+    await recordRunAndMaybeHeartbeat(newOrders.length, since, (text) => sendTelegramMessage(text, 'info'));
 
     if (orders.length === 0) {
       // Nothing to process this run — still advance the observability cursor
@@ -451,12 +474,6 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
       console.log('[order-sync] No orders in fetch window');
       return res.status(200).json({ message: 'No new orders', processed: 0 });
     }
-
-    // Sheet lookup — used for two DIFFERENT, now-decoupled purposes below:
-    // (a) reconciliation logging (every fetched order), (b) gating
-    // acknowledge/Sheet-row-append (Sheet-new orders only). It does NOT gate
-    // alerting — see alertOrders()'s docstring for why.
-    const existingIds = await getSheetOrderIds(SHEET_ID);
 
     // Reconciliation: log sheet/ledger/cutoff/cancelled state for every
     // order fetched this run, independent of what gates alerting or
@@ -493,11 +510,10 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     //    it's retried, not permanently marked alerted. Never throws.
     await alertOrders(orders, alertCutoffMs);
 
-    // Sheet dedup — decoupled from alerting above. Only gates duplicate
-    // acknowledge calls and duplicate Sheet rows; see reconcile log lines
-    // above for per-order alert state.
-    const newOrders = orders.filter((o) => !existingIds.has(o.purchaseOrderId));
-
+    // newOrders (Sheet dedup, decoupled from alerting above) was already
+    // computed above, alongside existingIds, for the heartbeat call. Only
+    // gates duplicate acknowledge calls and duplicate Sheet rows; see
+    // reconcile log lines above for per-order alert state.
     if (newOrders.length === 0) {
       // Every fetched order already has a Sheet row — nothing left to
       // acknowledge or log. Says nothing about whether any of them alerted.

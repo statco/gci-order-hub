@@ -71,8 +71,13 @@ function parseState(raw: string | null): HeartbeatState {
 /**
  * Record this run and, roughly once every 24h, send a summary Telegram
  * message and reset the counting window.
- * @param ordersSeenThisRun orders returned by fetchRecentOrders this run
- *   (pre-Sheet-dedup — the raw "did Walmart's API give us anything" signal)
+ * @param ordersSeenThisRun NEW orders this run — post-Sheet-dedup, matching
+ *   what a human means by "orders seen today" (not the raw count returned by
+ *   fetchRecentOrders, which re-includes every order still inside the
+ *   rolling fetch window on every run). As of the caller's current wiring
+ *   this also means the count depends on the Sheet lookup succeeding, unlike
+ *   a raw fetch-count would — see the call site in walmart-order-sync.ts for
+ *   what that trades away.
  * @param cursorIso the sync cursor value in effect for this run, so the
  *   heartbeat also surfaces a stuck/stale cursor
  * @param sendFn injected so this module doesn't import lib/telegram.js
