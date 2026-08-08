@@ -5,6 +5,8 @@
 > identically across all 6 repos below so it's available no matter which one you
 > land in first. If you update it, update all 6 copies.
 >
+> **2026-08-08**: gcitires-chatbot chat-timeout fix + first-ever monitoring build-out — see "Session update — 2026-08-08" at the end of this doc.
+>
 > Last written: 2026-07-01, last updated: 2026-07-29 end-of-session (after
 > the Walmart order-capture root-cause fix + canonical CT PO number format
 > pass — gci-order-hub#50/#51/#52/#54/#55 — and a same-night audit of
@@ -43,7 +45,7 @@ actual current purpose (some don't; see §4).
 | **gci-brain** | Shopify catalog/SEO/marketing engine. Owns: CT→Shopify catalog sync (`shopifySync.ts`), GMC/Microsoft Merchant feeds, SEO backfill, social media scheduler, blog publisher, installer booking UI (AI Match), `/api/airtable` + `/api/send-email` proxies used by other repos. | `gci-brain.vercel.app`, custom domain `match.gcitires.com` | ✅ core catalog/SEO pipeline working. ⛔ GMC account suspended (business action needed, not code). See §5. |
 | **gci-order-hub** | Order automation for GCI's own Shopify store: Shopify `orders/paid` webhook → routes to CT (TIRE- SKUs) → installer dispatch → Walmart price/inventory cron sync (`/api/walmart-sync`, `/api/walmart-sync-cursor`, `/api/walmart-ship`, etc.) → separately, `/api/walmart-order-sync` (Walmart *order capture*, not price/inventory — every 15 min, mirrors new Walmart orders into a Google Sheet, acknowledges them on Walmart, Telegram-alerts the team) — more routes live than the README documents, check the actual `api/` folder. CJ Dropshipping (NUPROZ- SKU) routing removed 2026-07 — see §3/§4. | `gci-order-hub.vercel.app` | ✅ core routing working. ✅ Walmart order capture fixed 2026-07-29 after being silently broken (§6.12) — verify this stays fixed, it has failed silently before. 🟡 CT auto-PO switch built, dormant (§6). |
 | **gci-command-center** | Internal ops dashboard — Sales/Marketing/Finance/IT/Content, one React app. Pulls Shopify + GA4 + Xero into one place. Also runs the Walmart discount-rotation system (`/promotions`). | `gci-command-center-ofzf` (custom domain `ops.gcitires.com`). The old duplicate plain-`.vercel.app` project was **deleted 2026-07-02** — there is now only one. | ✅ Fully verified 2026-07-02: all 4 dashboard widgets confirmed against real source data (Shopify orders/revenue, GA4 sessions, Xero invoices). Xero re-authed + root-cause fixed (§6.10), GA4 re-authed with a new service account (§5). |
-| **gcitires-chatbot** | Customer-facing AI chat widget embedded on the storefront. Memory/conversation history migrated 2026-07 from Airtable to Supabase (`chatbot_customers`/`chatbot_conversations` tables in the shared `gci-walmart-sync` Supabase project) — fixes the old `/api/memory` timeout problem. | `gcitires-chatbot.vercel.app` | ✅ Migration COMPLETE 2026-07-02: code merged (#27, #28), env vars set, and the historical-data migration script actually run against production — 19,275 customer records verified in Supabase (all unique, 0 nulls). The re-run script (`scripts/migrate-airtable-to-supabase.ts`) is upsert-keyed and safe to re-run. |
+| **gcitires-chatbot** | Customer-facing AI chat widget embedded on the storefront. Memory/conversation history migrated 2026-07 from Airtable to Supabase (`chatbot_customers`/`chatbot_conversations` tables in the shared `gci-walmart-sync` Supabase project) — fixes the old `/api/memory` timeout problem. | `gcitires-chatbot.vercel.app` | ✅ Migration COMPLETE 2026-07-02. ✅ 2026-08-08: fixed `/api/chat` 30s timeouts caused by unbounded parallel `search_catalog` fan-out (PR #29) and added its first-ever monitoring — `api/health-check.ts` cron (every 30min) + Telegram alerting via new `lib/telegram.ts`. See "Session update — 2026-08-08" at the end of this doc for full detail. |
 | **gci-walmart-sync** | **Standalone commercial Shopify app** (Remix, Shopify App Store template) for Walmart CA Marketplace sync — listings, price, inventory, orders, returns. Built first for GCI, intended to be **published commercially** once ready. **Still not installed on any real Shopify store**, GCI's included. | `app.gcitires.ca` (+ `gci-walmart-sync.vercel.app`) | 🟡 CC-1 through CC-12 built and compiling, feature-complete on paper, no real Shopify merchant has ever installed it. ✅ **2026-07-29**: its order-ingestion cron is now LIVE-capturing GCI's real Walmart orders in **shadow mode** (`docs/SHADOW-MODE.md`) for comparison against gci-order-hub — read that file AND `docs/SCOPE-NOTE.md` before assuming either "just a test app" or "the real pipeline now": both are wrong on their own, see §6 item 13. See its own `docs/SESSION-CONTEXT.md` for full build history. |
 | **gci-price-monitor** | Daily competitor tire-price scraper (Python/Playwright), **runs via GitHub Actions, not Vercel** — despite having a `vercel.json`, that file is an unused stub. Reports via Telegram. Persistence migrated 2026-07 from local SQLite to Supabase (`price_monitor_snapshots` table, same shared project) — real day-over-day trend data now possible for the first time. | GitHub Actions cron (`.github/workflows/price_monitor.yml`, daily 8AM EST) | ✅ Merged (gci-price-monitor#4) and verified end-to-end via a real `workflow_dispatch` production run (real scrape, real Supabase insert, confirmed via direct SQL). `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` secrets set on the repo. First real historical trend data started accruing 2026-07-01. |
 
@@ -65,7 +67,7 @@ don't touch without separately confirming scope.
 | **GA4** | gci-command-center (Marketing page + dashboard widget) | Service account (static private key, signs a JWT per request — NO rotating token, structurally immune to the Xero bug class, explicitly confirmed) | ✅ Fixed 2026-07-02: the original service account key was unrecoverable (Vercel "sensitive" env vars can't be read back, even via CLI). Created a NEW dedicated service account `gci-command-center-ga4@gci-price-monitor.iam.gserviceaccount.com`, granted Viewer on property `526079137`, full JSON key in `GA4_SERVICE_ACCOUNT_KEY`. Verified live with real session data. |
 | **Microsoft Merchant Center** (store 50034512 "GCI Tires Canada") | gci-brain (feed endpoint `api/feed/microsoft` — live TSV, ~1,963 active products) | Feed pulled by Microsoft from a public URL, no auth; Ads managed in the Microsoft Advertising UI | ✅ Connected 2026-07-02. Feed live + validated (1,963 active, 0 rejected). A minimal Standard Shopping campaign ("GCI - Shopping - Starter", $5 CAD/day, Enhanced CPC $1, Canada-only, all products) exists because Microsoft requires ≥1 active campaign even for FREE listings. 🟡 Watch item: "not targeted products" store warning attributed to ~12h sync lag — confirm it cleared. |
 | **Make.com** (team 2205971, zone us2) | gci-brain's social-scheduler posts to its webhook; the Make scenario (id 4867071) is what ACTUALLY publishes to Instagram/Facebook/Pinterest — no repo calls those platforms directly | Webhook URL in `MAKE_WEBHOOK_URL` (gci-brain); API token in `MAKE_API_TOKEN` (gci-order-hub, for the health check) | ⚠️ READ §4 — this was the biggest blind spot found in the whole audit. The scenario was OFF from creation (Apr 26) to Jul 2 with zero error signal anywhere, because Vercel only sees "webhook accepted". Now monitored by a daily health check (gci-order-hub#46, `/api/health-check-make`, cron 10:00 UTC) that alerts via Telegram if the scenario is paused OR hasn't executed in 3 days. |
-| **Telegram + Resend** | gci-order-hub, gci-command-center, gci-price-monitor, **and gci-brain as of 2026-07-02** (outreach missing-email alerts — `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` had to be added to gci-brain's Vercel env vars; they are per-project, not shared) | Bot token / API key per repo | Straightforward. Note: env vars do NOT propagate across Vercel projects — a repo "having Telegram" means ITS project has the vars set. |
+| **Telegram + Resend** | gci-order-hub, gci-command-center, gci-price-monitor, gci-brain (as of 2026-07-02), **and gcitires-chatbot as of 2026-08-08** (health-check alerts — `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID_ACTIONABLE`/`TELEGRAM_CHAT_ID_INFO` added to gcitires-chatbot's Vercel env vars; `TELEGRAM_CHAT_ID_ACTIONABLE`=`901641030` set, `TELEGRAM_CHAT_ID_INFO` still needs setting — see session update at end of doc) | Bot token / API key per repo | Straightforward. Note: env vars do NOT propagate across Vercel projects — a repo "having Telegram" means ITS project has the vars set. |
 | **Supabase** (project `gci-walmart-sync`, ref `enhbckomwdelktdhnuzq`, region `ca-central-1`) | gci-walmart-sync (original owner — `shops`/`products`/`walmart_orders`/`sync_logs`/`sessions`/`walmart_sync_cursor` tables), gcitires-chatbot (`chatbot_customers`/`chatbot_conversations`, added 2026-07), gci-price-monitor (`price_monitor_snapshots`, added 2026-07), **and gci-order-hub** (`ct_orders`, `walmart_order_alerts`, added 2026-07-27/28 — despite `gci-order-hub`'s own env-var naming, its data actually lives in the `gci-walmart-sync`-named project) | Service role key, held server-side only per repo | Reused deliberately across all four rather than provisioning separate paid projects. RLS enabled on every table, no permissive policies for anon/authenticated — service_role-only access pattern, consistent across all tenants of this project. If you add a new table here for a new use case, follow the same pattern. ⚠️ **Found 2026-07-29**: a SECOND, separate, entirely empty Supabase project literally named `gci-order-hub` (ref `gqaylwkfiokwsccibvxg`, created 2026-07-29) also exists in this org — a real trap for "apply the migration to the gci-order-hub project" without checking which one actually has the tables first. Always verify with `list_tables` before applying a migration by project *name* alone. |
 | **CJ Dropshipping** | none — removed 2026-07 | — | **Was dead code (`NUPROZ-` SKU path in gci-order-hub), now fully removed** (gci-order-hub#45). nuprozone.com was discontinued due to brand conflicts; confirmed permanent, not paused. |
 
@@ -388,3 +390,80 @@ work in that repo specifically:
   written for exactly this "prime a new session" purpose)
 - `gcitires-chatbot`, `gci-price-monitor`: `README.md`, `SETUP_GUIDE.md`,
   `WORKFLOW.md` (price-monitor)
+
+---
+
+## Session update — 2026-08-08: gcitires-chatbot chat-timeout fix + monitoring build-out
+
+Triggered by a real user report ("chat-bot seems down") with no Telegram
+alert. Audit found three things, all now resolved — full detail below;
+`gcitires-chatbot`'s repo-map row (§2) and the Telegram credential row
+(§3) have been updated to match.
+
+**1. `/api/chat` 30s timeouts (fixed, PR #29, merged).** A broad/ambiguous
+customer message let Claude fire off a burst of parallel `search_catalog`
+calls in one turn — production logs showed it sweeping every vehicle size
+listed in the system prompt (RAV4 + Camry + Civic + F-150 sizes all in one
+request). `streamChat()`'s tool loop awaited each sequentially, and a
+brand-only `search_catalog` call could itself paginate up to 4 sequential
+Shopify round-trips (1000 products) just to return 5 deduped results.
+Combined, this blew past `api/chat.ts`'s 30s `maxDuration` and the SSE
+stream died mid-response with nothing surfaced to the widget — looked
+exactly like the bot was down, but Vercel logged every request as a plain
+200 (the timeout was a separate, truncated invocation whose buffered
+console output leaked into the next request's log — don't trust a "200"
+alone when investigating this class of bug, check for an actual response
+body). Fixed with four coordinated changes in `lib/anthropic.ts` (parallel
+tool execution via `Promise.all`, capped to 4 calls/round), `lib/shopify.ts`
+(pagination cap lowered 1000→300 products, added an 8s per-request abort
+timeout), and `lib/prompts.ts` (EN+FR — hard 2-calls-per-turn limit,
+explicit ban on sweeping the example vehicle-size table).
+
+**2. Supabase `service_role` key silently broken 2026-08-04 to 2026-08-08
+(resolved, not via this session's code).** Confirmed via direct DB query
+against `chatbot_customers`: writes were steady (5–14/hour) right up to
+2026-08-04 16:37 UTC, then hard-stopped — a clean cutover, consistent with
+the key being rotated on the Supabase side without Vercel's copy of
+`SUPABASE_SERVICE_ROLE_KEY` (in the `gcitires-chatbot` project) being
+updated. Root cause of *why nobody noticed* was #3 below, not this bug
+itself. By the time this was checked again same-day, writes had resumed
+and the new health check (see #3) confirmed `supabase: ok` — so this was
+fixed (key rotated back, or a fresh key set) but not by an AI session; if
+a future session needs to touch this again, the project is
+`gci-walmart-sync` (ref `enhbckomwdelktdhnuzq`), Settings → API →
+`service_role` key, pasted into `gcitires-chatbot`'s Vercel env. **Worth
+checking `gci-price-monitor` isn't silently broken by the same rotation**
+— it shares this Supabase project and was never specifically re-verified
+in this session.
+
+**3. `gcitires-chatbot` had zero monitoring (fixed, PR #29, merged).**
+Confirmed: no `crons` in `vercel.json`, no Telegram code at all, and (per
+the credential map in §3, pre-this-update) this repo was never added to
+the list of projects with `TELEGRAM_BOT_TOKEN`/`CHAT_ID` configured. That's
+the real reason #1 and #2 both went unnoticed — there was no code path
+that could have alerted anyone. Added:
+- `lib/telegram.ts` — same dual actionable/info channel pattern as
+  `gci-order-hub`'s `api/lib/telegram.ts`, newly wired into this project
+  (env vars are per-Vercel-project, don't propagate — see §3).
+- `api/health-check.ts` — cron every 30 min, directly exercises a real
+  Supabase query (same table/client as production `findCustomer`) and a
+  real `searchCatalog()` call for a common tire size, plus an Anthropic
+  reachability check. Alerts debounced via a new `chatbot_health_checks`
+  table (2h cooldown while a check stays failing, one-time recovery
+  notice when it goes green again).
+- Telegram env vars set this session: `TELEGRAM_CHAT_ID_ACTIONABLE` =
+  `901641030`. `TELEGRAM_CHAT_ID_INFO` was **not** set separately — it
+  currently falls back to nothing configured, so recovery notices won't
+  send until that's added too (can reuse the same `901641030` chat, or
+  point it elsewhere).
+
+**Live-verified end to end same day**: all three health-check components
+(`supabase`, `shopify_catalog`, `anthropic`) confirmed `ok` via direct
+Supabase SQL against `chatbot_health_checks`, cron confirmed firing on
+schedule via Vercel runtime logs (30-min cadence), zero alerts fired
+(`last_alert_at` null on all three) since nothing has failed since deploy.
+
+**Session credential note** (same convention as §10 above): a GitHub PAT
+scoped to the `statco` org was shared directly in chat this session to
+push PR #29's branch and merge-adjacent doc updates. Standard hygiene:
+rotate it next time you're in GitHub token settings.
