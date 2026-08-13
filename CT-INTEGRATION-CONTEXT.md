@@ -380,6 +380,19 @@ the live `orders/paid` test confirmed is necessary.
    decrement writer in `gci-order-hub` remains unnecessary — but "Shopify
    itself refuses to oversell once a SKU hits 0" was never the actual
    backstop for this failure mode; the fix above is.
+
+   **Addendum, same day:** the first fix (gci-brain#139) only patched
+   `inventory-reconcile`'s own target-qty formula. Three other live
+   Shopify inventory-write paths in `gci-brain/api/shopifySync.ts` still
+   called `setInventory(..., getTotalQty(ct))` — `syncOneProduct()`
+   (regular catalog updates, 3 call sites), new-product creation, and the
+   `retry-create` admin action — so any of those running after the hourly
+   reconcile would have silently re-inflated a split-stock SKU right back
+   to the national sum. Caught by Codex's automated review on #139, not
+   by live testing. Closed in gci-brain#140 (merged 2026-08-13) — all
+   four write sites now use `getMaxLocationQty()`. As of #140, believed
+   complete across every Shopify inventory-write path; not yet
+   live-verified against real data.
 2. **QST marketplace-facilitator status for Quebec — confirmed.** Walmart's
    own bi-weekly payout statement for a real Quebec-bound sale ($187.99
    product price) showed `Net tax collected: $0.00` and
