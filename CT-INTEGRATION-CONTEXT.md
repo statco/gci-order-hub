@@ -357,6 +357,29 @@ the live `orders/paid` test confirmed is necessary.
    integration" (§ 11). Decided not worth it. Revisit only if live data
    later shows manual-required firing often enough to be a real drag — that
    would be a "the numbers say so" call, not a pre-launch one.
+
+   **🔴 Correction, 2026-08-13 (gci-brain#139, merged):** "CT's real live
+   quantity" above was wrong in a way that mattered. `inventory-reconcile`
+   was writing `getTotalQty(ct)` — the **sum across all 7 CT warehouses** —
+   to Shopify. But `resolveLocation()` (this file, § above) requires **one**
+   warehouse to cover the whole order; CT's Submit Order API can't
+   split-ship. So a SKU with 1 unit in Toronto + 1 in Montreal read as "2 in
+   stock" in Shopify — `inventory_policy: 'deny'` never triggers, because
+   Shopify genuinely (if wrongly) believes 2 are available — while
+   `resolveLocation()` would reject a real 2-unit order with
+   `CTInsufficientStockError`. This is a real oversell path, not just a
+   routine manual-required outcome: the customer's order is accepted by
+   Shopify at checkout time, then fails downstream. **Confirmed live
+   incident**: Ovation Vi-682 155/80R12 (SKU `200E2108`), 2026-08-12 — order
+   for 2x accepted, CT could only fulfill 1x from any single warehouse;
+   order manually cancelled and re-placed for 1x with customer's agreement.
+   Fixed by `getMaxLocationQty()` — max quantity at any single warehouse,
+   the true ceiling `resolveLocation()` can ever fulfill in one order for
+   any province (every `PROVINCE_ROUTING` list falls back across all 7
+   locations). The rest of this decision's reasoning still holds — a second
+   decrement writer in `gci-order-hub` remains unnecessary — but "Shopify
+   itself refuses to oversell once a SKU hits 0" was never the actual
+   backstop for this failure mode; the fix above is.
 2. **QST marketplace-facilitator status for Quebec — confirmed.** Walmart's
    own bi-weekly payout statement for a real Quebec-bound sale ($187.99
    product price) showed `Net tax collected: $0.00` and
