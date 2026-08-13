@@ -835,6 +835,21 @@ above, which now also applies to confirming the create/update paths
 write the capped number on their next real run, not just
 `inventory-reconcile`).
 
+**✅ Live-verified, 2026-08-13T19:14 UTC.** Ran `inventory-reconcile` for
+real against production (`gci-brain.vercel.app`). Preceded by a dry run
+sampled across 149 of 594 pending SKUs (25% coverage) to sanity-check
+magnitude before writing — largest corrections were high-volume SKUs
+like `10953NXK` (1316→645) and `HF-ST52SR` (1289→641), all still
+comfortably positive, no zeroing anywhere in the sample. `200E1059` (the
+reference part documented in `CT-INTEGRATION-CONTEXT.md` as "Stock is
+thin", max location Mount Pearl 11) landed exactly on target: 16→11,
+confirming the formula picks the right warehouse. Live run applied
+**596/596, 0 errors, 0 newly zeroed**. Re-ran a dry-run scan immediately
+after: **`pendingChanges: 0`** — confirms the write genuinely landed on
+Shopify, not just a green API response. This closes the loop: bug found
+→ root cause identified → fix scoped, found incomplete by Codex, fixed
+completely → live-verified with before/after real data.
+
 **Session credential note** (same convention as earlier session entries
 in this doc): a GitHub PAT scoped to the `statco` org was shared directly
 in chat this session (used for gci-brain's clone/branch/commit/PR and this
