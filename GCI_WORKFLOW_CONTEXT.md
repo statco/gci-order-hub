@@ -9,7 +9,7 @@
 >
 > **2026-08-11**: SEO drift protection (gci-brain) + Walmart listing content sync built (gci-walmart-sync, dormant — app still not installed on any real store, see §2). See "Session update — 2026-08-11" at the end of this doc.
 >
-> **2026-08-13**: `inventory-reconcile` (gci-brain) fixed a real oversell gap — was reporting national-summed CT stock instead of the max any single CT warehouse holds, since CT can't split-ship. Closes the bug behind a real customer oversell (Ovation Vi-682 155/80R12, SKU 200E2108). See "Session update — 2026-08-13" at the end of this doc, and the correction added to `gci-order-hub/CT-INTEGRATION-CONTEXT.md` § 5a.
+> **2026-08-13**: `inventory-reconcile` (gci-brain) fixed a real oversell gap — was reporting national-summed CT stock instead of the max any single CT warehouse holds, since CT can't split-ship. Closes the bug behind a real customer oversell (Ovation Vi-682 155/80R12, SKU 200E2108). First fix (#139) was incomplete — 3 other write paths had the same bug, caught by Codex review and closed in #140. See "Session update — 2026-08-13" at the end of this doc, and the correction added to `gci-order-hub/CT-INTEGRATION-CONTEXT.md` § 5a.
 >
 > Last written: 2026-07-01, last updated: 2026-07-29 end-of-session (after
 > the Walmart order-capture root-cause fix + canonical CT PO number format
@@ -805,6 +805,35 @@ reasoning relied on the now-fixed assumption.
 conservative relative to true national CT stock whenever inventory is
 genuinely spread across warehouses — correct today since CT can't
 split-ship; would need revisiting if CT ever adds that capability.
+
+**🔴 Follow-up, same day — gci-brain#139 was incomplete (caught by Codex
+review, not by this session's own testing).** #139 only fixed the target
+formula inside `inventory-reconcile`'s own code path. Three other live
+Shopify inventory-write paths still called
+`setInventory(..., getTotalQty(ct))` — the uncapped national sum:
+`syncOneProduct()` (updates existing products; called from the main daily
+sync, the price-update chunk action, and a third manual sync action —
+3 call sites), new-product creation (main daily sync's "FIX 3" path), and
+the `retry-create` admin action. Any regular sync running after the
+hourly reconcile would have quietly re-inflated a split-stock SKU's
+displayed quantity right back to the national sum until the next
+reconcile — reopening the exact oversell window #139 was meant to close.
+**Fixed in gci-brain#140 (merged 2026-08-13)**: all four `setInventory`
+call sites now use `getMaxLocationQty()`; also fixed `buildPayload()`'s
+"Stock: X units" customer-facing product-description text, which was
+still showing the uncapped sum and would have contradicted the actual
+`inventory_quantity` the product is created with. **LESSON, same shape as
+§7's existing "verify fixes with live data" principle**: grep for every
+call site of the function being replaced, not just the one in the bug
+report — a partial fix that only patches the path you were told about
+can leave the same class of bug live in sibling code paths.
+
+**As of gci-brain#140, this fix is believed complete across every
+Shopify inventory-write path in `shopifySync.ts`** — still not yet
+live-verified against real data (see the `dryRun=true` recommendation
+above, which now also applies to confirming the create/update paths
+write the capped number on their next real run, not just
+`inventory-reconcile`).
 
 **Session credential note** (same convention as earlier session entries
 in this doc): a GitHub PAT scoped to the `statco` org was shared directly
