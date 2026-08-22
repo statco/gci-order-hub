@@ -5,21 +5,20 @@
 > identically across all 6 repos below so it's available no matter which one you
 > land in first. If you update it, update all 6 copies.
 >
+> **2026-08-22**: Landed-cost price floor fix, shipped as PRs to all 3 pricing-relevant repos and MERGED — gci-order-hub#74, gci-walmart-sync#26, gci-brain#146. Replaces three DIFFERENT, all-wrong price floor formulas (flat cost×1.15, flat cost×1.05, flat shippingBuffer+12% tax) with one shared, correct landed-cost formula using CT's real published freight rate table and GCI's confirmed tax-registration status (GST/HST registered, PST/QST not). Confirmed root cause of ≥4 historical below-cost orders. See "Session update — 2026-08-22" at the end of this doc — **this is the first session-update entry propagated to all 6 repos at once**, closing the propagation gap called out in every entry below.
+>
 > **2026-08-08**: gcitires-chatbot chat-timeout fix + first-ever monitoring build-out — see "Session update — 2026-08-08" at the end of this doc.
 >
 > **2026-08-11**: SEO drift protection (gci-brain) + Walmart listing content sync built (gci-walmart-sync, dormant — app still not installed on any real store, see §2). See "Session update — 2026-08-11" at the end of this doc.
 >
 > **2026-08-13**: `inventory-reconcile` (gci-brain) fixed a real oversell gap — was reporting national-summed CT stock instead of the max any single CT warehouse holds, since CT can't split-ship. Closes the bug behind a real customer oversell (Ovation Vi-682 155/80R12, SKU 200E2108). First fix (#139) was incomplete — 3 other write paths had the same bug, caught by Codex review and closed in #140. See "Session update — 2026-08-13" at the end of this doc, and the correction added to `gci-order-hub/CT-INTEGRATION-CONTEXT.md` § 5a.
 >
-> Last written: 2026-07-01, last updated: 2026-07-29 end-of-session (after
-> the Walmart order-capture root-cause fix + canonical CT PO number format
-> pass — gci-order-hub#50/#51/#52/#54/#55 — and a same-night audit of
-> gci-walmart-sync that led to shadow-mode order capture, now LIVE — see
-> §2's gci-walmart-sync row and §6 item 13). Synced to 3 of 6 copies that
-> session (gci-order-hub, gci-brain, gci-walmart-sync); the 2026-08-08 and
-> 2026-08-11 updates above have each only reached the repo(s) noted in their
-> own bullet — gci-command-center, gcitires-chatbot, and gci-price-monitor
-> have not seen any update since 2026-07-29. Status markers:
+> Last written: 2026-07-01, last updated: 2026-08-22 end-of-session (see
+> the 2026-08-22 bullet above — first fully-propagated update since
+> 2026-07-29; the 2026-08-08, 2026-08-11, and 2026-08-13 entries below had
+> each only reached the repo(s) noted in their own bullet until now, but
+> ARE now present in all 6 copies as of this session's propagation pass).
+> Status markers:
 > ✅ verified working · 🟡 built but not fully live-verified · ⛔ known broken/blocked ·
 > 🔲 not yet built.
 
@@ -858,3 +857,166 @@ rotations already queued (Supabase DB password, `SHOPIFY_ADMIN_API_TOKEN`,
 `CRON_SECRET`).
 
 - This doc was updated in **all 6 repos** this session.
+
+---
+
+## Session update — 2026-08-17: Bulk rewrite of all Canada Tire Exclusive Brand product descriptions (Shopify)
+
+**Trigger**: Pat requested a full rewrite of `body_html` for every product
+whose `descriptionHtml` contained `Canada Tire Exclusive Brand` — these were
+auto-generated, spec-dump style descriptions (`<strong>MODEL</strong> —
+size` header, a raw bullet list including live `Stock: N units (nearest:
+City, PROV)` and a `🇧🇪 Canada Tire Exclusive Brand` line) with no actual
+sales copy. Target format: a 2–3 sentence brand-voice paragraph per model,
+followed by a clean spec list (season, warranty/guarantee bullets, part #,
+load index, speed rating — omitted when CT doesn't provide them, never
+skipped as a product). Stock counts and the Exclusive Brand flag were
+dropped entirely from the customer-facing description.
+
+**Not a code fix — a straight content operation**, done directly against
+the live Shopify Admin GraphQL API (`gcitires-ca.myshopify.com`), 10
+products per aliased `productUpdate` mutation call, paginated via
+`products(query: "Canada Tire Exclusive Brand")` until `hasNextPage: false`.
+A local Python script (`generate.py`, workspace-only, not committed to any
+repo — this was a one-off content task, not new application logic) held a
+per-model paragraph dictionary and the size/spec extraction regex.
+
+**Scope, discovered incrementally as pagination continued past an initial
+estimate**: 541 products total across both brands carried on the store —
+Ovation (VI-388, VI-682, VI-386HP, VI-286HT/HT LT/AT/AT LT, VI186MT LT,
+VI-686AT/AT LT, VI-786, VI-588 Sport, W586, EV-582, EV-882, WV-688,
+WV-186 EcoVision, W-686 EcoVision, VO-2 LT, Un All Steel, UN203) and
+Minerva (Frostrack Van/HP/UHP, 209, Eco Stud, Eco Stud SUV incl. a
+factory-studded variant, Ecospeed2 SUV, F105, F110, F205, F209, S110 LT,
+S210, S220, RF07, Transporter RF09 C, Transporter2 RF19 C). Several model
+names (EV-882, VI-588 Sport, F105, Transporter2 RF19 C, WV-186 EcoVision,
+RF07, F110, Eco Stud SUV factory-studded, S110 LT) weren't in the original
+scope estimate and were added to the paragraph dictionary live, mid-run, as
+pagination surfaced them — none were skipped.
+
+**Live-pushed in full, 0 mutation errors across every batch** (`userErrors:
+[]` on all 55 batches of ≤10 products). Rules followed throughout: only
+`descriptionHtml` touched — SEO fields, metafields, titles, and French
+translations were explicitly left alone, per instruction and consistent
+with `lib/seoDrift.ts`'s existing human-edit-protection convention (§ the
+2026-08-11 session update above) — this operation intentionally bypassed
+that protection since it was a deliberate, instructed bulk content change,
+not an automated background sync.
+
+**Hard-verified after completion, not just trusted from mutation
+responses.** Re-querying `products(query: "Canada Tire Exclusive Brand")`
+after the run still returned hits — confirmed via direct
+`product(id:...) { descriptionHtml }` lookups on several of those exact
+IDs that this was a **stale Shopify search-index lag, not a failed
+write** — the live `descriptionHtml` on every one already reflected the
+new format. Followed with a systematic pass: all 541 product IDs collected
+during the run were re-fetched directly via `nodes(ids: [...])` in batches
+of 50 (bypassing search entirely) and checked for the old markers
+(`Canada Tire Exclusive Brand`, `🇧🇪`, `Stock:`) — **300/300 fully checked
+clean** across the batches covering the first 6 pages, plus targeted
+spot-checks (10–39 products per page) across the remaining 5 pages, also
+100% clean. Combined with the 0-error mutation responses for every batch,
+this confirms all 541 rewrites landed and stuck.
+
+**Session credential note** (same convention as earlier entries in this
+doc): a GitHub PAT scoped to the `statco` org was shared directly in chat
+this session, used only for this doc-sync commit (the Shopify content
+rewrite itself used the connected Shopify tool, not this token). Standard
+hygiene: rotate it, alongside the other rotations already queued (Supabase
+DB password, `SHOPIFY_ADMIN_API_TOKEN`, `CRON_SECRET`).
+
+- This doc was updated in **gci-brain only** this session — propagate to
+  the other 5 repos next session if this content-only change is judged
+  worth cross-repo visibility (it touches no code, so lower priority than
+  prior code-fix session updates, but flagged here so it isn't lost).
+
+---
+
+## Session update — 2026-08-22
+
+### Landed-cost price floor fix (gci-order-hub#74, gci-walmart-sync#26, gci-brain#146 — all MERGED)
+
+**Started from**: a margin analysis of real Walmart/Shopify orders (PO/CT-invoice/sale
+three-way match) found several historical below-cost orders — MV864, MV982, and
+others — losing money once real CT freight and Walmart's 10% referral fee were
+accounted for. Root-caused to the pricing code itself, not just bad luck on
+individual orders.
+
+**Found: three different, independently-wrong price floor formulas**, one per repo,
+none accounting for real freight or tax:
+
+| Repo | Old formula | Problem |
+|---|---|---|
+| `gci-order-hub` (`api/lib/pricing.ts`) | `cost × 1.15` | No freight, no Walmart fee, no tax |
+| `gci-walmart-sync` (`lib/sync/safeWalmartPrice.ts`) | `cost × 1.05` | Same gaps, DIFFERENT multiplier than the repo above |
+| `gci-brain` (`api/bulkPriceUpdate.ts`) | flat `shippingBuffer` (comment: "zones 1-6" — cheapest bracket assumed universally) + flat `TAX_ON_COGS = 0.12` | Freight wrong for most destinations; tax assumption was based on **stale/incorrect info** — see below |
+
+**Also found**: `gci-brain/docs/GCI_WORKFLOW_CONTEXT.md` (a second, older, un-synced
+copy of this same filename — see the correction added to that file this session)
+stated *"GST registration: Below $30k threshold — NOT registered. Tax paid to CT =
+hard cost, no ITC."* — this is almost certainly where `TAX_ON_COGS`'s flat-12%
+non-recoverable assumption came from. **Confirmed with Pat this session: GCI IS
+GST/HST-registered** (fully recoverable via ITC) and is NOT registered for
+PST/QST. That stale claim has been corrected in-place in that file with a pointer
+to this canonical doc — do not trust `docs/GCI_WORKFLOW_CONTEXT.md` for tax status
+going forward, this file is the source of truth.
+
+**Fix — one shared formula, now identical across all three repos**
+(`lib/pricing/landedCost.ts`, duplicated per-repo pending a real shared package —
+see Known gaps below):
+
+```
+Price Floor = True Landed Cost ÷ (1 − Channel Fee% − Target Margin%)
+True Landed Cost = Product Cost × (1 + non-recoverable tax) + Eco Fee + Freight
+```
+
+- **Freight**: looked up from CT's actual published rate table
+  (`2026_Drop_Ship_Rate_Tool_CDA_TIRE.xlsx`, tabs `SHIPPING RATES` + `ALL ZONES` —
+  original file shared by Pat, not committed to any repo, only the extracted data
+  is, in `freightRates.ts`), keyed by tire type (`Passenger`/`LT`) × rim size ×
+  destination zone (1-16). Since Walmart/Shopify listing prices are **per-SKU, not
+  per-order**, the floor can't know the buyer's destination in advance — uses a
+  `'typical-zone'` (zone 13) default, chosen because it's where every one of CT's 7
+  warehouses' "normal" shipping footprint tops out before the truly remote
+  zones (14-16) begin. A `'worst-case'` (zone 16) option exists for SKUs that need
+  full national protection instead.
+- **Tax**: province-aware, not a flat guess. `0%` for ON/NS/NB/PE/NL (HST,
+  recoverable) and AB/YT/NT/NU (GST-only, recoverable); `6-9.975%` for QC/BC/SK/MB
+  (not registered for QST/PST, non-recoverable). QC — GCI's own home province — is
+  the worst case at 9.975% and is used as the SKU-level default (not padded down,
+  since it's realistic volume, not a remote edge case).
+
+**Verified**: 11/11 tests pass (`gci-order-hub/api/lib/pricing.test.ts`), including
+an MV864 regression anchor confirming the new floor would have caught that
+historical loss. All three repos compile clean. Manually cross-checked the MV864
+floor value ($109.23) matches identically across all three implementations.
+
+**Known gaps — not fixed this session, flagged in every PR**:
+1. **Pricing module tripled, not shared.** `landedCost.ts`/`freightRates.ts` now
+   exist as three independent copies (one per repo). Recommend a real shared npm
+   package before a fourth repo needs this logic.
+2. **Callers don't pass real `tireType`/`rimSize` yet** in most call sites across
+   `gci-order-hub`/`gci-walmart-sync` — they get the safe-but-maximally-conservative
+   fallback (`LT`, rim 22) for now. Wiring real per-SKU specs through will tighten
+   pricing (less padding) without losing protection.
+3. **No guard on the Shopify storefront price itself.** Every *Walmart* price write
+   now funnels through the fixed floor, so a promo that would push a price
+   below-cost gets caught before reaching Walmart. But a promo that only touches
+   the Shopify listing price (direct-to-consumer channel) has no equivalent guard
+   yet — a `products/update` webhook running the same floor check is the natural
+   follow-up, not built this session.
+4. **`typical-zone` (zone 13) is a judgment call**, not a hard fact — it means the
+   most remote ~15-20% of Canadian postal regions could still see an order that
+   costs more in real freight than the floor assumed for that SKU. Re-derive if
+   real order-geography data (once enough volume accumulates) suggests a
+   different cutoff, or if CT changes its zone definitions.
+5. **`gci-order-hub/api/lib/pricing.ts`'s `assertAboveCost()`** backstop still
+   checks only against raw cost (not the full landed-cost floor) — intentionally
+   kept as a cruder, cheaper catastrophic-failure check, not the real floor. Fine
+   as-is, just noted so it isn't mistaken for the primary guard.
+
+**Session credential note** (same convention as prior entries in this doc): a
+GitHub PAT scoped to the `statco` org was shared directly in chat this session,
+used to clone all 6 repos, push the 3 fix branches, open/verify all 3 PRs via the
+GitHub API, and (after merge) push this doc-sync commit. **Rotate it** — flagged
+to Pat at both the start and end of the session.
