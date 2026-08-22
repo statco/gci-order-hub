@@ -14,7 +14,7 @@
 
 import assert from 'node:assert';
 import { safeWalmartPrice, assertAboveCost } from './pricing.js';
-import { computePriceFloor } from './pricing/landedCost.js';
+import { computePriceFloor, nonRecoverableTaxRateFor, worstCaseNonRecoverableTaxRate } from './pricing/landedCost.js';
 
 let passed = 0;
 function check(name: string, fn: () => void) {
@@ -81,6 +81,26 @@ check('assertAboveCost throws on below-cost amount', () => {
 
 check('assertAboveCost passes when amount >= cost', () => {
   assert.doesNotThrow(() => assertAboveCost('TIRE-X', 379.99, 330));
+});
+
+// Confirmed with Pat 2026-08-22: GST/HST registered, PST/QST not registered.
+// HST provinces must show ZERO non-recoverable tax (fully recoverable via
+// ITC) — the old flat-12% guess was silently over-taxing these, which is
+// most of Canada's population (ON/NS/NB/PE/NL + AB/territories GST-only).
+check('HST/GST-only provinces have zero non-recoverable tax', () => {
+  assert.strictEqual(nonRecoverableTaxRateFor('ON'), 0);
+  assert.strictEqual(nonRecoverableTaxRateFor('AB'), 0);
+});
+
+// QC/BC/SK/MB are the only provinces GCI can't recover tax in (not
+// registered for QST/PST). QC is highest at 9.975% and is GCI's own home
+// province — the worst-case default the price floor should protect against.
+check('QC/BC/SK/MB have the expected non-recoverable rates, QC is worst-case', () => {
+  assert.strictEqual(nonRecoverableTaxRateFor('QC'), 0.09975);
+  assert.strictEqual(nonRecoverableTaxRateFor('BC'), 0.07);
+  assert.strictEqual(nonRecoverableTaxRateFor('SK'), 0.06);
+  assert.strictEqual(nonRecoverableTaxRateFor('MB'), 0.07);
+  assert.strictEqual(worstCaseNonRecoverableTaxRate(), 0.09975);
 });
 
 function roundedNear99(n: number): number {

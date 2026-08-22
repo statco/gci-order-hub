@@ -93,23 +93,57 @@ export function freightForKnownShipment(
 
 // ─── Non-recoverable tax ───────────────────────────────────────────────
 //
-// OPEN QUESTION FOR PAT: is GCI registered for GST/HST and actively claiming
-// Input Tax Credits? The prior code (gci-brain/api/bulkPriceUpdate.ts) assumed
-// NOT registered ("non-recoverable below $30k GST threshold") and applied a
-// flat 12% tax markup to every order regardless of destination. That flat 12%
-// happens to match BC's actual GST+PST combined rate (5%+7%) almost exactly,
-// but is WRONG for HST provinces (ON/NS/NB/PEI/NL) if GCI is a registrant —
-// HST is fully recoverable via ITC in that case, and this 12% markup would be
-// needlessly inflating the price floor (and therefore prices) on those orders.
+// CONFIRMED with Pat (2026-08-22): GCI is registered for GST/HST (so GST
+// and HST are fully recoverable via Input Tax Credits — 0% non-recoverable),
+// but is NOT registered for any provincial sales tax (PST/RST) or QST. That
+// means non-recoverable tax is province-specific, not a flat blended guess:
 //
-// Until confirmed, this module keeps the conservative assumption (tax is
-// non-recoverable) but makes it a single named, easily-flipped constant
-// instead of being silently baked into the formula.
+//   AB, YT, NT, NU        → 0%      (GST only, fully recoverable)
+//   ON, NS, NB, PE, NL    → 0%      (HST, fully recoverable via ITC)
+//   BC                    → 7%      PST, not registered → non-recoverable
+//   SK                    → 6%      PST, not registered → non-recoverable
+//   MB                    → 7%      RST, not registered → non-recoverable
+//   QC                    → 9.975%  QST, not registered → non-recoverable
+//
+// The prior flat "12%" constant (still visible in gci-brain's
+// bulkPriceUpdate.ts as of this writing) only ever matched BC's rate by
+// coincidence (5% GST + 7% PST ≈ 12%) — it was OVER-taxing every HST-province
+// and GST-only-province order (the majority of Canada), inflating those
+// price floors for no reason. That file has NOT been patched here — this
+// fix only covers gci-order-hub / gci-walmart-sync's safeWalmartPrice(). See
+// PR follow-up note.
+//
+// Like freight, the price floor can't know the buyer's province in advance
+// (SKU-level listing price, not per-order). Unlike freight, Quebec — GCI's
+// own home province and a large share of real volume — carries the highest
+// non-recoverable rate (9.975%), so "worst case" here isn't a remote edge
+// case the way zone 16 freight is. Default to the worst case (QC) rather
+// than a padded-down "typical" compromise.
 
-export const ASSUME_TAX_RECOVERABLE = false; // ← flip to `true` once confirmed with Pat/accountant
+export type Province =
+  | 'AB' | 'BC' | 'MB' | 'NB' | 'NL' | 'NS' | 'NT' | 'NU'
+  | 'ON' | 'PE' | 'QC' | 'SK' | 'YT';
 
-/** Blended non-recoverable tax rate, applied to product+eco cost only (not freight, which CT bills with its own tax treatment already reflected in invoices). */
-export const NON_RECOVERABLE_TAX_RATE = ASSUME_TAX_RECOVERABLE ? 0 : 0.12;
+export const NON_RECOVERABLE_TAX_BY_PROVINCE: Record<Province, number> = {
+  AB: 0, YT: 0, NT: 0, NU: 0,           // GST only, recoverable
+  ON: 0, NS: 0, NB: 0, PE: 0, NL: 0,    // HST, recoverable
+  BC: 0.07,
+  SK: 0.06,
+  MB: 0.07,
+  QC: 0.09975,
+};
+
+/** Highest non-recoverable rate across all provinces GCI ships to — the
+ * safe default for a SKU-level floor when destination isn't known yet. */
+export function worstCaseNonRecoverableTaxRate(): number {
+  return Math.max(...Object.values(NON_RECOVERABLE_TAX_BY_PROVINCE));
+}
+
+/** Exact rate for a known destination province — for post-hoc margin
+ * verification on a real order, not for setting listing-price floors. */
+export function nonRecoverableTaxRateFor(province: Province): number {
+  return NON_RECOVERABLE_TAX_BY_PROVINCE[province] ?? worstCaseNonRecoverableTaxRate();
+}
 
 // ─── Price floor ────────────────────────────────────────────────────────
 
@@ -144,7 +178,8 @@ export function computePriceFloor(
     freightStrategy === 'worst-case'
       ? worstCaseFreightPerTire(input.tireType, input.rimSize)
       : typicalZoneFreightPerTire(input.tireType, input.rimSize);
-  const taxedProductCost = input.productCost * (1 + NON_RECOVERABLE_TAX_RATE);
+  const taxRate = worstCaseNonRecoverableTaxRate(); // QC (9.975%) — see note above
+  const taxedProductCost = input.productCost * (1 + taxRate);
   const landedCost = taxedProductCost + ecoFee + freight;
   const floor = landedCost / (1 - channelFeePct - targetMarginPct);
 
