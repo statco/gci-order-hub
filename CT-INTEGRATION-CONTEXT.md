@@ -2,7 +2,7 @@
 
 **Repo:** `gci-order-hub`
 **Last updated:** 2026-08-06
-**Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **New blocker discovered same night, unresolved:** a Shopify plan-tier PII-access gap — see § 10a. Do not consider flipping `CT_DRY_RUN` until § 10a is closed.
+**Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **Shopify plan/PII gap (§ 10a) is now CLOSED** (2026-08-26, live-reverified). **Current top blocker instead: § 12** — a separate, no-repo Cowork PO-drafting tool exists outside this system's guard stack, and `ct_orders` is confirmed still empty despite real orders having flowed through since `CT_AUTO_PO_ENABLED` went live. Do not flip `CT_DRY_RUN` until § 12 is resolved.
 
 **Nothing in this repo can place a real CT order today.** See § Safety Gates.
 
@@ -669,7 +669,27 @@ just because Vercel shows it saved.
 
 ---
 
-## 10a. 🔴 Shopify plan/PII access gap — discovered 2026-08-02, unresolved
+## 10a. ✅ CLOSED 2026-08-26 — Shopify plan/PII access gap (discovered 2026-08-02)
+
+**Confirmed closed via live re-verification, following the exact steps this
+section laid out.** Store confirmed on the Grow plan (GraphQL
+`shop.plan.displayName` → `"Shopify"`, the current name for the Grow tier — no
+`partnerDevelopment`/`shopifyPlus` flags). A direct Admin GraphQL read of a
+real order (`#1014`) returned full, unredacted PII —
+`shippingAddress { firstName lastName address1 city province zip }` all
+populated (David M., Mississauga ON) — no `ACCESS_DENIED`, no stripped fields.
+This is the same query shape that returned redacted data on 2026-08-02.
+
+**Not yet done from the original step list:** admin API token regeneration
+(step 2) — worth doing per the original caution about plan-upgrade-without-
+token-rotation, even though the live read above already succeeded without it.
+The webhook-payload PII question (whether Shopify can also redact fields
+inside a webhook delivery, as opposed to Admin API reads) also remains
+formally untested — no real webhook-driven checkout order's `ct_orders` row
+has been inspected yet, since `ct_orders` is still empty (see § 12, a
+separate, unrelated reason for that).
+
+**Original text below, kept for the historical record:**
 
 **This is the current top blocker. Do not flip `CT_DRY_RUN` until this is
 closed and re-verified.**
@@ -802,3 +822,53 @@ Everything here is gated on § 10a closing first:
 
 - `gci-brain/api/shopifySync.ts` — live catalog integration.
 - `gci-walmart-sync` — unrelated commercial app in intentional test mode.
+
+---
+
+## 12. 🔴 A second, separate PO-drafting path exists — not in this repo, not in the ledger
+
+**Discovered 2026-08-26, via a Vercel/Supabase audit that found real orders with
+no corresponding `ct_orders` row.** Do not assume `ct_orders` is a complete
+record of every PO placed with CT — it isn't.
+
+Pat built a standalone Claude Cowork automation (no repo — lives outside all
+six `statco` projects) that **drafts a preview PO** for review. It:
+
+- Runs **only on manual trigger**, not on a schedule or webhook.
+- **Never sends anything to CT itself** — output is a draft for Pat to review.
+- **Does not read or write Supabase** — has zero visibility into `ct_orders`,
+  `walmart_shopify_mirror`, or any claim/idempotency mechanism this repo relies
+  on, and vice versa: this repo has zero visibility into it.
+- After Pat reviews a draft, **he sends the PO to CT manually** (email/portal).
+  The Shopify order is then tagged `po-drafted` (alongside the existing
+  `gci-walmart-mirror` tag where applicable) — confirmed on real orders
+  including `#1013`, `#1014`.
+
+**Why it exists:** built as a stopgap to semi-automate PO drafting while
+waiting on the Shopify Grow upgrade (§10a) and full automation to be ready.
+**Shopify is now on Grow as of this session (§10a below, confirmed closed)**
+— this tool's original reason for existing may now be largely resolved; worth
+a deliberate decision on retiring it rather than letting it run indefinitely
+alongside the real pipeline.
+
+**The actual risk:** an order tagged `po-drafted` has **already had a real PO
+manually sent to CT** — it is spoken for. But nothing in this repo's guard
+stack (mirror idempotency, `gci-walmart-mirror` webhook guard, `ct_orders`
+claim) knows that. The moment `CT_AUTO_PO_ENABLED` + `CT_DRY_RUN=false` go
+live together, `routeOrderToCT()` has no way to see that a `po-drafted` order
+was already handled — it would attempt to claim and submit it again, a real
+duplicate PO against the live credit line, the exact failure mode § 1's guard
+stack exists to prevent. **`po-drafted` is not currently checked anywhere in
+`classifyLineItems()`, `claimOrder()`, or `routeOrderToCT()`.**
+
+**Before live CT automation is ever turned on**, one of the following must
+happen:
+1. Retire the Cowork tool entirely once the real pipeline is trusted, so
+   there's only one path again, or
+2. Add a `po-drafted` tag check to `routeOrderToCT()` (or `claimOrder()`) that
+   refuses/flags auto-PO for any order already carrying that tag, or
+3. Have the Cowork tool write a lightweight marker row (even without full
+   ledger integration) so the two systems can see each other.
+
+Not yet decided which. Do not flip `CT_AUTO_PO_ENABLED`+`CT_DRY_RUN=false`
+together until one of these is in place.
