@@ -14,6 +14,12 @@
 // is untouched.
 //
 // ─── FLOW, IN ORDER ───────────────────────────────────────────────────────
+//   0. po-drafted tag guard — BEFORE anything else. A human may have already
+//      sent CT a real PO by hand via the Cowork PO-drafting tool (no repo,
+//      no Supabase access — see CT-INTEGRATION-CONTEXT.md §12). That tool's
+//      only trace in this system is the 'po-drafted' Shopify tag, so it's
+//      checked first, before any ledger claim, CT call, or even the
+//      installer check below.
 //   1. ship_to_installer refusal — BEFORE any ledger claim. Installer
 //      shipping data isn't modeled yet; order-router.ts used to send empty
 //      address fields straight into submitOrder(), which threw a raw
@@ -123,9 +129,18 @@ export interface RouteOrderToCTInput {
   email?: string;
   phone?: string;
   meta?:  RouteOrderMeta;
+  /**
+   * Shopify order tags, if the caller has them (order-router.ts's webhook
+   * payload carries these directly; maybeRouteToCT()'s mirror-time call
+   * currently does not, since a just-created mirror order can't yet carry a
+   * tag a human adds later — see CT-INTEGRATION-CONTEXT.md §12). Checked
+   * only for PO_DRAFTED_TAG below.
+   */
+  tags?: string[];
 }
 
 export type RouteOrderOutcome =
+  | { kind: 'po_drafted_skip';    reason: string }
   | { kind: 'installer_refused';  reason: string }
   | { kind: 'not_configured';     reason: string }
   | { kind: 'no_ct_items';        reason: string }
@@ -135,10 +150,38 @@ export type RouteOrderOutcome =
   | { kind: 'failed';             poNumber: string; reason: string }
   | { kind: 'indeterminate';      poNumber: string; reason: string };
 
+/**
+ * Set by a human (via the Cowork PO-drafting tool — no repo, see
+ * CT-INTEGRATION-CONTEXT.md §12) once they've manually sent a real PO to CT
+ * for this order. That tool has no Supabase access and never touches
+ * ct_orders, so this tag is the ONLY signal this repo has that an order was
+ * already handled outside the ledger. Must be checked before any claim.
+ */
+export const PO_DRAFTED_TAG = 'po-drafted';
+
 // ─── Main entry point ──────────────────────────────────────────────────────
 
 export async function routeOrderToCT(input: RouteOrderToCTInput): Promise<RouteOrderOutcome> {
   const meta = input.meta ?? {};
+
+  // ── 0. po-drafted guard — BEFORE anything else, including the installer
+  // check below. If a human already sent CT a real PO by hand for this
+  // order (via the no-repo Cowork tool — see CT-INTEGRATION-CONTEXT.md §12),
+  // auto-routing must never attempt to claim or submit it again: that would
+  // be a real duplicate PO against a live credit line, the exact failure
+  // mode § 1's guard stack exists to prevent. This is the cheapest possible
+  // check (no CT call, no ledger claim), so it runs first.
+  if (input.tags?.includes(PO_DRAFTED_TAG)) {
+    const reason =
+      `Order carries '${PO_DRAFTED_TAG}' — a PO was already manually drafted ` +
+      `and sent to CT by hand (Cowork tool, no repo — see ` +
+      `CT-INTEGRATION-CONTEXT.md §12). Refusing auto-PO to avoid a duplicate submission.`;
+    console.warn(`[ct-order-routing] ${input.channel} ${input.sourceOrderNumber}: ${reason}`);
+    await sendCtRoutingAlert(input, null, {
+      outcomeLine: `⏭️ Skipped auto-PO — already manually drafted/sent (tag: ${PO_DRAFTED_TAG})`,
+    });
+    return { kind: 'po_drafted_skip', reason };
+  }
 
   // ── 1. Installer refusal — BEFORE any ledger claim ──────────────────────
   if (input.shipToInstaller) {

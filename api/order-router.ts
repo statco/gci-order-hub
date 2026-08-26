@@ -258,6 +258,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // today's behavior for "CT auto-PO didn't happen". Nothing here is a
       // hard dependency on CT being ready.
       let autoSubmittedCtPoId: string | undefined;
+      let skipManualNotify = false;
       if (CT_AUTO_PO_ENABLED) {
         try {
           const outcome = await routeOrderToCT({
@@ -282,11 +283,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             installerName:   installer.installerName,
             installerId:     installer.installerId,
             meta: { resultingShopifyOrderNumber: order.name },
+            tags: (order.tags ?? '').split(',').map((t) => t.trim()).filter(Boolean),
           });
 
           if (outcome.kind === 'submitted') {
             autoSubmittedCtPoId = outcome.ctOrderNumber;
             console.log(`✅ CT auto-PO submitted for order ${order.name}: ${autoSubmittedCtPoId}`);
+          } else if (outcome.kind === 'po_drafted_skip') {
+            // A human already sent CT a real PO by hand for this order (see
+            // CT-INTEGRATION-CONTEXT.md §12) — do NOT fall through to the
+            // manual-authorize notification below; that would ask someone to
+            // do a job that's already done. routeOrderToCT() already sent
+            // its own Telegram alert for this outcome.
+            skipManualNotify = true;
+            console.log(`⏭️  CT routing for order ${order.name}: already manually drafted/sent — skipping manual-authorize notification.`);
           } else if (outcome.kind === 'not_configured') {
             console.log(`ℹ️  CT auto-PO not yet configured — falling back to manual authorize flow for ${order.name}`);
           } else if (outcome.kind === 'already_claimed') {
@@ -300,44 +310,53 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       }
 
-      const authUrl = buildAuthorizeUrl({
-        orderId:     order.id,
-        orderNumber: order.name,
-        supplierType:'TIRE',
-        exp:         Date.now() + 24 * 60 * 60 * 1_000,
-      });
+      if (skipManualNotify) {
+        // Order already carries the 'po-drafted' tag — a human already sent
+        // CT a real PO by hand (Cowork tool, no repo — see
+        // CT-INTEGRATION-CONTEXT.md §12). Sending a manual-authorize
+        // notification here would ask someone to do a job that's already
+        // done; routeOrderToCT() already sent its own Telegram alert.
+        results.push('TIRE: already manually drafted/sent — no notification sent');
+      } else {
+        const authUrl = buildAuthorizeUrl({
+          orderId:     order.id,
+          orderNumber: order.name,
+          supplierType:'TIRE',
+          exp:         Date.now() + 24 * 60 * 60 * 1_000,
+        });
 
-      const po = {
-        shopifyOrderId: order.id,
-        orderNumber:    order.name,
-        createdAt:      new Date().toISOString(),
-        items:          notifyItems,
-        shippingAddress: installer.fulfillmentType === 'ship_to_installer'
-          ? { note: `Ship to installer: ${installer.installerName} (id: ${installer.installerId})` }
-          : addr,
-        installerMeta: installer,
-        autoSubmittedCtPoId,
-      };
-      console.log('🛞 TIRE PO:', JSON.stringify(po));
+        const po = {
+          shopifyOrderId: order.id,
+          orderNumber:    order.name,
+          createdAt:      new Date().toISOString(),
+          items:          notifyItems,
+          shippingAddress: installer.fulfillmentType === 'ship_to_installer'
+            ? { note: `Ship to installer: ${installer.installerName} (id: ${installer.installerId})` }
+            : addr,
+          installerMeta: installer,
+          autoSubmittedCtPoId,
+        };
+        console.log('🛞 TIRE PO:', JSON.stringify(po));
 
-      const notify: NotifyPayload = {
-        shopifyOrderId:   order.id,
-        orderNumber:      order.name,
-        supplierType:     'TIRE',
-        items:            notifyItems,
-        totalCost,
-        authorizeUrl:     authUrl,
-        customerName:     custName,
-        shippingCity:     addr.city          ?? '',
-        shippingProvince: addr.province_code ?? addr.province ?? '',
-        installerName:    installer.installerName  || undefined,
-        appointmentDate:  installer.appointmentDate || undefined,
-        autoSubmittedCtPoId,
-      };
-      await sendOrderNotification(notify);
-      results.push(autoSubmittedCtPoId
-        ? `TIRE: auto-submitted to CT (PO ${autoSubmittedCtPoId}) + notification sent`
-        : 'TIRE: PO built + notification sent');
+        const notify: NotifyPayload = {
+          shopifyOrderId:   order.id,
+          orderNumber:      order.name,
+          supplierType:     'TIRE',
+          items:            notifyItems,
+          totalCost,
+          authorizeUrl:     authUrl,
+          customerName:     custName,
+          shippingCity:     addr.city          ?? '',
+          shippingProvince: addr.province_code ?? addr.province ?? '',
+          installerName:    installer.installerName  || undefined,
+          appointmentDate:  installer.appointmentDate || undefined,
+          autoSubmittedCtPoId,
+        };
+        await sendOrderNotification(notify);
+        results.push(autoSubmittedCtPoId
+          ? `TIRE: auto-submitted to CT (PO ${autoSubmittedCtPoId}) + notification sent`
+          : 'TIRE: PO built + notification sent');
+      }
     } catch (err: any) {
       console.error('❌ TIRE routing error:', err);
       errors.push(`TIRE: ${err.message}`);
