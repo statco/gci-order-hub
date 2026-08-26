@@ -28,6 +28,7 @@ import {
   lineItemsSummary,
   buildUnknownItemsAlert,
   buildCtRoutingAlert,
+  PO_DRAFTED_TAG,
   type RouteOrderToCTInput,
 } from '../lib/ct-order-routing.js';
 import type { CTClassification } from '../lib/ct-client.js';
@@ -133,6 +134,28 @@ test('an installer refusal (no classification yet) still renders a usable alert'
   });
   assert.ok(text.includes('⚠️ manual PO required — ship-to-installer'));
   // Falls back to the raw lineItems (no classification to draw from yet).
+  assert.ok(text.includes('200E1059'));
+});
+
+console.log('\npo-drafted guard (§12 — see CT-INTEGRATION-CONTEXT.md)');
+
+test('PO_DRAFTED_TAG matches the literal tag the Cowork tool applies', () => {
+  // Guards against silent drift between this constant and the tag documented
+  // in CT-INTEGRATION-CONTEXT.md §12 / observed on real orders (#1013, #1014).
+  assert.equal(PO_DRAFTED_TAG, 'po-drafted');
+});
+
+test('a po-drafted-skip outcome renders a clear, non-alarming alert with no classification', () => {
+  // Mirrors the installer-refusal test above: routeOrderToCT() calls
+  // sendCtRoutingAlert() with classification=null for this outcome too,
+  // since it returns before classifyLineItems() ever runs (see step 0's
+  // module-header comment).
+  const text = buildCtRoutingAlert(baseInput({ tags: [PO_DRAFTED_TAG] }), null, {
+    outcomeLine: `⏭️ Skipped auto-PO — already manually drafted/sent (tag: ${PO_DRAFTED_TAG})`,
+  });
+  assert.ok(text.includes('Skipped auto-PO'));
+  assert.ok(text.includes(PO_DRAFTED_TAG));
+  // Falls back to the raw lineItems, same as the installer-refusal case.
   assert.ok(text.includes('200E1059'));
 });
 

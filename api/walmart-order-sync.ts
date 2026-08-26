@@ -393,6 +393,13 @@ export async function maybeRouteToCT(
         deliverByDate:               formatWalmartDate(order.shippingInfo?.estimatedDeliveryDate),
         revenue:                     walmartLines.reduce((sum, l) => sum + getLinePrice(l), 0),
       },
+      // tags intentionally omitted: this call fires synchronously, in-process,
+      // immediately after the Shopify order was just created by the mirror —
+      // a human can't have tagged it 'po-drafted' yet (see
+      // ct-order-routing.ts's PO_DRAFTED_TAG guard and CT-INTEGRATION-
+      // CONTEXT.md §12). If this function is ever called again later for the
+      // same order (e.g. a future retry/backfill path), that caller MUST
+      // fetch and pass current Shopify tags — do not copy this omission.
     });
     console.log(`[order-sync] CT routing for ${order.purchaseOrderId} (Shopify ${shopifyOrderNumber}): ${ctOutcome.kind}`);
   } catch (err: any) {
