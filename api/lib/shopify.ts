@@ -21,6 +21,113 @@ export interface ShopifyVariantData {
   inventoryQuantity: number | null;
 }
 
+export interface ShopifyOrderLookup {
+  id:        string;   // gid://shopify/Order/...
+  name:      string;   // "#1044"
+  email:     string | null;
+  phone:     string | null;
+  tags:      string[];
+  customAttributes: { key: string; value: string }[];
+  lineItems: { sku: string; quantity: number }[];
+  shippingAddress: {
+    name?:        string;
+    address1?:    string;
+    address2?:    string;
+    city?:        string;
+    province?:    string;
+    postalCode?:  string;
+    country?:     string;
+    phone?:       string;
+  } | null;
+}
+
+/**
+ * Fetch a single order by its Shopify order name (e.g. "#1044" or "1044" —
+ * both work, Shopify's search normalises the leading #). Returns null if no
+ * matching order is found. Used by admin-canary-ct-order.ts to re-fetch a
+ * real, already-existing order's current state before manually re-routing
+ * it through routeOrderToCT() — see CT-INTEGRATION-CONTEXT.md §13.
+ */
+export async function fetchOrderByName(orderName: string): Promise<ShopifyOrderLookup | null> {
+  if (!SHOPIFY_STORE || !SHOPIFY_TOKEN) {
+    throw new Error('Shopify credentials not configured (SHOPIFY_STORE_DOMAIN / SHOPIFY_ADMIN_API_TOKEN)');
+  }
+
+  // Strip characters that could break out of the query-string literal below.
+  // This is an internal admin endpoint (not user input from the internet),
+  // but defensive anyway since it's string-interpolated GraphQL.
+  const cleanName = orderName.trim().replace(/["\\]/g, '');
+  const query = `{
+    orders(first: 1, query: "name:${cleanName}") {
+      edges {
+        node {
+          id
+          name
+          email
+          phone
+          tags
+          customAttributes { key value }
+          lineItems(first: 100) {
+            edges { node { sku quantity } }
+          }
+          shippingAddress {
+            name
+            address1
+            address2
+            city
+            provinceCode
+            zip
+            countryCodeV2
+            phone
+          }
+        }
+      }
+    }
+  }`;
+
+  const res = await fetch(
+    `https://${SHOPIFY_STORE}/admin/api/${API_VERSION}/graphql.json`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query }),
+    },
+  );
+
+  if (!res.ok) throw new Error(`Shopify GraphQL error: ${res.status} ${(await res.text()).slice(0, 200)}`);
+  const data: any = await res.json();
+  if (data.errors) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors).slice(0, 200)}`);
+
+  const edge = data?.data?.orders?.edges?.[0];
+  if (!edge) return null;
+  const node = edge.node;
+
+  return {
+    id:    node.id,
+    name:  node.name,
+    email: node.email ?? null,
+    phone: node.phone ?? null,
+    tags:  (node.tags ?? []) as string[],
+    customAttributes: (node.customAttributes ?? []).map((a: any) => ({ key: a.key, value: a.value })),
+    lineItems: (node.lineItems?.edges ?? [])
+      .map((e: any) => ({ sku: (e.node.sku ?? '').toUpperCase(), quantity: e.node.quantity }))
+      .filter((i: any) => i.sku),
+    shippingAddress: node.shippingAddress ? {
+      name:       node.shippingAddress.name ?? undefined,
+      address1:   node.shippingAddress.address1 ?? undefined,
+      address2:   node.shippingAddress.address2 ?? undefined,
+      city:       node.shippingAddress.city ?? undefined,
+      province:   node.shippingAddress.provinceCode ?? undefined,
+      postalCode: node.shippingAddress.zip ?? undefined,
+      country:    node.shippingAddress.countryCodeV2 ?? undefined,
+      phone:      node.shippingAddress.phone ?? undefined,
+    } : null,
+  };
+}
+
 /**
  * Fetch ALL Shopify variants (sku, price, cost, inventoryQuantity) via
  * GraphQL cursor pagination. Returns a Map keyed by UPPER-cased SKU.

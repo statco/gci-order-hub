@@ -29,6 +29,7 @@ import {
   buildUnknownItemsAlert,
   buildCtRoutingAlert,
   PO_DRAFTED_TAG,
+  isCanaryMatch,
   type RouteOrderToCTInput,
 } from '../lib/ct-order-routing.js';
 import type { CTClassification } from '../lib/ct-client.js';
@@ -157,6 +158,14 @@ test('a po-drafted-skip outcome renders a clear, non-alarming alert with no clas
   assert.ok(text.includes(PO_DRAFTED_TAG));
   // Falls back to the raw lineItems, same as the installer-refusal case.
   assert.ok(text.includes('200E1059'));
+});
+
+console.log('\ncanary override (§13 — see CT-INTEGRATION-CONTEXT.md)');
+
+test('isCanaryMatch() is false by default — no env vars set means no order can match', () => {
+  assert.equal(isCanaryMatch(''), false);
+  assert.equal(isCanaryMatch('#1044'), false);
+  assert.equal(isCanaryMatch('309117859146786'), false);
 });
 
 console.log(`\n✅ ${passed} assertions passed\n`);

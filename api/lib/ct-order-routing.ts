@@ -66,6 +66,7 @@ import {
   classifyLineItems,
   submitOrder,
   CT_DRY_RUN,
+  CT_ENVIRONMENT,
   CTNotConfiguredError,
   CTInsufficientStockError,
   CTValidationError,
@@ -159,6 +160,40 @@ export type RouteOrderOutcome =
  */
 export const PO_DRAFTED_TAG = 'po-drafted';
 
+// ─── Canary override — see CT-INTEGRATION-CONTEXT.md §13 ─────────────────
+//
+// A deliberate, single-order escape hatch from the global CT_DRY_RUN=true
+// default, for the FIRST real submitOrder() call ever made against CT.
+// There is no CT sandbox — this is how that first call gets made safely,
+// supervised, and scoped to exactly one order instead of flipping the
+// global switch for everything at once.
+//
+// Two separate env vars must BOTH be set and match for this to arm:
+//   CT_CANARY_SOURCE_ORDER_NUMBER — exact match against sourceOrderNumber
+//     (Shopify order name like "#1044", or Walmart purchaseOrderId).
+//   CT_CANARY_CONFIRM             — must equal CT_CANARY_CONFIRM_PHRASE
+//     exactly. A second, deliberately awkward-to-fat-finger value so a
+//     single leftover/typo'd env var can't arm this by accident.
+//
+// Both are read from Vercel env vars, which require an explicit redeploy to
+// take effect (see § 10 "Any change to an env var in Vercel requires an
+// explicit redeploy" below) — that redeploy requirement is a FEATURE here:
+// it means arming the canary is a deliberate two-step action (set vars,
+// redeploy), not something that can happen in a single click.
+//
+// 🔴 REMOVE BOTH VARS AND REDEPLOY IMMEDIATELY after the canary order's
+// outcome is confirmed — armed-and-forgotten is the failure mode here.
+export const CT_CANARY_SOURCE_ORDER_NUMBER = process.env.CT_CANARY_SOURCE_ORDER_NUMBER || '';
+export const CT_CANARY_CONFIRM_PHRASE = 'I_UNDERSTAND_THIS_SUBMITS_A_REAL_CT_ORDER';
+export const CT_CANARY_ARMED =
+  !!CT_CANARY_SOURCE_ORDER_NUMBER &&
+  process.env.CT_CANARY_CONFIRM === CT_CANARY_CONFIRM_PHRASE;
+
+/** Pure — exported for unit testing. Exact match only, no prefix/substring. */
+export function isCanaryMatch(sourceOrderNumber: string): boolean {
+  return CT_CANARY_ARMED && sourceOrderNumber === CT_CANARY_SOURCE_ORDER_NUMBER;
+}
+
 // ─── Main entry point ──────────────────────────────────────────────────────
 
 export async function routeOrderToCT(input: RouteOrderToCTInput): Promise<RouteOrderOutcome> {
@@ -181,6 +216,26 @@ export async function routeOrderToCT(input: RouteOrderToCTInput): Promise<RouteO
       outcomeLine: `⏭️ Skipped auto-PO — already manually drafted/sent (tag: ${PO_DRAFTED_TAG})`,
     });
     return { kind: 'po_drafted_skip', reason };
+  }
+
+  // ── 0.5 canary check — computed once, used at claim (step 3) and submit
+  // (step 4) below. Deliberately does NOT short-circuit here: a canary order
+  // must still go through every real check (installer refusal, classify,
+  // claim) exactly like any other order — the whole point is to exercise the
+  // real pipeline end to end, not skip steps. It only overrides the final
+  // dry-run/live decision at the bottom. Logged and alerted immediately, here,
+  // so there's a clear "canary armed and matched" signal even if something
+  // later in the pipeline returns early (e.g. no_ct_items) before ever
+  // reaching submit.
+  const isCanary = isCanaryMatch(input.sourceOrderNumber);
+  if (isCanary) {
+    const canaryMsg =
+      `🐤 CANARY MATCH — ${input.channel} order '${input.sourceOrderNumber}' matches ` +
+      `CT_CANARY_SOURCE_ORDER_NUMBER. This order WILL be submitted LIVE to CT ` +
+      `(env='${CT_ENVIRONMENT}') if it reaches step 4, regardless of CT_DRY_RUN. ` +
+      `Remove CT_CANARY_SOURCE_ORDER_NUMBER / CT_CANARY_CONFIRM and redeploy once confirmed.`;
+    console.warn(`[ct-order-routing] ${canaryMsg}`);
+    await sendTelegramMessage(`🐤 <b>CT CANARY MATCHED</b>\n${canaryMsg}`, 'actionable');
   }
 
   // ── 1. Installer refusal — BEFORE any ledger claim ──────────────────────
@@ -226,7 +281,11 @@ export async function routeOrderToCT(input: RouteOrderToCTInput): Promise<RouteO
     channel:            input.channel,
     sourceOrderId:      input.sourceOrderId,
     sourceOrderNumber:  input.sourceOrderNumber,
-    dryRun:             CT_DRY_RUN,
+    // isCanary overrides the global dry-run flag for this one order — the
+    // ledger must reflect that from the moment of claim, not just at
+    // markSubmitted() afterward, or a reviewer reading ct_orders mid-flight
+    // would see a claimed-as-dry-run row for an order that's actually live.
+    dryRun:             CT_DRY_RUN && !isCanary,
     requestPayload:     { lineItems: input.lineItems, shipTo: input.shipTo },
   });
 
@@ -261,6 +320,7 @@ export async function routeOrderToCT(input: RouteOrderToCTInput): Promise<RouteO
       shipping,
       email:    input.email,
       phone:    input.phone || input.shipTo.phone,
+      forceLive: isCanary,
     });
 
     await markSubmitted(poNumber, {
@@ -285,7 +345,10 @@ export async function routeOrderToCT(input: RouteOrderToCTInput): Promise<RouteO
 
     await sendCtRoutingAlert(input, classification, {
       poNumber, ctCost, location: result.locationUsed, stockStatus: 'OK',
-      outcomeLine: `✅ CT order ${result.orderNumber} placed${result.dryRun ? ' (DRY RUN)' : ''}`,
+      outcomeLine: isCanary
+        ? `🐤 CANARY SUBMITTED LIVE — CT order ${result.orderNumber} placed for real. ` +
+          `Remove CT_CANARY_SOURCE_ORDER_NUMBER / CT_CANARY_CONFIRM and redeploy now.`
+        : `✅ CT order ${result.orderNumber} placed${result.dryRun ? ' (DRY RUN)' : ''}`,
     });
 
     return {

@@ -500,6 +500,16 @@ export interface CTSubmitOrderInput {
   phone?: string;
   shipping: CTOrderShipping;
   items: { partNumber: string; quantity: number }[];
+  /**
+   * Single-order canary override (see ct-order-routing.ts's CT_CANARY_*
+   * constants / CT-INTEGRATION-CONTEXT.md §13). When true, this ONE call
+   * transmits for real regardless of the global CT_DRY_RUN default. Callers
+   * must gate this themselves — submitOrder() does not re-derive it, so a
+   * caller passing forceLive:true unconditionally would defeat the point.
+   * As of this writing, ct-order-routing.ts's routeOrderToCT() is the only
+   * caller that ever sets this, and only after isCanaryMatch() returns true.
+   */
+  forceLive?: boolean;
 }
 
 export interface CTSubmitOrderResult {
@@ -579,7 +589,7 @@ export async function submitOrder(input: CTSubmitOrderInput): Promise<CTSubmitOr
 
   const loggable = { ...payload, customerToken: '***REDACTED***' };
 
-  if (CT_DRY_RUN) {
+  if (CT_DRY_RUN && !input.forceLive) {
     console.log('🧪 CT_DRY_RUN=true — order NOT submitted. Payload that would be sent:');
     console.log(JSON.stringify(loggable, null, 2));
     return {
@@ -588,6 +598,13 @@ export async function submitOrder(input: CTSubmitOrderInput): Promise<CTSubmitOr
       items: input.items.map(i => ({ partNumber: i.partNumber, quantity: i.quantity, itemTotal: '0.00' })),
       dryRun: true, requestPayload: loggable, locationUsed: location,
     };
+  }
+
+  if (CT_DRY_RUN && input.forceLive) {
+    console.warn(
+      `🐤 CANARY OVERRIDE — CT_DRY_RUN=true globally, but forceLive=true for ` +
+      `poNumber=${input.poNumber}. Submitting for REAL despite the global dry-run default.`
+    );
   }
 
   if (CT_ENVIRONMENT === 'production') {
