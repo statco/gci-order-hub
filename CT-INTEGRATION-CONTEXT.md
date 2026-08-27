@@ -2,7 +2,7 @@
 
 **Repo:** `gci-order-hub`
 **Last updated:** 2026-08-06
-**Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **Shopify plan/PII gap (§ 10a) is now CLOSED** (2026-08-26, live-reverified). **Current top blocker instead: § 12** — a separate, no-repo Cowork PO-drafting tool exists outside this system's guard stack, and `ct_orders` is confirmed still empty despite real orders having flowed through since `CT_AUTO_PO_ENABLED` went live. Do not flip `CT_DRY_RUN` until § 12 is resolved.
+**Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **Shopify plan/PII gap (§ 10a) is now CLOSED** (2026-08-26). **§ 12 (Cowork PO-drafting tool vs. the ledger) is now CLOSED** — PR #75 merged and deployed 2026-08-26. **§ 13 adds a canary mechanism** for the first real `submitOrder()` call, since no CT sandbox exists. **Open: § 14** — `order-router.ts`'s direct-Shopify-order path has a real, confirmed latent bug (stale `TIRE-` SKU-prefix filter against a catalog that's actually bare-SKU) and needs fixing before that path can be trusted; no orders have been lost to it yet, but only because Pat has been checking dashboards manually.
 
 **Nothing in this repo can place a real CT order today.** See § Safety Gates.
 
@@ -870,5 +870,118 @@ happen:
 3. Have the Cowork tool write a lightweight marker row (even without full
    ledger integration) so the two systems can see each other.
 
-Not yet decided which. Do not flip `CT_AUTO_PO_ENABLED`+`CT_DRY_RUN=false`
-together until one of these is in place.
+**✅ RESOLVED 2026-08-26 — option 2 implemented and merged.** PR #75
+(`fix/po-drafted-guard`), deployed to production the same day. `po-drafted`
+is now checked as the very first thing `routeOrderToCT()` does — see the
+guard at the top of that function and the `PO_DRAFTED_TAG` constant above.
+Options 1 and 3 remain open as future simplifications (retiring the Cowork
+tool once the real pipeline is trusted) but are no longer blocking.
+
+---
+
+## 13. Canary override — the mechanism for the FIRST real `submitOrder()` call
+
+**No CT sandbox exists.** `submitOrder()` (the `createOrder` RESTlet) has
+never been called in any environment — everything to date, including manual
+PO `GCI-2026-447270`, has been either fully manual or `CT_DRY_RUN=true`. This
+section is how the very first real call gets made safely: scoped to one
+order, supervised, without flipping the global `CT_DRY_RUN` switch for every
+order at once.
+
+### How it works
+
+Two env vars, both required, both checked in `ct-order-routing.ts`:
+
+- `CT_CANARY_SOURCE_ORDER_NUMBER` — exact match against `sourceOrderNumber`
+  (Shopify order name like `#1044`, or a Walmart `purchaseOrderId`).
+- `CT_CANARY_CONFIRM` — must equal the literal string
+  `I_UNDERSTAND_THIS_SUBMITS_A_REAL_CT_ORDER` exactly. A second, deliberately
+  awkward value so one leftover/typo'd env var can't arm this by accident.
+
+When both match, `routeOrderToCT()` still runs the **entire normal
+pipeline** for that order — installer refusal, `po-drafted` guard,
+`classifyLineItems()`, `claimOrder()` — nothing is skipped. Only the final
+`submitOrder()` call is forced live (`forceLive: true`), overriding the
+global `CT_DRY_RUN` for that one call only. `claimOrder()`'s own `dryRun`
+field is also computed with the canary in mind, so the ledger reflects
+reality from the moment of claim, not just after the fact.
+
+Every step logs loudly and sends a dedicated, unmissable Telegram alert
+(`🐤 CT CANARY MATCHED`, then `🐤 CANARY SUBMITTED LIVE` on success) — separate
+from the routine per-outcome alerts, so this never blends into normal noise.
+
+Both env vars require an explicit Vercel redeploy to take effect (see § 10's
+🔴 callout) — that's a **feature**, not friction: arming the canary is a
+deliberate two-step action, not a single click.
+
+**🔴 Remove both vars and redeploy again immediately after the canary
+order's outcome is confirmed.** Armed-and-forgotten is the actual failure
+mode here — a leftover `CT_CANARY_SOURCE_ORDER_NUMBER` matching some future
+order's number by coincidence would silently force a real submission.
+
+### Triggering it against a real order
+
+Shopify webhooks fire once, at order creation — by the time you've picked
+which order to canary and armed the vars, that order's webhook already fired
+(and, since CT isn't configured, almost certainly returned `not_configured`).
+`api/admin-canary-ct-order.ts` (`POST`, `CRON_SECRET`-protected) re-fetches a
+named order fresh from Shopify and re-runs it through the exact same
+`routeOrderToCT()` — the "re-deliver the webhook" mechanism. It does NOT
+decide live-vs-dry-run itself; that's still entirely the two env vars above.
+It refuses ship-to-installer orders and Walmart-mirrored orders (recommend
+picking a plain direct-to-customer order for the first test) — see the file
+header for the full safety notes.
+
+**🔴 `claimOrder()` writes a real, permanent row to the shared `ct_orders`
+table the moment it's called — even when the resulting submission is
+dry-run.** `dry_run: true` gets stored on the row, but the row and the PO
+number it burns are real. This is a genuine side effect on shared production
+data, not a true no-op — treat "let's dry-run the rehearsal" as a real
+action worth confirming, not something to run casually.
+
+### Recommended first real order
+
+Given only 4 real orders have ever been placed and delivered — `#1003`,
+`#1011` (direct), and the two Walmart-mirrored deliveries — `#1003` or
+`#1011` are the natural candidates: real, already fulfilled, already known
+to be correct (customer received their tires), so a canary run tests
+`submitOrder()`'s real behavior without any risk of the *order itself* being
+wrong. A **dry-run rehearsal first** (call `admin-canary-ct-order.ts` with
+neither canary env var set) proves the whole pipeline — Shopify fetch,
+classification, ledger claim — against real historical data with zero
+chance of anything transmitting to CT, since CT still isn't configured
+either way. It still burns a real `ct_orders` row and PO number, per above.
+
+---
+
+## 14. 🔴 `order-router.ts`'s TIRE_PREFIX filter is stale against the live catalog
+
+**Discovered 2026-08-27**, while building § 13's canary tooling. Real,
+current Shopify line-item SKUs are **bare** — no prefix. Confirmed against 4
+real orders pulled live: `#1011` → `200E2108`, `#1010` → `200E2108`, `#1003`
+→ `200E2096`/`200E2101`, `#1001` → `MV688`. None carry the `TIRE-` prefix
+`order-router.ts`'s webhook handler requires to build a PO / send a
+notification.
+
+**What this means:** any line item on a direct Shopify checkout order
+(`orders/paid` webhook → `order-router.ts`) falls into `unknownItems`, which
+gets `console.warn()`'d and **nothing else** — no Telegram, no email. The
+module header comment even documents this as intentional design: *"(anything
+else → unknownItems, logged, not auto-processed)"* — it just predates the
+catalog's current bare-SKU convention.
+
+**Confirmed with Pat (2026-08-27): no orders were actually missed.** All 4
+real direct/Walmart orders to date (`#1013`, `#1012`, `#1011`, `#1003`)
+predate this automation being built or activated — Pat found and processed
+every one of them by manually checking the Shopify/Walmart dashboards
+directly, not via any alert from this system. So this is a real, live latent
+bug, not an active incident — but it means **the direct-Shopify-order path
+has never actually alerted on a real order**, and won't, until fixed.
+
+**Not yet fixed.** § 13's `admin-canary-ct-order.ts` deliberately does NOT
+repeat this mistake — it hands every line item to `classifyLineItems()` (CT's
+real product-search RESTlet) rather than filtering by a local prefix
+heuristic, matching how `maybeRouteToCT()` (the Walmart path, which has
+always worked correctly) already does it. `order-router.ts` itself is the
+one place this is still broken and needs the same fix before the direct
+Shopify order path can be trusted.
