@@ -593,7 +593,16 @@ export async function submitOrder(input: CTSubmitOrderInput): Promise<CTSubmitOr
     console.log('🧪 CT_DRY_RUN=true — order NOT submitted. Payload that would be sent:');
     console.log(JSON.stringify(loggable, null, 2));
     return {
-      id: '', orderNumber: 'DRY-RUN', orderTotal: '0.00', salesTax: '0.00',
+      // id was previously '' (empty) here — see CT-INTEGRATION-CONTEXT.md §15.
+      // markSubmitted() requires a non-empty ctInternalId and throws
+      // otherwise, which routeOrderToCT()'s catch-all was misinterpreting as
+      // "CT may have silently committed this order" and escalating to the
+      // maximum-severity indeterminate alarm, on EVERY dry-run success.
+      // 'DRY-RUN' here matches the existing orderNumber sentinel below, and
+      // dry_run:true (stored on the same ledger row) is the real signal for
+      // "this isn't a genuine CT internal id" — never match on this string
+      // alone to determine dry-run status.
+      id: 'DRY-RUN', orderNumber: 'DRY-RUN', orderTotal: '0.00', salesTax: '0.00',
       tireTax: '0.00', shippingCost: '0.00',
       items: input.items.map(i => ({ partNumber: i.partNumber, quantity: i.quantity, itemTotal: '0.00' })),
       dryRun: true, requestPayload: loggable, locationUsed: location,
