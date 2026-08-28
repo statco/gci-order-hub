@@ -2,7 +2,7 @@
 
 **Repo:** `gci-order-hub`
 **Last updated:** 2026-08-06
-**Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **Shopify plan/PII gap (§ 10a) is now CLOSED** (2026-08-26). **§ 12 (Cowork PO-drafting tool vs. the ledger) is now CLOSED** — PR #75 merged and deployed 2026-08-26. **§ 13 adds a canary mechanism** for the first real `submitOrder()` call, since no CT sandbox exists. **Open: § 14** — `order-router.ts`'s direct-Shopify-order path has a real, confirmed latent bug (stale `TIRE-` SKU-prefix filter against a catalog that's actually bare-SKU) and needs fixing before that path can be trusted; no orders have been lost to it yet, but only because Pat has been checking dashboards manually.
+**Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **Shopify plan/PII gap (§ 10a) is now CLOSED** (2026-08-26). **§ 12 (Cowork PO-drafting tool vs. the ledger) is now CLOSED** — PR #75 merged and deployed 2026-08-26. **§ 13 adds a canary mechanism** for the first real `submitOrder()` call, since no CT sandbox exists. **🔴 Current real blocker, found 2026-08-27 via that canary tooling: § 10 — the CT credentials were configured in the WRONG Vercel project (`gci-brain` instead of `gci-order-hub`)**, which likely explains every `not_configured` outcome to date, independent of the separately-pending CT sandbox creds. Not yet fixed. **Also open: § 14** — `order-router.ts`'s direct-Shopify-order path has a stale `TIRE-` SKU-prefix filter; no orders lost yet, but only because Pat has been checking dashboards manually.
 
 **Nothing in this repo can place a real CT order today.** See § Safety Gates.
 
@@ -634,13 +634,41 @@ creating Shopify orders or acknowledging on Walmart.
 
 ## 10. Environment variables
 
+**🔴 CONFIRMED WRONG 2026-08-27 — the five `CT_*` credential rows below are
+NOT actually set in `gci-order-hub`'s Vercel project.** Live-verified via
+`admin-canary-ct-order.ts` against real order `#1003`:
+`assertConfigured()` (which checks the fully-resolved value *after* the
+sandbox→production fallback in `creds()`) reported all five as missing —
+`CT_CONSUMER_KEY`, `CT_CONSUMER_SECRET`, `CT_TOKEN_ID`, `CT_TOKEN_SECRET`,
+`CT_CUSTOMER_API_TOKEN`. **Root cause found: they were set in the `gci-brain`
+Vercel project instead.** `gci-brain` and `gci-order-hub` are separate Vercel
+projects with fully isolated env vars — nothing copies between them
+automatically. This has presumably been the REAL reason every real order's
+CT routing has returned `not_configured` all along — not (only) the pending
+sandbox creds from the CT rep.
+
+**Fix (not yet done — needs Pat, no tool access to copy Vercel env vars):**
+copy all five `CT_*` credential values from `gci-brain`'s Production env vars
+into `gci-order-hub`'s Production env vars, then redeploy `gci-order-hub`
+(env var changes require an explicit redeploy — see the 🔴 callout below).
+After that, re-run the `admin-canary-ct-order.ts` rehearsal against `#1003`
+again to confirm `classifyLineItems()` now succeeds instead of returning
+`not_configured`.
+
+The table below is kept as originally written for historical record, but
+treat the "set in Vercel" notes as **aspirational until re-verified**, not
+current fact — this is now the second time this doc has stated something
+about Vercel config that live testing contradicted (see § 10a for the
+first). Live re-verification via a real call, not doc text, is now the
+standard for anything credential-related in this file.
+
 | Variable | Value / default | Notes |
 |---|---|---|
-| `CT_CONSUMER_KEY` | set in Vercel | |
-| `CT_CONSUMER_SECRET` | set in Vercel | |
-| `CT_TOKEN_ID` | set in Vercel | |
-| `CT_TOKEN_SECRET` | set in Vercel | |
-| `CT_CUSTOMER_API_TOKEN` | set in Vercel | the `d!U3^…` value; pairs with 19997 |
+| `CT_CONSUMER_KEY` | ❌ confirmed NOT in `gci-order-hub` (was in `gci-brain`) | |
+| `CT_CONSUMER_SECRET` | ❌ confirmed NOT in `gci-order-hub` (was in `gci-brain`) | |
+| `CT_TOKEN_ID` | ❌ confirmed NOT in `gci-order-hub` (was in `gci-brain`) | |
+| `CT_TOKEN_SECRET` | ❌ confirmed NOT in `gci-order-hub` (was in `gci-brain`) | |
+| `CT_CUSTOMER_API_TOKEN` | ❌ confirmed NOT in `gci-order-hub` (was in `gci-brain`) | the `d!U3^…` value; pairs with 19997 |
 | `CT_CUSTOMER_ID` | `19997` | defaults to 19997 with warning if unset |
 | `CT_ENVIRONMENT` | default `sandbox` | `production` to activate |
 | `CT_AUTO_PO_ENABLED` | **`true`** (set 2026-08-02) | routing is live for real orders |
@@ -932,12 +960,19 @@ It refuses ship-to-installer orders and Walmart-mirrored orders (recommend
 picking a plain direct-to-customer order for the first test) — see the file
 header for the full safety notes.
 
-**🔴 `claimOrder()` writes a real, permanent row to the shared `ct_orders`
-table the moment it's called — even when the resulting submission is
-dry-run.** `dry_run: true` gets stored on the row, but the row and the PO
-number it burns are real. This is a genuine side effect on shared production
-data, not a true no-op — treat "let's dry-run the rehearsal" as a real
-action worth confirming, not something to run casually.
+**Correction, verified 2026-08-27 (was stated wrong in an earlier draft of
+this section): `claimOrder()` does NOT necessarily fire on every call.**
+`classifyLineItems()` runs BEFORE `claimOrder()` in the step order (step 2,
+before step 3) — if classification fails (e.g. `CTNotConfiguredError`), the
+function returns early and no ledger row is ever written. **Confirmed live**:
+running the rehearsal below against `#1003` produced `not_configured` and
+`ct_orders` remained at 0 rows, verified directly via SQL immediately after.
+So a dry-run rehearsal against an order that hits `not_configured` is a true
+no-op on `ct_orders`. It would NOT be a no-op once CT is actually configured
+and classification succeeds — at that point `claimOrder()` does run and does
+write a real row (with `dry_run: true`) even without the canary armed. Keep
+treating any rehearsal run AFTER CT is configured as a real action worth
+confirming, even though this particular run wasn't.
 
 ### Recommended first real order
 
@@ -946,11 +981,11 @@ Given only 4 real orders have ever been placed and delivered — `#1003`,
 `#1011` are the natural candidates: real, already fulfilled, already known
 to be correct (customer received their tires), so a canary run tests
 `submitOrder()`'s real behavior without any risk of the *order itself* being
-wrong. A **dry-run rehearsal first** (call `admin-canary-ct-order.ts` with
-neither canary env var set) proves the whole pipeline — Shopify fetch,
-classification, ledger claim — against real historical data with zero
-chance of anything transmitting to CT, since CT still isn't configured
-either way. It still burns a real `ct_orders` row and PO number, per above.
+wrong. A dry-run rehearsal against real historical data is safe to run
+freely **while CT remains unconfigured** (per the correction above) — but
+re-run it again after § 10's credential fix lands, since the outcome (and
+whether it writes to `ct_orders`) will be different once classification can
+actually succeed.
 
 ---
 
