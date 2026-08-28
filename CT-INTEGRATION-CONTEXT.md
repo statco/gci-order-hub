@@ -2,7 +2,7 @@
 
 **Repo:** `gci-order-hub`
 **Last updated:** 2026-08-06
-**Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **Shopify plan/PII gap (§ 10a) is now CLOSED** (2026-08-26). **§ 12 (Cowork PO-drafting tool vs. the ledger) is now CLOSED** — PR #75 merged and deployed 2026-08-26. **§ 13 adds a canary mechanism** for the first real `submitOrder()` call, since no CT sandbox exists. **🔴 Current real blocker, found 2026-08-27 via that canary tooling: § 10 — the CT credentials were configured in the WRONG Vercel project (`gci-brain` instead of `gci-order-hub`)**, which likely explains every `not_configured` outcome to date, independent of the separately-pending CT sandbox creds. Not yet fixed. **Also open: § 14** — `order-router.ts`'s direct-Shopify-order path has a stale `TIRE-` SKU-prefix filter; no orders lost yet, but only because Pat has been checking dashboards manually.
+**Status:** Client + ledger + routing all merged to `main`. `CT_AUTO_PO_ENABLED` was flipped to **`true` in Vercel production 2026-08-02** — routing now genuinely engages on real orders (`claimOrder()`, `classifyLineItems()`, real ledger rows). `CT_DRY_RUN` is still unset (default `true`), so **no real transmission to CT can happen** — but this is no longer "identical to before this work began" (see § 2, updated). **Shopify plan/PII gap (§ 10a) is now CLOSED** (2026-08-26). **§ 12 (Cowork PO-drafting tool vs. the ledger) is now CLOSED** — PR #75 merged and deployed 2026-08-26. **§ 13 adds a canary mechanism** for the first real `submitOrder()` call, since no CT sandbox exists. **✅ § 10 is now CLOSED** — the CT credential + `CT_ENVIRONMENT` fix landed 2026-08-27/28, and auth to CT's real production server was confirmed working (see § 15). **🔴 New current blocker: § 15** — the first order ever to reach `submitOrder()` (`#1011`, a dry-run rehearsal) exposed a real bug: dry-run "success" incorrectly reports as the maximum-severity `indeterminate` ("CT may have committed this for real, do not resubmit") alarm instead of `submitted (DRY RUN)`. **Do not run further dry-run rehearsals against orders with CT-recognized SKUs until this is fixed** — each one burns a real PO number and permanently locks that order out of auto-retry. **Also open: § 14** — `order-router.ts`'s direct-Shopify-order path has a stale `TIRE-` SKU-prefix filter; no orders lost yet, but only because Pat has been checking dashboards manually.
 
 **Nothing in this repo can place a real CT order today.** See § Safety Gates.
 
@@ -1020,3 +1020,71 @@ heuristic, matching how `maybeRouteToCT()` (the Walmart path, which has
 always worked correctly) already does it. `order-router.ts` itself is the
 one place this is still broken and needs the same fix before the direct
 Shopify order path can be trusted.
+
+---
+
+## 15. ✅ Auth to CT's real production server now works — and 🔴 a new bug found because of it
+
+**2026-08-27/28, in order:**
+
+1. § 10's fix (copying `CT_*` creds from `gci-brain`) landed, but the first
+   retest still failed: `CTServerError ... INVALID_LOGIN_ATTEMPT`.
+   Root cause: `CT_ENVIRONMENT` still defaulted to `sandbox`
+   (targets `CT_ACCOUNT_ID_SANDBOX = 8031691_SB1`), while the copied
+   creds are scoped to production (`CT_ACCOUNT_ID_PROD = 8031691`) — right
+   key, wrong account/realm.
+2. Pat set `CT_ENVIRONMENT=production` in `gci-order-hub` to match
+   `gci-brain`. **This worked** — `#1003`'s rehearsal got a real,
+   authenticated response from CT's live `productSearch` RESTlet for the
+   first time ever (`no_ct_items` — CT's catalog doesn't recognize
+   `200E2096`/`200E2101` under this account; a real data question, not a
+   bug — worth checking with CT directly if that persists for currently
+   sellable SKUs).
+3. Retesting against `#1011` (SKU `200E2108`) went further than any order
+   ever has: it passed classification, claimed a **real PO number for the
+   first time ever** — `GCI-2026-447300` — and reached `submitOrder()`.
+
+**🔴 New bug found, exposed only because #1011 was the first order to ever
+reach this code path:** `submitOrder()`'s dry-run stub deliberately returns
+`id: ''` (empty) — correct, nothing should get a fake CT tracking ID. But
+`markSubmitted()` (`ct-order-ledger.ts`) requires a non-empty `ctInternalId`
+and throws if it's blank, with the exact message *"A success response
+without an id is INDETERMINATE."* That throw gets caught by
+`routeOrderToCT()`'s outer catch-all, which calls `markIndeterminate()` —
+**the same path reserved for "CT may have silently committed this order for
+real, do not auto-retry, human must check CT manually."** A dedicated,
+scary Telegram alert fires for this outcome by design.
+
+**Net effect: every dry-run "success," forever, has been silently destined
+to report as this maximum-severity ambiguous-outcome alarm instead of the
+intended `submitted (DRY RUN)`** — because nothing had ever reached step 4
+before `#1011`, this was structurally impossible to catch until today.
+Confirmed via direct query: `GCI-2026-447300`'s row shows `dry_run: true`,
+`ct_internal_id: null` — nothing was actually transmitted to CT, the alarm
+was a false positive caused by the dry-run stub shape, not a real ambiguous
+CT interaction.
+
+**Consequence for `#1011` specifically: harmless.** It was already fulfilled
+and delivered manually, long before this automation existed — it will never
+need to be resubmitted through this system, so its permanent
+no-auto-retry lock doesn't matter in practice. But the same false alarm
+would fire on any future dry-run test, and — more importantly — could
+plausibly fire on a genuine first real submission too, depending on whether
+a real CT success response could ever come back without a usable id field
+(untested, unknown).
+
+**Not yet fixed.** Two reasonable approaches, not yet decided between:
+1. `submitOrder()`'s dry-run stub returns a synthetic non-empty id (e.g.
+   `id: 'DRY-RUN'`, matching the existing `orderNumber: 'DRY-RUN'` pattern)
+   so `markSubmitted()`'s validation passes and the ledger correctly shows
+   `submitted` with `dry_run: true`, matching the alert text that was
+   always written assuming this would work.
+2. `routeOrderToCT()`'s step 4 special-cases `result.dryRun === true` and
+   calls a distinct dry-run-aware ledger transition instead of
+   `markSubmitted()`, so real vs. dry-run success paths are never
+   conflated even if their response shapes differ in the future.
+
+Do not run further dry-run rehearsals against real orders that have
+CT-recognized SKUs until one of these is fixed — each one will currently
+burn a real PO number, permanently lock that order out of auto-retry, and
+fire an unnecessary maximum-severity Telegram alarm.
