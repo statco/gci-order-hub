@@ -1088,3 +1088,23 @@ Do not run further dry-run rehearsals against real orders that have
 CT-recognized SKUs until one of these is fixed — each one will currently
 burn a real PO number, permanently lock that order out of auto-retry, and
 fire an unnecessary maximum-severity Telegram alarm.
+
+**✅ Fix implemented — PR #77 (`fix/dryrun-indeterminate-false-alarm`),
+option 1 above.** Not yet merged as of this writing; review before merging,
+since it changes ledger success-reporting behavior. New
+`ct-client-dryrun.unit.test.ts` (3/3) exercises the real dry-run branch
+directly, no mocks. Once merged and redeployed, re-run the `#1003`/`#1011`
+rehearsal once more to confirm it now reports `submitted (DRY RUN)` instead
+of `indeterminate` — that live confirmation is the real proof, not just the
+unit test passing.
+
+**Extra precaution taken 2026-08-28: Pat contacted CT staff directly**,
+asking them not to process PO `GCI-2026-447300` or orders `#1003`/`#1011`,
+given ongoing integration testing. Sensible belt-and-suspenders move —
+our own ledger data (confirmed via direct SQL: `dry_run: true`,
+`ct_internal_id: null` on the `GCI-2026-447300` row) is strong evidence
+nothing was ever transmitted to CT from our side, and both orders were
+already fulfilled/delivered independently before any of this testing
+existed — but this system genuinely cannot see CT's side directly, so a
+human-to-human confirmation is worthwhile insurance the `indeterminate`
+ledger state can't provide by itself.
