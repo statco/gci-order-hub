@@ -7,12 +7,23 @@
 //
 // Flow:
 //  1. Verify Shopify HMAC signature (SHOPIFY_WEBHOOK_SECRET)
-//  2. Split line items by SKU prefix
-//       TIRE-   → build Canada Tire PO, preserve installer metadata
-//       (anything else → unknownItems, logged, not auto-processed)
-//  3. For each supplier batch: generate HMAC-signed 24h authorize link
-//  4. Fire notifications (Telegram + email) — order not submitted yet
-//  5. Mixed orders handled independently (separate supplier batches)
+//  2. Hand ALL line items to routeOrderToCT() → classifyLineItems(), which
+//     asks CT's real product-search RESTlet what's CT-eligible. No local
+//     SKU-prefix filtering — see CT-INTEGRATION-CONTEXT.md §14 for why
+//     that used to exist and why it was removed 2026-08-28: it required a
+//     'TIRE-' prefix that the live catalog has never actually used, so
+//     every real order's line items were silently falling into
+//     unknownItems (console.warn() only, no alert) since this handler
+//     went live. classifyLineItems() already excludes non-CT items
+//     (install fees / warranties) internally via isCandidateForCT() —
+//     nothing here needs to duplicate that.
+//  3. Whatever CT auto-routing does or doesn't resolve, always fire the
+//     manual-authorize notification (Telegram + email) unless the order
+//     was fully auto-submitted or already handled by a human — see the
+//     outcome-kind branches below. This is the real safety net and is
+//     outcome-agnostic, so it covers items CT doesn't recognize too.
+//  4. Mixed/partial outcomes still return 200 — Shopify would otherwise
+//     retry the whole webhook on a non-2xx.
 //
 // NUPROZ- (nuprozone.com dropshipping via CJ) routing removed 2026-07 --
 // confirmed permanently discontinued. See git history if ever needed again.
@@ -42,7 +53,11 @@ const APP_BASE_URL   = (
   (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '')
 ).replace(/\/$/, '');
 
-const TIRE_PREFIX   = 'TIRE-';
+// Defensive strip only, NOT a classification filter — see CT-INTEGRATION-
+// CONTEXT.md §14. Real catalog SKUs are bare; this exists only in case a
+// stray 'TIRE-' prefix ever shows up on a line item, matching the same
+// normalization used in lib/shopify.ts and admin-canary-ct-order.ts.
+const STALE_TIRE_PREFIX = 'TIRE-';
 // NUPROZ- (nuprozone.com dropshipping) routing removed 2026-07 --
 // confirmed by GCI Tires as permanently discontinued (brand-conflict
 // decision, not a temporary pause). See git history for the old CJ
@@ -53,7 +68,7 @@ const TIRE_COST_RATIO   = 0.50;
 
 // ─── SHOPIFY TYPES ────────────────────────────────────────────
 
-interface ShopifyLineItem {
+export interface ShopifyLineItem {
   id:         number;
   sku:        string;
   title:      string;
@@ -165,6 +180,25 @@ export function buildAuthorizeUrl(payload: AuthToken): string {
   return `${APP_BASE_URL}/api/authorize-order?data=${data}&sig=${sig}`;
 }
 
+/**
+ * Normalizes Shopify line items for CT routing — strips a stray 'TIRE-'
+ * prefix if present (defensive only, see STALE_TIRE_PREFIX above) and
+ * upper-cases every SKU. Deliberately does NOT filter by prefix or
+ * classify anything — that's classifyLineItems()'s job now, against CT's
+ * real live catalog. See CT-INTEGRATION-CONTEXT.md §14.
+ * Exported for unit testing.
+ */
+export function normalizeLineItems(lineItems: ShopifyLineItem[]): ShopifyLineItem[] {
+  return lineItems
+    .filter((i) => i.sku)
+    .map((i) => ({
+      ...i,
+      sku: i.sku.toUpperCase().startsWith(STALE_TIRE_PREFIX)
+        ? i.sku.toUpperCase().slice(STALE_TIRE_PREFIX.length)
+        : i.sku.toUpperCase(),
+    }));
+}
+
 // ─── MAIN HANDLER ─────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -213,22 +247,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   console.log(`📦 Order received: ${order.name} (id=${order.id})`);
 
-  // ── Split line items by SKU prefix ───────────────────────────
-  const tireItems:    ShopifyLineItem[] = [];
-  const unknownItems: ShopifyLineItem[] = [];
-
-  for (const item of order.line_items) {
-    const sku = (item.sku ?? '').toUpperCase();
-    if (sku.startsWith(TIRE_PREFIX)) { tireItems.push(item); continue; }
-    unknownItems.push(item);
-  }
-
-  if (unknownItems.length) {
-    console.warn(
-      `⚠️  Order ${order.name}: unrecognised SKU prefix on`,
-      unknownItems.map(i => i.sku).join(', '),
-    );
-  }
+  // ── Normalize all line items — no local classification ──────────
+  // See CT-INTEGRATION-CONTEXT.md §14: this used to split into
+  // tireItems/unknownItems by a 'TIRE-' SKU prefix the live catalog has
+  // never actually used, silently dropping every real order's items into
+  // unknownItems (console.warn() only, no alert). Removed 2026-08-28.
+  // classifyLineItems() (called inside routeOrderToCT() below) already
+  // does real classification against CT's live catalog, including
+  // excluding non-CT items (install fees/warranties) via its own
+  // isCandidateForCT() filter — nothing here needs to duplicate that.
+  const items = normalizeLineItems(order.line_items);
 
   const installer = extractInstallerMeta(order);
   const addr      = order.shipping_address ?? order.billing_address ?? {};
@@ -237,10 +265,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const results: string[] = [];
   const errors:  string[] = [];
 
-  // ── TIRE- items → Canada Tire PO ─────────────────────────────
-  if (tireItems.length > 0) {
+  // ── Route the whole order through CT auto-routing / manual notify ────
+  if (items.length > 0) {
     try {
-      const notifyItems = tireItems.map(i => ({
+      const notifyItems = items.map(i => ({
         sku:      i.sku,
         title:    i.title,
         quantity: i.quantity,
@@ -265,10 +293,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             channel:           'shopify',
             sourceOrderId:     String(order.id),
             sourceOrderNumber: order.name,
-            lineItems: tireItems.map(i => ({
-              sku:      i.sku.replace(new RegExp(`^${TIRE_PREFIX}`, 'i'), ''),
-              quantity: i.quantity,
-            })),
+            lineItems: items.map(i => ({ sku: i.sku, quantity: i.quantity })),
             shipTo: {
               name:       custName,
               address1:   addr.address1,
@@ -301,6 +326,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             console.log(`ℹ️  CT auto-PO not yet configured — falling back to manual authorize flow for ${order.name}`);
           } else if (outcome.kind === 'already_claimed') {
             console.log(`ℹ️  CT routing for order ${order.name}: already claimed as ${outcome.poNumber} (status=${outcome.existingStatus}) — falling back to manual authorize flow.`);
+          } else if (outcome.kind === 'no_ct_items') {
+            // CT's real classification found nothing it recognizes on this
+            // order — could be genuinely non-tire items, or a real catalog
+            // gap worth raising with CT (see CT-INTEGRATION-CONTEXT.md §13's
+            // #1003 note). Either way, still falls through to manual notify
+            // below — a human needs to see this order regardless.
+            console.log(`ℹ️  CT routing for order ${order.name}: no CT-eligible items (${outcome.reason}) — falling back to manual authorize flow.`);
           } else {
             console.log(`ℹ️  CT routing for order ${order.name}: ${outcome.kind} (${outcome.reason}) — falling back to manual authorize flow.`);
           }
