@@ -62,19 +62,32 @@
 //     value... Enter a 'integer' data type" — ShippingWeight must be a flat
 //     integer, not the {measure,unit} object walmart-item-feed.ts uses for
 //     MP_ITEM_INTL. This account's Item schema is flat, not nested sections.
-// Round 4 (current code) drops "Visible" entirely and adds a flat
-// `publishedStatus` field directly under Item instead — matching the exact
-// flat field name Walmart's own /v3/items READ response already uses for
-// this same concept. ShippingWeight fixed to a plain integer. STILL
-// UNVERIFIED whether `publishedStatus` is accepted as a WRITE field — that
-// requires another real submit + feed status read. Keep iterating the same
-// way: submit ?action=unpublish&dryRun=false against known test SKUs, read
-// walmart-feed-status, and let Walmart's own ingestion error name anything
-// still wrong — it's the only working oracle for this account (see above).
-// Confirm the round-trip in Seller Center before trusting this for real
-// traffic. Whatever the real field turns out to be, it lives in ONE place —
-// buildMaintenanceItem() below — so correcting it is a small, local edit,
-// not a rewrite.
+// Round 4 dropped "Visible" and tried a flat `publishedStatus` field
+// instead (matching the flat field name Walmart's own /v3/items READ
+// response uses for this concept) — ALSO rejected: "'publishedStatus' is
+// not a valid field." sku/productIdentifiers/price/ShippingWeight all
+// confirmed valid at this point; only the toggle-field name is unknown.
+//
+// LIKELY ROOT CAUSE, found after Round 4: Walmart sunset Item Spec 4.x
+// (this account's feed header was sending version 4.1) in favour of 5.x,
+// which restructured the schema and uses dated build-string versions, not
+// simple numbers. Persistent rejection of 4.x-era field names (Visible,
+// publishedStatus) even with all other required data valid is consistent
+// with this account validating against 5.x regardless of the feed header's
+// claimed version. DEFAULT_SPEC_VERSION bumped to a findable recent 5.x
+// string; may need updating again if it's since gone stale.
+//
+// Round 5 (current code) combines that version bump with a batch probe of
+// 10 plausible field names (buildProbeFields()) submitted as Item siblings
+// in one request — Walmart's ingestion error lists every invalid field
+// together, so whichever of these ISN'T flagged is the real one. STILL
+// UNVERIFIED. Keep iterating the same way: submit ?action=unpublish
+// &dryRun=false against known test SKUs, read walmart-feed-status, and let
+// Walmart's own ingestion error name anything still wrong — it's the only
+// working oracle for this account (see above). Confirm the round-trip in
+// Seller Center before trusting this for real traffic. Whatever the real
+// field turns out to be, it lives in ONE place — buildMaintenanceItem()
+// below — so correcting it is a small, local edit, not a rewrite.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -87,9 +100,16 @@ const SECRET       = process.env.WALMART_UNPUBLISH_SECRET ?? '';
 
 const CHUNK_SIZE           = 300; // matches the repo-wide convention (walmart-retire.ts)
 const MAINTENANCE_FEED_TYPE = 'MP_MAINTENANCE';
-// MP_MAINTENANCE only supports spec versions 4.0/4.1 (4.2 is MP_ITEM/MP_WFS_ITEM
-// only — using it here previously caused Get Spec to 400 with "no schema found").
-const DEFAULT_SPEC_VERSION  = '4.1';
+// Walmart sunset Item Spec 4.x (this account's feed submissions were using
+// version 4.1) in favour of 5.x, which uses dated build-string versions
+// instead of simple numbers (e.g. "5.0.20260114-19_40_57", the most recent
+// one findable without a working Get Spec lookup for this account — see
+// header). Persistent "not a valid field" errors on 4.x-era field names
+// (Visible, publishedStatus) even once all other required data was valid
+// are consistent with this account now validating against 5.x regardless
+// of what version string the feed header claims. May need bumping again to
+// whatever Walmart's current 5.x dated version is if this one doesn't work.
+const DEFAULT_SPEC_VERSION  = '5.0.20260114-19_40_57';
 const DEFAULT_PRODUCT_TYPE  = 'Tires'; // CONFIRM against action=get-taxonomy output
 
 type PublishAction = 'unpublish' | 'republish';
