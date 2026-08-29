@@ -33,15 +33,25 @@
 // WM_GLOBAL_VERSION: 3.1 and never calls Get Spec. There is no self-serve
 // schema lookup available for this account/market.
 //
-// CONFIRMED FIELD: **STILL UNVERIFIED — Get Spec is a dead end for this
-// account (see above). The real oracle is a live feed submission: run
-// POST ?action=unpublish&dryRun=false against 2-3 known test SKUs, then
-// poll /api/walmart-feed-status?feedId=<id> — itemDetails.itemIngestionStatus[]
-// will name any unknown/invalid field directly if Visible.publishedStatus
-// (the current assumption below) is wrong. Confirm the round-trip in Seller
-// Center before trusting this for real traffic.**
-// Whatever the real field turns out to be, it lives in ONE place —
-// buildVisibleBlock() below — so correcting it is a one-function edit.
+// CONFIRMED FIELD: partially verified via a real (harmless — 0 items
+// succeeded) feed submission against 3 live test SKUs, read back through
+// walmart-feed-status. Round 1, with MPItem entries shaped as
+// `{ sku, Visible: {...} }`, came back:
+//   - EXT_DATA_ERROR "'Visible, sku' is not a valid field" — that shape is
+//     wrong at the MPItem level.
+//   - EXT_DATA_ERROR "`Item` is a required attribute, but no value was
+//     provided" — there's a required top-level `Item` wrapper key.
+// Fixed to `{ Item: { sku, Visible: {...} } }` (buildMaintenanceItem below)
+// on that basis — STILL UNVERIFIED whether `Visible.publishedStatus` itself
+// is the correct nested field; that requires another real submit + feed
+// status read. Keep iterating the same way: submit ?action=unpublish
+// &dryRun=false against known test SKUs, read walmart-feed-status, and let
+// Walmart's own ingestion error name anything still wrong — it's the only
+// working oracle for this account (see above). Confirm the round-trip in
+// Seller Center before trusting this for real traffic.
+// Whatever the real shape turns out to be, it lives in ONE place —
+// buildMaintenanceItem()/buildVisibleBlock() below — so correcting it is a
+// small, local edit, not a rewrite.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -192,8 +202,10 @@ function buildVisibleBlock(targetStatus: 'PUBLISHED' | 'UNPUBLISHED') {
 
 function buildMaintenanceItem(sku: string, action: PublishAction) {
   return {
-    sku,
-    Visible: buildVisibleBlock(action === 'unpublish' ? 'UNPUBLISHED' : 'PUBLISHED'),
+    Item: {
+      sku,
+      Visible: buildVisibleBlock(action === 'unpublish' ? 'UNPUBLISHED' : 'PUBLISHED'),
+    },
   };
 }
 
