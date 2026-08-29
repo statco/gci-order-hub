@@ -6,16 +6,11 @@
 // catalogue and can be flipped back.
 //
 //   GET  /api/walmart-unpublish?action=get-taxonomy[&version=4.1]
-//     Diagnostic only, no writes. Calls Walmart's taxonomy utility API for
-//     feedType=MP_MAINTENANCE to list the exact valid productType category
-//     names (e.g. confirms whether it's "Tires" or something else) — run
-//     this BEFORE action=get-spec if get-spec 400s with "no schema found".
-//
 //   GET  /api/walmart-unpublish?action=get-spec[&version=4.1&productType=Tires]
-//     Diagnostic only, no writes. Calls Walmart's Get Spec API for
-//     feedType=MP_MAINTENANCE and returns the raw spec plus a heuristic scan
-//     for candidate publish/orderable field names. RUN THIS FIRST — see
-//     "Schema verification" below.
+//     Diagnostic only, no writes. BOTH CONFIRMED NON-FUNCTIONAL FOR THIS
+//     ACCOUNT — see "Schema verification" below. Left in place only as a
+//     documented dead end so nobody re-tries them expecting a different
+//     result; the real verification path is a live feed submission (below).
 //
 //   POST /api/walmart-unpublish?action=unpublish|republish[&dryRun=false][&offset=N&limit=300]
 //     Body: { skus: string[] }  OR  { tag: string }  (exactly one)
@@ -23,19 +18,30 @@
 //     dryRun defaults to TRUE — must pass dryRun=false explicitly to write.
 //
 // ── Schema verification (Step 0) ────────────────────────────────────────────
-// Walmart's MP_MAINTENANCE field names vary by spec version and are NOT
-// guessable — this file assumes the field below pending confirmation from a
-// live GET ?action=get-spec call against a deployed environment (the sandbox
-// this file was built in has no Walmart credentials and its network egress
-// policy blocks marketplace.walmartapis.com / developer.walmart.com, so the
-// live spec could not be fetched at build time — see PR description).
+// Walmart's Get Spec API (POST /v3/items/spec) and taxonomy utility
+// (GET /v3/utilities/taxonomy) were tried live against this account and both
+// come back structurally rejected:
+//   - get-spec: HTTP 400 INVALID_REQUEST.GMP_ITEM_QUERY_API "No schema found
+//     for input parameters", tried with both version 4.2 and the correct
+//     MP_MAINTENANCE version 4.1.
+//   - get-taxonomy: HTTP 400 "MARKET_NOT_SUPPORTED — This capability isn't
+//     available for the market you requested."
+// The "GMP_ITEM_QUERY_API"/"MARKET_NOT_SUPPORTED" pairing indicates these are
+// US-domestic-Marketplace-only utility endpoints, not exposed to Global
+// Marketplace Partner (GMP) accounts — which is what CA is, and matches how
+// walmart-item-feed.ts already works: it submits MP_ITEM_INTL directly with
+// WM_GLOBAL_VERSION: 3.1 and never calls Get Spec. There is no self-serve
+// schema lookup available for this account/market.
 //
-// CONFIRMED FIELD: **UNVERIFIED — confirm with action=get-spec before first
-// real use, then update buildVisibleBlock() below and this comment.**
-// Current assumption (Visible.publishedStatus, matching the task's own
-// starting-point draft and the Orderable/Visible wrapper every other CA feed
-// in this repo already uses) lives in ONE place — buildVisibleBlock() below —
-// so correcting it later is a one-function edit, not a rewrite.
+// CONFIRMED FIELD: **STILL UNVERIFIED — Get Spec is a dead end for this
+// account (see above). The real oracle is a live feed submission: run
+// POST ?action=unpublish&dryRun=false against 2-3 known test SKUs, then
+// poll /api/walmart-feed-status?feedId=<id> — itemDetails.itemIngestionStatus[]
+// will name any unknown/invalid field directly if Visible.publishedStatus
+// (the current assumption below) is wrong. Confirm the round-trip in Seller
+// Center before trusting this for real traffic.**
+// Whatever the real field turns out to be, it lives in ONE place —
+// buildVisibleBlock() below — so correcting it is a one-function edit.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
