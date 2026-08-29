@@ -86,12 +86,16 @@ async function handleGetSpec(req: VercelRequest, res: VercelResponse) {
   const productType = (req.query.productType as string) || DEFAULT_PRODUCT_TYPE;
 
   const token = await getWalmartToken();
-  const url   = `${WALMART_BASE}/v3/items/spec?feedType=${encodeURIComponent(MAINTENANCE_FEED_TYPE)}&version=${encodeURIComponent(version)}`;
+  const url   = `${WALMART_BASE}/v3/items/spec`;
+  // feedType/version were first tried as query params — Walmart rejected that
+  // shape (400 INVALID_REQUEST.GMP_ITEM_QUERY_API, field "feedType"), so all
+  // three documented params (feedType, version, productTypes) go in the body.
+  const requestBody = { feedType: MAINTENANCE_FEED_TYPE, version, productTypes: [productType] };
 
   const walmartRes = await fetch(url, {
     method: 'POST',
     headers: buildHeaders(token, { 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ productTypes: [productType] }),
+    body: JSON.stringify(requestBody),
   });
 
   const bodyText = await walmartRes.text();
@@ -99,14 +103,14 @@ async function handleGetSpec(req: VercelRequest, res: VercelResponse) {
   if (!walmartRes.ok) {
     // Surface Walmart's raw error — on a real deploy this usually names the
     // expected request shape directly, which is the fastest way to correct
-    // the request above if this first guess at its shape is wrong.
+    // the request above if this guess at its shape is still wrong.
     return res.status(walmartRes.status).json({
       success: false,
       mode: 'get-spec',
       error: `Walmart Get Spec API ${walmartRes.status}`,
       details: bodyText.slice(0, 2000),
       requestedUrl: url,
-      requestedBody: { productTypes: [productType] },
+      requestedBody: requestBody,
     });
   }
 
