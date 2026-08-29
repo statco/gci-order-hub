@@ -5,7 +5,13 @@
 // this endpoint only flips visibility/publish state — the item stays in the
 // catalogue and can be flipped back.
 //
-//   GET  /api/walmart-unpublish?action=get-spec[&version=4.2&productType=Tires]
+//   GET  /api/walmart-unpublish?action=get-taxonomy[&version=4.1]
+//     Diagnostic only, no writes. Calls Walmart's taxonomy utility API for
+//     feedType=MP_MAINTENANCE to list the exact valid productType category
+//     names (e.g. confirms whether it's "Tires" or something else) — run
+//     this BEFORE action=get-spec if get-spec 400s with "no schema found".
+//
+//   GET  /api/walmart-unpublish?action=get-spec[&version=4.1&productType=Tires]
 //     Diagnostic only, no writes. Calls Walmart's Get Spec API for
 //     feedType=MP_MAINTENANCE and returns the raw spec plus a heuristic scan
 //     for candidate publish/orderable field names. RUN THIS FIRST — see
@@ -42,8 +48,10 @@ const SECRET       = process.env.WALMART_UNPUBLISH_SECRET ?? '';
 
 const CHUNK_SIZE           = 300; // matches the repo-wide convention (walmart-retire.ts)
 const MAINTENANCE_FEED_TYPE = 'MP_MAINTENANCE';
-const DEFAULT_SPEC_VERSION  = '4.2'; // CA v4.x — CONFIRM against action=get-spec output
-const DEFAULT_PRODUCT_TYPE  = 'Tires';
+// MP_MAINTENANCE only supports spec versions 4.0/4.1 (4.2 is MP_ITEM/MP_WFS_ITEM
+// only — using it here previously caused Get Spec to 400 with "no schema found").
+const DEFAULT_SPEC_VERSION  = '4.1';
+const DEFAULT_PRODUCT_TYPE  = 'Tires'; // CONFIRM against action=get-taxonomy output
 
 type PublishAction = 'unpublish' | 'republish';
 
@@ -61,7 +69,41 @@ function buildHeaders(token: string, extra: Record<string, string> = {}): Record
   };
 }
 
-// ─── Step 0: Get Spec diagnostic ───────────────────────────────────────────
+// ─── Step 0a: taxonomy diagnostic (finds the real productType category name) ─
+
+async function handleGetTaxonomy(req: VercelRequest, res: VercelResponse) {
+  const version = (req.query.version as string) || DEFAULT_SPEC_VERSION;
+
+  const token = await getWalmartToken();
+  const url   = `${WALMART_BASE}/v3/utilities/taxonomy?feedType=${encodeURIComponent(MAINTENANCE_FEED_TYPE)}&version=${encodeURIComponent(version)}`;
+
+  const walmartRes = await fetch(url, { method: 'GET', headers: buildHeaders(token) });
+  const bodyText   = await walmartRes.text();
+
+  if (!walmartRes.ok) {
+    return res.status(walmartRes.status).json({
+      success: false,
+      mode: 'get-taxonomy',
+      error: `Walmart taxonomy API ${walmartRes.status}`,
+      details: bodyText.slice(0, 2000),
+      requestedUrl: url,
+    });
+  }
+
+  let taxonomy: unknown;
+  try { taxonomy = JSON.parse(bodyText); } catch { taxonomy = bodyText; }
+
+  return res.status(200).json({
+    success: true,
+    mode: 'get-taxonomy',
+    feedType: MAINTENANCE_FEED_TYPE,
+    version,
+    note: 'Find the exact category/productType name for tires in here, then pass it as ?productType=<name> to action=get-spec.',
+    taxonomy,
+  });
+}
+
+// ─── Step 0b: Get Spec diagnostic ───────────────────────────────────────────
 
 /**
  * Recursively collects key paths whose name looks like a publish/orderable
@@ -265,6 +307,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const action = req.query.action as string | undefined;
 
+    if (action === 'get-taxonomy') {
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        return res.status(405).json({ error: 'GET or POST only for action=get-taxonomy' });
+      }
+      return await handleGetTaxonomy(req, res);
+    }
+
     if (action === 'get-spec') {
       if (req.method !== 'GET' && req.method !== 'POST') {
         return res.status(405).json({ error: 'GET or POST only for action=get-spec' });
@@ -274,7 +323,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (action !== 'unpublish' && action !== 'republish') {
       return res.status(400).json({
-        error: 'Missing/invalid action — expected ?action=get-spec | unpublish | republish',
+        error: 'Missing/invalid action — expected ?action=get-taxonomy | get-spec | unpublish | republish',
       });
     }
 
