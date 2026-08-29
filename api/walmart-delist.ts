@@ -32,8 +32,14 @@
 //                                keep-list, retire the rest" cleanups)
 //     Auth: Bearer token matching WALMART_UNPUBLISH_SECRET.
 //     dryRun defaults to TRUE — must pass dryRun=false explicitly to write.
-//     Large willRetire sets page via offset/limit (300/call) — repeat with
-//     increasing offset until done:true, same convention as walmart-retire.ts.
+//     Real writes page via offset/limit (300/call, repeat with increasing
+//     offset until done:true — same convention as walmart-retire.ts). For
+//     keepSkus mode specifically: don't page a real (dryRun=false) run
+//     directly, since willRetire is recomputed from live data every call and
+//     retirement propagation lag can shift the underlying set between calls.
+//     Instead run a dry run with no &limit first (returns the FULL list,
+//     uncapped) to snapshot it, then feed that exact list back as an
+//     explicit { skus: [...] } for the real paged run.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -170,17 +176,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // ── Pagination ──────────────────────────────────────────────────
-    const rawOffset = parseInt(String(req.query.offset ?? '0'), 10);
-    const offset    = Number.isNaN(rawOffset) ? 0 : Math.max(0, rawOffset);
-    const rawLimit  = parseInt(String(req.query.limit ?? String(CHUNK_SIZE)), 10);
-    const limit     = Number.isNaN(rawLimit) ? CHUNK_SIZE : Math.max(1, Math.min(CHUNK_SIZE, rawLimit));
+    const dryRun = (req.query.dryRun as string | undefined ?? 'true') !== 'false';
 
     const totalWillRetire = willRetire.length;
-    const chunk           = willRetire.slice(offset, offset + limit);
-    const nextOffset      = offset + limit < totalWillRetire ? offset + limit : null;
-    const done            = nextOffset === null;
+    const rawOffset = parseInt(String(req.query.offset ?? '0'), 10);
+    const offset    = Number.isNaN(rawOffset) ? 0 : Math.max(0, rawOffset);
 
-    const dryRun = (req.query.dryRun as string | undefined ?? 'true') !== 'false';
+    // Real writes always cap at CHUNK_SIZE per call (rate-limit safety).
+    // A dry run with no explicit limit returns the FULL computed list
+    // uncapped — useful for keepSkus mode, where willRetire is recomputed
+    // from live "currently listed" data on every call. Paging a live write
+    // with increasing offset across several separate calls would be unsafe
+    // there (retirement propagation lags, so the underlying set can shift
+    // between calls, skipping or re-targeting SKUs). Snapshot the full list
+    // once via an uncapped dry run, then pass that exact list back as an
+    // explicit { skus: [...] } for the real paged run — immune to drift
+    // since it's now a fixed list, not recomputed each call.
+    const rawLimitParam = req.query.limit;
+    const rawLimit       = rawLimitParam != null ? parseInt(String(rawLimitParam), 10) : NaN;
+    const limit = !dryRun
+      ? (Number.isNaN(rawLimit) ? CHUNK_SIZE : Math.max(1, Math.min(CHUNK_SIZE, rawLimit)))
+      : (Number.isNaN(rawLimit) ? Math.max(totalWillRetire, 1) : Math.max(1, rawLimit));
+
+    const chunk      = willRetire.slice(offset, offset + limit);
+    const nextOffset = offset + limit < totalWillRetire ? offset + limit : null;
+    const done       = nextOffset === null;
 
     console.log(
       `[walmart-delist] dryRun=${dryRun} totalInput=${totalInputSkus} currentlyListed=${listedSkus.size} ` +
