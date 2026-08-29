@@ -28,10 +28,54 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { runListedSyncChunk } from './lib/listed-sync';
 import { readCursor, updateCursor } from './lib/supabase';
+import { sendTelegramMessage } from './lib/telegram';
 
 export const config = { maxDuration: 180 };
 
 const CHUNK_LIMIT = 50;
+
+// ── Failure alerting ──────────────────────────────────────────────────────
+// Added 2026-08-28 after a ~42h total outage (2026-08-26 17:24 UTC onward,
+// every single tick failing on Walmart's /v3/items endpoint) went completely
+// unalerted — consecutive_failures climbed past 270 with nothing watching it.
+//
+// ALERT_THRESHOLD: first alert fires once failures cross this (10 min at the
+// 2-min tick interval) — long enough to skip single transient blips, short
+// enough that a real outage is caught fast, not after two days.
+// ALERT_REPEAT_EVERY: once alerted, re-alert only every N further failures
+// (1h) so an ongoing outage doesn't spam the actionable channel every tick.
+const ALERT_THRESHOLD    = 5;
+const ALERT_REPEAT_EVERY = 30;
+
+async function maybeSendFailureAlert(
+  consecutiveFailures: number,
+  lastAlertCount: number | null,
+  errorDetail: string,
+): Promise<number | null> {
+  if (consecutiveFailures < ALERT_THRESHOLD) return lastAlertCount;
+
+  const dueForAlert =
+    lastAlertCount === null || consecutiveFailures - lastAlertCount >= ALERT_REPEAT_EVERY;
+  if (!dueForAlert) return lastAlertCount;
+
+  const minutesDown = consecutiveFailures * 2; // 2-min tick interval
+  await sendTelegramMessage(
+    `🔴 <b>Walmart sync down</b>\n` +
+    `walmart-sync-cursor has failed ${consecutiveFailures} consecutive ticks ` +
+    `(~${minutesDown} min). No price or inventory has synced to Walmart in that window.\n\n` +
+    `Latest error:\n<code>${errorDetail.slice(0, 300)}</code>`,
+    'actionable',
+  );
+  return consecutiveFailures;
+}
+
+async function maybeSendRecoveryAlert(lastAlertCount: number | null): Promise<void> {
+  if (lastAlertCount === null) return; // no active outage alert to clear
+  await sendTelegramMessage(
+    `✅ <b>Walmart sync recovered</b>\nwalmart-sync-cursor succeeded after ${lastAlertCount}+ consecutive failures.`,
+    'actionable',
+  );
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET' && req.method !== 'POST') {
@@ -108,10 +152,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('❌ Chunk failed:', msg);
+    const newConsecutiveFailures = cursor.consecutive_failures + 1;
+    const newAlertCount = await maybeSendFailureAlert(
+      newConsecutiveFailures,
+      cursor.last_failure_alert_count,
+      msg,
+    );
     await updateCursor({
-      consecutive_failures: cursor.consecutive_failures + 1,
-      last_status:          'error',
-      last_run_at:          new Date().toISOString(),
+      consecutive_failures:     newConsecutiveFailures,
+      last_failure_alert_count: newAlertCount,
+      last_status:              'error',
+      last_run_at:               new Date().toISOString(),
     });
     return res.status(500).json({ error: 'Chunk failed', details: msg, offset, status: 'error' });
   }
@@ -128,16 +179,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ` inv_fail=${chunkResult.inventoryResult?.failed ?? 'dry'}`
   );
 
+  await maybeSendRecoveryAlert(cursor.last_failure_alert_count);
+
   await updateCursor({
-    current_offset:       nextOffset,
-    attempt_count:        0,
-    consecutive_failures: 0,
-    total_listed:         chunkResult.totalListed,
-    last_inv_ok:          chunkResult.inventoryResult?.success ?? null,
-    last_inv_fail:        chunkResult.inventoryResult?.failed  ?? null,
-    last_zeroed:          chunkResult.zeroedNoActiveMatch,
-    last_status:          newStatus,
-    last_run_at:          new Date().toISOString(),
+    current_offset:           nextOffset,
+    attempt_count:            0,
+    consecutive_failures:     0,
+    last_failure_alert_count: null,
+    total_listed:             chunkResult.totalListed,
+    last_inv_ok:              chunkResult.inventoryResult?.success ?? null,
+    last_inv_fail:            chunkResult.inventoryResult?.failed  ?? null,
+    last_zeroed:              chunkResult.zeroedNoActiveMatch,
+    last_status:              newStatus,
+    last_run_at:              new Date().toISOString(),
   });
 
   // ── 8. Return summary ─────────────────────────────────────────────────────
