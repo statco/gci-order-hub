@@ -24,9 +24,16 @@
 // "republish"; a retired item must be re-created via the item feed.
 //
 //   POST /api/walmart-delist?dryRun=false[&offset=N&limit=300]
-//     Body: { skus: string[] }  OR  { tag: string }  (exactly one)
+//     Body: exactly one of:
+//       { skus: string[] }     — retire these specific SKUs
+//       { tag: string }        — retire everything under this Shopify tag
+//       { keepSkus: string[] } — retire everything CURRENTLY LISTED except
+//                                these (inverted selection, for "here's my
+//                                keep-list, retire the rest" cleanups)
 //     Auth: Bearer token matching WALMART_UNPUBLISH_SECRET.
 //     dryRun defaults to TRUE — must pass dryRun=false explicitly to write.
+//     Large willRetire sets page via offset/limit (300/call) — repeat with
+//     increasing offset until done:true, same convention as walmart-retire.ts.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -98,42 +105,68 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // ── Parse body: exactly one of skus / tag ───────────────────────
-    const body = req.body as { skus?: unknown; tag?: unknown } | undefined;
-    const hasSkus = Array.isArray(body?.skus) && (body!.skus as unknown[]).length > 0;
-    const hasTag  = typeof body?.tag === 'string' && body!.tag.trim().length > 0;
+    // ── Parse body: exactly one of skus / tag / keepSkus ────────────
+    // keepSkus inverts the selection: "retire everything currently listed
+    // EXCEPT these" — for bulk catalogue cleanups driven by a keep-list
+    // rather than an explicit retire-list.
+    const body = req.body as { skus?: unknown; tag?: unknown; keepSkus?: unknown } | undefined;
+    const hasSkus     = Array.isArray(body?.skus) && (body!.skus as unknown[]).length > 0;
+    const hasTag      = typeof body?.tag === 'string' && body!.tag.trim().length > 0;
+    const hasKeepSkus = Array.isArray(body?.keepSkus) && (body!.keepSkus as unknown[]).length > 0;
 
-    if (hasSkus === hasTag) {
-      return res.status(400).json({ error: 'Body must contain exactly one of { skus: string[] } or { tag: string }' });
+    if ([hasSkus, hasTag, hasKeepSkus].filter(Boolean).length !== 1) {
+      return res.status(400).json({ error: 'Body must contain exactly one of { skus: string[] }, { tag: string }, or { keepSkus: string[] }' });
     }
 
-    let inputSkus: string[];
-    if (hasTag) {
-      const tag = (body!.tag as string).trim();
-      console.log(`[walmart-delist] Resolving SKUs from Shopify tag "${tag}"…`);
-      inputSkus = await fetchSkusByShopifyTag(tag);
-      console.log(`[walmart-delist] Tag "${tag}" resolved to ${inputSkus.length} SKUs`);
-    } else {
-      inputSkus = (body!.skus as unknown[]).map(s => String(s).toUpperCase().trim());
-    }
-
-    if (inputSkus.length === 0) {
-      return res.status(400).json({ error: 'No SKUs resolved (empty skus array or tag matched nothing)' });
-    }
-
-    // ── Confirm each SKU is actually listed on Walmart before retiring it ──
-    // (bare or TIRE- form — same twin-matching convention as walmart-zero.ts)
-    console.log('[walmart-delist] Fetching Walmart-listed SKUs to validate input…');
+    console.log('[walmart-delist] Fetching Walmart-listed SKUs…');
     const listedSkus = await fetchListedSkus();
 
     const willRetire: string[] = [];
     const skippedNotListed: string[] = [];
+    let totalInputSkus: number;
+    let keepSkusCount: number | undefined;
 
-    for (const sku of new Set(inputSkus)) {
-      const bare = sku.startsWith('TIRE-') ? sku.slice(5) : sku;
-      if (listedSkus.has(bare)) willRetire.push(bare);
-      else if (listedSkus.has(`TIRE-${bare}`)) willRetire.push(`TIRE-${bare}`);
-      else skippedNotListed.push(sku);
+    if (hasKeepSkus) {
+      // Normalise each keep entry to both bare and TIRE- forms so a keep
+      // entry protects whichever form the item actually happens to be
+      // listed under on Walmart.
+      const keepBareSet = new Set<string>();
+      const keepSet     = new Set<string>();
+      for (const raw of body!.keepSkus as unknown[]) {
+        const sku = String(raw).toUpperCase().trim();
+        if (!sku) continue;
+        const bare = sku.startsWith('TIRE-') ? sku.slice(5) : sku;
+        keepBareSet.add(bare);
+        keepSet.add(bare);
+        keepSet.add(`TIRE-${bare}`);
+      }
+      keepSkusCount  = keepBareSet.size;
+      totalInputSkus = keepSkusCount;
+      willRetire.push(...[...listedSkus].filter(sku => !keepSet.has(sku)));
+    } else {
+      let inputSkus: string[];
+      if (hasTag) {
+        const tag = (body!.tag as string).trim();
+        console.log(`[walmart-delist] Resolving SKUs from Shopify tag "${tag}"…`);
+        inputSkus = await fetchSkusByShopifyTag(tag);
+        console.log(`[walmart-delist] Tag "${tag}" resolved to ${inputSkus.length} SKUs`);
+      } else {
+        inputSkus = (body!.skus as unknown[]).map(s => String(s).toUpperCase().trim());
+      }
+
+      if (inputSkus.length === 0) {
+        return res.status(400).json({ error: 'No SKUs resolved (empty skus array or tag matched nothing)' });
+      }
+      totalInputSkus = inputSkus.length;
+
+      // Confirm each SKU is actually listed on Walmart before retiring it
+      // (bare or TIRE- form — same twin-matching convention as walmart-zero.ts)
+      for (const sku of new Set(inputSkus)) {
+        const bare = sku.startsWith('TIRE-') ? sku.slice(5) : sku;
+        if (listedSkus.has(bare)) willRetire.push(bare);
+        else if (listedSkus.has(`TIRE-${bare}`)) willRetire.push(`TIRE-${bare}`);
+        else skippedNotListed.push(sku);
+      }
     }
 
     // ── Pagination ──────────────────────────────────────────────────
@@ -150,7 +183,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const dryRun = (req.query.dryRun as string | undefined ?? 'true') !== 'false';
 
     console.log(
-      `[walmart-delist] dryRun=${dryRun} totalInput=${inputSkus.length} ` +
+      `[walmart-delist] dryRun=${dryRun} totalInput=${totalInputSkus} currentlyListed=${listedSkus.size} ` +
       `willRetire=${totalWillRetire} skippedNotListed=${skippedNotListed.length} ` +
       `chunk=${chunk.length} offset=${offset} limit=${limit}`,
     );
@@ -159,7 +192,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({
         ok: true,
         dryRun: true,
-        totalInputSkus: inputSkus.length,
+        totalInputSkus,
+        ...(keepSkusCount !== undefined ? { keepSkusCount } : {}),
+        currentlyListedCount: listedSkus.size,
         willRetireCount: totalWillRetire,
         willRetire: chunk,
         skippedNotListed,
@@ -171,7 +206,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({
         ok: true,
         dryRun: false,
-        totalInputSkus: inputSkus.length,
+        totalInputSkus,
+        ...(keepSkusCount !== undefined ? { keepSkusCount } : {}),
+        currentlyListedCount: listedSkus.size,
         willRetireCount: totalWillRetire,
         skippedNotListed,
         offset, limit, nextOffset, done,
@@ -224,7 +261,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).json({
       ok: failed.length === 0,
       dryRun: false,
-      totalInputSkus: inputSkus.length,
+      totalInputSkus,
+      ...(keepSkusCount !== undefined ? { keepSkusCount } : {}),
+      currentlyListedCount: listedSkus.size,
       willRetireCount: totalWillRetire,
       skippedNotListed,
       offset, limit, nextOffset, done,
