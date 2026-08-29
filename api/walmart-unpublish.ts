@@ -41,10 +41,23 @@
 //     wrong at the MPItem level.
 //   - EXT_DATA_ERROR "`Item` is a required attribute, but no value was
 //     provided" — there's a required top-level `Item` wrapper key.
-// Fixed to `{ Item: { sku, Visible: {...} } }` (buildMaintenanceItem below)
-// on that basis — STILL UNVERIFIED whether `Visible.publishedStatus` itself
-// is the correct nested field; that requires another real submit + feed
-// status read. Keep iterating the same way: submit ?action=unpublish
+// Fixed to `{ Item: { sku, Visible: {...} } }` (buildMaintenanceItem below).
+// Round 2 with that shape came back:
+//   - EXT_DATA_ERROR "'Visible' is not a valid field" (at the Item level)
+//   - EXT_DATA_ERROR: productIdentifiers, price (Selling Price), and
+//     ShippingWeight (Shipping Weight lbs) are all required attributes.
+// The required-field list matches Orderable's fields from walmart-item-feed.ts
+// (MP_ITEM_INTL) but flat under Item, not nested in an Orderable wrapper —
+// i.e. this account's MP_MAINTENANCE schema is NOT the lightweight partial
+// update generally documented; it demands real business data even to touch
+// one field. Round 3 (current code) fetches each SKU's real gtin/upc/price
+// from Walmart's own /v3/items record (fetchWalmartItemCore) and echoes them
+// back unchanged, alongside a fixed ShippingWeight=25lb approximation (that
+// one field isn't readable back from Walmart — see DEFAULT_SHIPPING_WEIGHT_LB
+// below), to isolate whether `Visible` is rejected outright or was a
+// symptom of the missing required fields. STILL UNVERIFIED whether
+// `Visible.publishedStatus` is accepted — that requires another real submit
+// + feed status read. Keep iterating the same way: submit ?action=unpublish
 // &dryRun=false against known test SKUs, read walmart-feed-status, and let
 // Walmart's own ingestion error name anything still wrong — it's the only
 // working oracle for this account (see above). Confirm the round-trip in
@@ -213,6 +226,32 @@ async function handleGetSpec(req: VercelRequest, res: VercelResponse) {
   });
 }
 
+// ─── Real-data lookup ───────────────────────────────────────────────────────
+// MP_MAINTENANCE ingestion demands productIdentifiers/price as required
+// attributes even for what should be a lightweight publish-status update
+// (see file header). Rather than fabricate them, fetch each SKU's own
+// current record from Walmart and echo those values back unchanged.
+const DEFAULT_SHIPPING_WEIGHT_LB = 25; // walmart-item-feed.ts's PASSENGER_CAR
+// default — Walmart's own item record doesn't expose a shipping-weight field
+// to read back, so this one attribute is an approximation; productIdentifiers
+// and price below are exact echoes of Walmart's current real data, not guesses.
+
+interface WalmartItemCore {
+  gtin:  string | null;
+  upc:   string | null;
+  price: number | null;
+}
+
+async function fetchWalmartItemCore(sku: string): Promise<WalmartItemCore> {
+  const data: any = await walmartFetch<any>(`/v3/items/${encodeURIComponent(sku)}`);
+  const item = data?.ItemResponse?.[0];
+  return {
+    gtin:  item?.gtin ?? null,
+    upc:   item?.upc  ?? null,
+    price: item?.price?.amount != null ? parseFloat(item.price.amount) : null,
+  };
+}
+
 // ─── Payload builder ───────────────────────────────────────────────────────
 // SINGLE point of truth for the maintenance field mapping. If action=get-spec
 // reveals a different field/path, this is the only function to change.
@@ -222,10 +261,16 @@ function buildVisibleBlock(targetStatus: 'PUBLISHED' | 'UNPUBLISHED') {
   };
 }
 
-function buildMaintenanceItem(sku: string, action: PublishAction) {
+function buildMaintenanceItem(sku: string, action: PublishAction, core: WalmartItemCore) {
   return {
     Item: {
       sku,
+      productIdentifiers: {
+        productIdType: core.gtin ? 'GTIN' : 'UPC',
+        productId: core.gtin ?? core.upc ?? '',
+      },
+      price: core.price ?? 0,
+      ShippingWeight: { measure: DEFAULT_SHIPPING_WEIGHT_LB, unit: 'lb' },
       Visible: buildVisibleBlock(action === 'unpublish' ? 'UNPUBLISHED' : 'PUBLISHED'),
     },
   };
@@ -472,8 +517,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // ── Build + submit feed ─────────────────────────────────────────
-    const feedItems = chunk.map(sku => buildMaintenanceItem(sku, action));
+    // ── Fetch each SKU's real current data (required attributes — no
+    // fabricated values on a live listing) then build + submit feed ────
+    const coreBySku = new Map<string, WalmartItemCore>();
+    for (const sku of chunk) {
+      coreBySku.set(sku, await fetchWalmartItemCore(sku));
+      await delay(150);
+    }
+
+    const feedItems = chunk.map(sku => buildMaintenanceItem(sku, action, coreBySku.get(sku)!));
     const feedId    = await submitMaintenanceFeed(feedItems);
 
     console.log(`[walmart-unpublish] Feed accepted. feedId=${feedId} action=${action} items=${feedItems.length}`);
