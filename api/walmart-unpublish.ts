@@ -262,6 +262,33 @@ async function fetchWalmartItemCore(sku: string): Promise<WalmartItemCore> {
   };
 }
 
+// ─── TEMPORARY: field-name probe ────────────────────────────────────────────
+// Round 4 confirmed sku/productIdentifiers/price/ShippingWeight are ALL valid
+// (no errors on any of them) — but flat `publishedStatus` is ALSO rejected as
+// "not a valid field", same as `Visible` before it. Neither guess from public
+// docs/task draft is right, and there's no more documentation to consult
+// (see header). This submits several plausible field names as siblings under
+// Item in ONE request — Walmart's ingestion error lists every invalid field
+// together (confirmed in earlier rounds), so whichever of these ISN'T named
+// as invalid is the real one. REMOVE this block once the real field is
+// confirmed and hardcode it directly in buildMaintenanceItem() below.
+function buildProbeFields(action: PublishAction): Record<string, unknown> {
+  const boolVal   = action !== 'unpublish';           // true = republish/visible
+  const statusVal = action === 'unpublish' ? 'UNPUBLISHED' : 'PUBLISHED';
+  return {
+    orderable:    boolVal,
+    isOrderable:  boolVal,
+    published:    boolVal,
+    isPublished:  boolVal,
+    visible:      boolVal,
+    isVisible:    boolVal,
+    sellerActive: boolVal,
+    active:       boolVal,
+    status:       statusVal,
+    itemStatus:   statusVal,
+  };
+}
+
 // ─── Payload builder ───────────────────────────────────────────────────────
 // SINGLE point of truth for the maintenance field mapping. If action=get-spec
 // reveals a different field/path, this is the only function to change.
@@ -278,11 +305,8 @@ function buildMaintenanceItem(sku: string, action: PublishAction, core: WalmartI
       // uses for MP_ITEM_INTL — Walmart rejected the object shape here
       // ("invalid data type value... Enter a 'integer' data type").
       ShippingWeight: DEFAULT_SHIPPING_WEIGHT_LB,
-      // Flat field, not nested under "Visible" — Walmart rejected "Visible"
-      // outright even with all other required fields present. This name
-      // matches the flat "publishedStatus" field Walmart's own /v3/items
-      // read response already uses — UNVERIFIED as a WRITE field, see header.
-      publishedStatus: action === 'unpublish' ? 'UNPUBLISHED' : 'PUBLISHED',
+      // TEMPORARY field-name probe — see buildProbeFields() above.
+      ...buildProbeFields(action),
     },
   };
 }
