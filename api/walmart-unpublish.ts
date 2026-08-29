@@ -52,19 +52,29 @@
 // update generally documented; it demands real business data even to touch
 // one field. Round 3 (current code) fetches each SKU's real gtin/upc/price
 // from Walmart's own /v3/items record (fetchWalmartItemCore) and echoes them
-// back unchanged, alongside a fixed ShippingWeight=25lb approximation (that
-// one field isn't readable back from Walmart — see DEFAULT_SHIPPING_WEIGHT_LB
-// below), to isolate whether `Visible` is rejected outright or was a
-// symptom of the missing required fields. STILL UNVERIFIED whether
-// `Visible.publishedStatus` is accepted — that requires another real submit
-// + feed status read. Keep iterating the same way: submit ?action=unpublish
-// &dryRun=false against known test SKUs, read walmart-feed-status, and let
-// Walmart's own ingestion error name anything still wrong — it's the only
-// working oracle for this account (see above). Confirm the round-trip in
-// Seller Center before trusting this for real traffic.
-// Whatever the real shape turns out to be, it lives in ONE place —
-// buildMaintenanceItem()/buildVisibleBlock() below — so correcting it is a
-// small, local edit, not a rewrite.
+// back unchanged. Round 3 (Item{sku,productIdentifiers,price,ShippingWeight:
+// {measure,unit},Visible}) came back:
+//   - productIdentifiers/price errors GONE — echoing real values worked.
+//   - EXT_DATA_ERROR "'Visible' is not a valid field" STILL present, now
+//     with all other required fields real/valid — confirms Visible is
+//     genuinely invalid for this account, not a symptom of missing data.
+//   - EXT_DATA_ERROR "'Shipping Weight (lbs)' has an invalid data type
+//     value... Enter a 'integer' data type" — ShippingWeight must be a flat
+//     integer, not the {measure,unit} object walmart-item-feed.ts uses for
+//     MP_ITEM_INTL. This account's Item schema is flat, not nested sections.
+// Round 4 (current code) drops "Visible" entirely and adds a flat
+// `publishedStatus` field directly under Item instead — matching the exact
+// flat field name Walmart's own /v3/items READ response already uses for
+// this same concept. ShippingWeight fixed to a plain integer. STILL
+// UNVERIFIED whether `publishedStatus` is accepted as a WRITE field — that
+// requires another real submit + feed status read. Keep iterating the same
+// way: submit ?action=unpublish&dryRun=false against known test SKUs, read
+// walmart-feed-status, and let Walmart's own ingestion error name anything
+// still wrong — it's the only working oracle for this account (see above).
+// Confirm the round-trip in Seller Center before trusting this for real
+// traffic. Whatever the real field turns out to be, it lives in ONE place —
+// buildMaintenanceItem() below — so correcting it is a small, local edit,
+// not a rewrite.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -255,12 +265,6 @@ async function fetchWalmartItemCore(sku: string): Promise<WalmartItemCore> {
 // ─── Payload builder ───────────────────────────────────────────────────────
 // SINGLE point of truth for the maintenance field mapping. If action=get-spec
 // reveals a different field/path, this is the only function to change.
-function buildVisibleBlock(targetStatus: 'PUBLISHED' | 'UNPUBLISHED') {
-  return {
-    publishedStatus: targetStatus, // UNVERIFIED — see file header
-  };
-}
-
 function buildMaintenanceItem(sku: string, action: PublishAction, core: WalmartItemCore) {
   return {
     Item: {
@@ -270,8 +274,15 @@ function buildMaintenanceItem(sku: string, action: PublishAction, core: WalmartI
         productId: core.gtin ?? core.upc ?? '',
       },
       price: core.price ?? 0,
-      ShippingWeight: { measure: DEFAULT_SHIPPING_WEIGHT_LB, unit: 'lb' },
-      Visible: buildVisibleBlock(action === 'unpublish' ? 'UNPUBLISHED' : 'PUBLISHED'),
+      // Flat integer, not the {measure, unit} object walmart-item-feed.ts
+      // uses for MP_ITEM_INTL — Walmart rejected the object shape here
+      // ("invalid data type value... Enter a 'integer' data type").
+      ShippingWeight: DEFAULT_SHIPPING_WEIGHT_LB,
+      // Flat field, not nested under "Visible" — Walmart rejected "Visible"
+      // outright even with all other required fields present. This name
+      // matches the flat "publishedStatus" field Walmart's own /v3/items
+      // read response already uses — UNVERIFIED as a WRITE field, see header.
+      publishedStatus: action === 'unpublish' ? 'UNPUBLISHED' : 'PUBLISHED',
     },
   };
 }
