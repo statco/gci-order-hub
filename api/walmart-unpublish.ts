@@ -77,17 +77,32 @@
 // claimed version. DEFAULT_SPEC_VERSION bumped to a findable recent 5.x
 // string; may need updating again if it's since gone stale.
 //
-// Round 5 (current code) combines that version bump with a batch probe of
-// 10 plausible field names (buildProbeFields()) submitted as Item siblings
-// in one request — Walmart's ingestion error lists every invalid field
-// together, so whichever of these ISN'T flagged is the real one. STILL
-// UNVERIFIED. Keep iterating the same way: submit ?action=unpublish
-// &dryRun=false against known test SKUs, read walmart-feed-status, and let
-// Walmart's own ingestion error name anything still wrong — it's the only
-// working oracle for this account (see above). Confirm the round-trip in
-// Seller Center before trusting this for real traffic. Whatever the real
-// field turns out to be, it lives in ONE place — buildMaintenanceItem()
-// below — so correcting it is a small, local edit, not a rewrite.
+// Round 5 combined that version bump with a batch probe of 10 plausible
+// field names. Result: the 5.x dated version string was ITSELF rejected —
+// "'5.0.20260114-19_40_57' is not a valid Unit for the 'Spec Version' field.
+// Select a valid value from the drop-down list: [1.0]." CONFIRMED: this
+// account's feed uses its own "1.0" versioning, a schema entirely separate
+// from the mainstream 4.x/5.x Item Spec lineage (matches the distinct
+// "Global Marketplace itembulkuploads" API family). Also newly required:
+// `productCategory`. All 10 of round 5's field-name guesses (orderable,
+// isOrderable, published, isPublished, visible, isVisible, sellerActive,
+// active, status, itemStatus) were rejected together in one error — none
+// were right.
+//
+// Round 6 (current code): DEFAULT_SPEC_VERSION fixed to "1.0" (confirmed,
+// not a guess); productCategory added, echoed from the item's own real
+// productType (e.g. "Tires") via fetchWalmartItemCore — not fabricated.
+// A fresh, non-overlapping batch of field-name candidates (listingStatus,
+// availabilityStatus, offerStatus, publishStatus, state, itemState,
+// isListed, enabled, isEnabled, hidden, isHidden, discontinued) tests the
+// remaining unknown: the toggle field itself. STILL UNVERIFIED. Keep
+// iterating the same way: submit ?action=unpublish&dryRun=false against
+// known test SKUs, read walmart-feed-status, and let Walmart's own
+// ingestion error name anything still wrong — it's the only working oracle
+// for this account (see above). Confirm the round-trip in Seller Center
+// before trusting this for real traffic. Whatever the real field turns out
+// to be, it lives in ONE place — buildMaintenanceItem() below — so
+// correcting it is a small, local edit, not a rewrite.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -100,16 +115,13 @@ const SECRET       = process.env.WALMART_UNPUBLISH_SECRET ?? '';
 
 const CHUNK_SIZE           = 300; // matches the repo-wide convention (walmart-retire.ts)
 const MAINTENANCE_FEED_TYPE = 'MP_MAINTENANCE';
-// Walmart sunset Item Spec 4.x (this account's feed submissions were using
-// version 4.1) in favour of 5.x, which uses dated build-string versions
-// instead of simple numbers (e.g. "5.0.20260114-19_40_57", the most recent
-// one findable without a working Get Spec lookup for this account — see
-// header). Persistent "not a valid field" errors on 4.x-era field names
-// (Visible, publishedStatus) even once all other required data was valid
-// are consistent with this account now validating against 5.x regardless
-// of what version string the feed header claims. May need bumping again to
-// whatever Walmart's current 5.x dated version is if this one doesn't work.
-const DEFAULT_SPEC_VERSION  = '5.0.20260114-19_40_57';
+// CONFIRMED live: Walmart rejected the 5.x dated string with
+// "'5.0.20260114-19_40_57' is not a valid Unit for the 'Spec Version' field.
+// Select a valid value from the drop-down list: [1.0]." — this account's feed
+// uses its own "1.0" versioning, distinct from the mainstream 4.x/5.x Item
+// Spec lineage entirely (matches the separate "Global Marketplace
+// itembulkuploads" API family, not the US-marketplace Item Spec docs).
+const DEFAULT_SPEC_VERSION  = '1.0';
 const DEFAULT_PRODUCT_TYPE  = 'Tires'; // CONFIRM against action=get-taxonomy output
 
 type PublishAction = 'unpublish' | 'republish';
@@ -267,18 +279,20 @@ const DEFAULT_SHIPPING_WEIGHT_LB = 25; // walmart-item-feed.ts's PASSENGER_CAR
 // and price below are exact echoes of Walmart's current real data, not guesses.
 
 interface WalmartItemCore {
-  gtin:  string | null;
-  upc:   string | null;
-  price: number | null;
+  gtin:            string | null;
+  upc:             string | null;
+  price:           number | null;
+  productCategory: string | null; // echoed from the item's own real productType
 }
 
 async function fetchWalmartItemCore(sku: string): Promise<WalmartItemCore> {
   const data: any = await walmartFetch<any>(`/v3/items/${encodeURIComponent(sku)}`);
   const item = data?.ItemResponse?.[0];
   return {
-    gtin:  item?.gtin ?? null,
-    upc:   item?.upc  ?? null,
-    price: item?.price?.amount != null ? parseFloat(item.price.amount) : null,
+    gtin:            item?.gtin ?? null,
+    upc:             item?.upc  ?? null,
+    price:           item?.price?.amount != null ? parseFloat(item.price.amount) : null,
+    productCategory: item?.productType ?? null,
   };
 }
 
@@ -292,20 +306,29 @@ async function fetchWalmartItemCore(sku: string): Promise<WalmartItemCore> {
 // together (confirmed in earlier rounds), so whichever of these ISN'T named
 // as invalid is the real one. REMOVE this block once the real field is
 // confirmed and hardcode it directly in buildMaintenanceItem() below.
+//
+// Round 5 batch (orderable, isOrderable, published, isPublished, visible,
+// isVisible, sellerActive, active, status, itemStatus) came back ALL
+// rejected together in one error: "'active, isOrderable, isPublished,
+// isVisible, itemStatus, orderable, published, sellerActive, status,
+// visible' is not a valid field." None of round 5's guesses were right.
+// Round 6 (current) tries a fresh, non-overlapping batch.
 function buildProbeFields(action: PublishAction): Record<string, unknown> {
-  const boolVal   = action !== 'unpublish';           // true = republish/visible
-  const statusVal = action === 'unpublish' ? 'UNPUBLISHED' : 'PUBLISHED';
+  const isRepublish = action === 'republish';
+  const statusVal   = action === 'unpublish' ? 'UNPUBLISHED' : 'PUBLISHED';
   return {
-    orderable:    boolVal,
-    isOrderable:  boolVal,
-    published:    boolVal,
-    isPublished:  boolVal,
-    visible:      boolVal,
-    isVisible:    boolVal,
-    sellerActive: boolVal,
-    active:       boolVal,
-    status:       statusVal,
-    itemStatus:   statusVal,
+    listingStatus:      statusVal,
+    availabilityStatus: statusVal,
+    offerStatus:        statusVal,
+    publishStatus:      statusVal, // NOTE: distinct from already-rejected "publishedStatus"
+    state:              statusVal,
+    itemState:          statusVal,
+    isListed:           isRepublish,
+    enabled:            isRepublish,
+    isEnabled:          isRepublish,
+    hidden:             !isRepublish,
+    isHidden:           !isRepublish,
+    discontinued:       !isRepublish,
   };
 }
 
@@ -325,6 +348,9 @@ function buildMaintenanceItem(sku: string, action: PublishAction, core: WalmartI
       // uses for MP_ITEM_INTL — Walmart rejected the object shape here
       // ("invalid data type value... Enter a 'integer' data type").
       ShippingWeight: DEFAULT_SHIPPING_WEIGHT_LB,
+      // Newly required (round 5) — echoed from the item's own real
+      // productType (e.g. "Tires"), not fabricated.
+      productCategory: core.productCategory ?? DEFAULT_PRODUCT_TYPE,
       // TEMPORARY field-name probe — see buildProbeFields() above.
       ...buildProbeFields(action),
     },
