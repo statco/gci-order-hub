@@ -18,6 +18,7 @@
     "api/walmart-zero.ts":             { "maxDuration": 120 },
     "api/walmart-orphan-sweep.ts":     { "maxDuration": 300 },
     "api/walmart-retire.ts":           { "maxDuration": 300 },
+    "api/walmart-delist.ts":           { "maxDuration": 300 },
     "api/walmart-oversell-monitor.ts": { "maxDuration": 300 },
     "api/walmart-sync-cursor.ts":      { "maxDuration": 180 },
     "api/health-check-make.ts":        { "maxDuration": 30  }
