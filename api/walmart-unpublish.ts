@@ -119,6 +119,28 @@ async function handleGetTaxonomy(req: VercelRequest, res: VercelResponse) {
   });
 }
 
+// ─── Step 0c: raw item detail diagnostic ───────────────────────────────────
+// Read-only. Fetches GET /v3/items/{sku} verbatim so real field shapes
+// (productIdentifiers, price, any shipping-weight field) can be sourced from
+// Walmart's own record for a SKU, instead of guessed — required after
+// MP_MAINTENANCE ingestion demanded productIdentifiers/price/ShippingWeight
+// as real business data, not placeholders (see file header).
+async function handleGetItem(req: VercelRequest, res: VercelResponse) {
+  const sku = ((req.query.sku as string) || '').toUpperCase().trim();
+  if (!sku) {
+    return res.status(400).json({ error: 'Missing required query param: sku' });
+  }
+
+  const raw = await walmartFetch<any>(`/v3/items/${encodeURIComponent(sku)}`);
+
+  return res.status(200).json({
+    success: true,
+    mode: 'get-item',
+    sku,
+    raw,
+  });
+}
+
 // ─── Step 0b: Get Spec diagnostic ───────────────────────────────────────────
 
 /**
@@ -332,6 +354,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return await handleGetTaxonomy(req, res);
     }
 
+    if (action === 'get-item') {
+      if (req.method !== 'GET') {
+        return res.status(405).json({ error: 'GET only for action=get-item' });
+      }
+      return await handleGetItem(req, res);
+    }
+
     if (action === 'get-spec') {
       if (req.method !== 'GET' && req.method !== 'POST') {
         return res.status(405).json({ error: 'GET or POST only for action=get-spec' });
@@ -341,7 +370,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (action !== 'unpublish' && action !== 'republish') {
       return res.status(400).json({
-        error: 'Missing/invalid action — expected ?action=get-taxonomy | get-spec | unpublish | republish',
+        error: 'Missing/invalid action — expected ?action=get-taxonomy | get-spec | get-item | unpublish | republish',
       });
     }
 
