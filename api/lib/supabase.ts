@@ -60,17 +60,18 @@ async function restPatch(path: string, body: Record<string, unknown>): Promise<v
 // ── Cursor row type ─────────────────────────────────────────────────────────
 
 export interface SyncCursorRow {
-  id:                   number;
-  current_offset:       number;
-  total_listed:         number | null;
-  attempt_count:        number;
-  last_run_at:          string | null;
-  last_status:          string | null;  // 'ok' | 'wrapped' | 'error' | 'skipped'
-  last_inv_ok:          number | null;
-  last_inv_fail:        number | null;
-  last_zeroed:          number | null;
-  consecutive_failures: number;
-  updated_at:           string | null;
+  id:                       number;
+  current_offset:           number;
+  total_listed:             number | null;
+  attempt_count:            number;
+  last_run_at:              string | null;
+  last_status:              string | null;  // 'ok' | 'wrapped' | 'error' | 'skipped'
+  last_inv_ok:              number | null;
+  last_inv_fail:            number | null;
+  last_zeroed:              number | null;
+  consecutive_failures:     number;
+  last_failure_alert_count: number | null;  // consecutive_failures value at last alert; null = no active outage alert
+  updated_at:               string | null;
 }
 
 export async function readCursor(): Promise<SyncCursorRow> {
