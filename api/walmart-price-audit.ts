@@ -1,34 +1,33 @@
 /**
  * api/walmart-price-audit.ts
  *
- * Compares Walmart listed prices against current Shopify prices, in BOTH
- * directions:
+ * READ-ONLY diagnostic. Compares Walmart listed prices against current
+ * Shopify prices, in BOTH directions:
  *
  *   - 'below_shopify': Walmart price is more than 5% below Shopify price —
- *     the original dumping/undercut-risk check.
- *   - 'overpriced': Walmart price sits more than 5% above the CORRECT
- *     landed-cost floor (real tireType/rimSize, not the conservative
- *     LT/rim-22 fallback every caller used to omit). This is what Walmart's
- *     own price-fairness algorithm reads as "listed too high" and can
- *     auto-unpublish for — confirmed live on SKU 300E3009 (Ovation W-686
- *     Ecovision 185/65R15): Walmart at $261.99 vs a real $174.99 Shopify
- *     price, because every past correction used the LT/22 fallback floor
- *     instead of this tire's real Passenger/15 class.
+ *     the delisting-risk direction (Walmart delists sellers found pricing
+ *     lower elsewhere).
+ *   - 'overpriced': Walmart price sits more than 5% above the correct
+ *     landed-cost floor (real tireType/rimSize).
  *
- * Both directions correct to the same safeWalmartPrice() value — the higher
- * of the real Shopify price and the real landed-cost floor — so a corrected
- * 'overpriced' SKU settles back down near its actual Shopify price, never
- * below cost.
+ * CHANGED 2026-08-30: this endpoint used to auto-correct flagged SKUs by
+ * default (writes unless ?dryRun=true was passed) — a second, independent
+ * place computing and pushing a Walmart price, alongside the live
+ * walmart-sync-cursor cron. The two could diverge and fight each other.
+ * That write capability is removed entirely. api/lib/listed-sync.ts (used
+ * by the scheduled cursor) now computes the identical safeWalmartPrice()
+ * value automatically every 2 minutes — there is exactly one place in this
+ * codebase that ever decides and writes a Walmart price. This endpoint is
+ * now report-only, for manual sanity-checking between cursor passes.
  *
- * GET /api/walmart-price-audit?dryRun=true   — report only, no corrections
- * GET /api/walmart-price-audit               — report + auto-correct flagged SKUs
+ * GET /api/walmart-price-audit               — report only, no writes, ever
  * GET /api/walmart-price-audit?offset=N&limit=M — paginated (default: all)
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getWalmartToken } from './lib/walmart-client.js';
 import { fetchAllShopifyVariants } from './lib/shopify.js';
-import { safeWalmartPrice, assertAboveCost } from './lib/pricing.js';
+import { safeWalmartPrice } from './lib/pricing.js';
 
 const WALMART_BASE    = process.env.WALMART_BASE_URL!;
 const PAGE_SIZE       = 200;
@@ -45,9 +44,6 @@ interface AuditRow {
   safePrice: number | null;
   /** % below Shopify price (below_shopify rows) or % above the correct floor (overpriced rows). */
   pctDiff: number;
-  corrected: boolean;
-  skippedNoCost?: boolean;
-  error?: string;
 }
 
 // ─── Walmart helpers ──────────────────────────────────────────────────────────
@@ -108,51 +104,13 @@ async function fetchListedItemsWithPrices(
   return items;
 }
 
-async function correctWalmartPrice(
-  token: string,
-  sku: string,
-  newPrice: number,
-  cost: number | null
-): Promise<void> {
-  const amount = parseFloat(newPrice.toFixed(2));
-  // LAYER 1 backstop — a below-cost correction throws rather than ships.
-  assertAboveCost(sku, amount, cost);
-
-  const res = await fetch(`${WALMART_BASE}/v3/price`, {
-    method: 'PUT',
-    headers: {
-      'WM_SEC.ACCESS_TOKEN':    token,
-      'WM_GLOBAL_VERSION':      '3.1',
-      'WM_MARKET':              'ca',
-      'WM_SVC.NAME':            'Walmart Marketplace',
-      'WM_QOS.CORRELATION_ID':  crypto.randomUUID(),
-      Accept:                   'application/json',
-      'Content-Type':           'application/json',
-    },
-    body: JSON.stringify({
-      sku,
-      pricing: [{
-        currentPriceType: 'BASE',
-        currentPrice: { currency: 'CAD', amount },
-      }],
-    }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Price update failed for ${sku}: ${text}`);
-  }
-}
-
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'GET only' });
 
-  const dryRun = req.query.dryRun === 'true';
-  const isCron = req.headers['x-vercel-cron'] === '1';
   const offset = parseInt(req.query.offset as string ?? '0', 10) || 0;
-  const limit = isCron ? 99999 : (parseInt(req.query.limit as string ?? '300', 10) || 300);
+  const limit = parseInt(req.query.limit as string ?? '300', 10) || 300;
 
   try {
     const token = await getWalmartToken();
@@ -180,26 +138,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (walmartPrice < belowThreshold) {
         const pctDiff = ((shopifyPrice - walmartPrice) / shopifyPrice) * 100;
         flagged.push({
-          sku,
-          direction: 'below_shopify',
-          walmartPrice,
-          shopifyPrice,
-          cost: sv.cost,
-          safePrice,
-          pctDiff: parseFloat(pctDiff.toFixed(1)),
-          corrected: false,
+          sku, direction: 'below_shopify', walmartPrice, shopifyPrice,
+          cost: sv.cost, safePrice, pctDiff: parseFloat(pctDiff.toFixed(1)),
         });
       } else if (aboveThreshold != null && walmartPrice > aboveThreshold) {
         const pctDiff = ((walmartPrice - safePrice!) / safePrice!) * 100;
         flagged.push({
-          sku,
-          direction: 'overpriced',
-          walmartPrice,
-          shopifyPrice,
-          cost: sv.cost,
-          safePrice,
-          pctDiff: parseFloat(pctDiff.toFixed(1)),
-          corrected: false,
+          sku, direction: 'overpriced', walmartPrice, shopifyPrice,
+          cost: sv.cost, safePrice, pctDiff: parseFloat(pctDiff.toFixed(1)),
         });
       } else {
         clean.push(walmartPrice);
@@ -208,37 +154,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // Sort worst discrepancy first
     flagged.sort((a, b) => b.pctDiff - a.pctDiff);
-
-    // Paginate corrections on the flagged array, not walmartItems
     const pagedFlagged = flagged.slice(offset, offset + limit);
-
-    if (!dryRun) {
-      for (const row of pagedFlagged) {
-        // LAYER 1: correct to the floored safe price, never the raw Shopify
-        // price. Missing cost → skip + log (never guess).
-        if (row.safePrice == null) {
-          row.skippedNoCost = true;
-          continue;
-        }
-        try {
-          await correctWalmartPrice(token, row.sku, row.safePrice, row.cost);
-          row.corrected = true;
-        } catch (e: unknown) {
-          row.error = e instanceof Error ? e.message : String(e);
-        }
-      }
-    }
 
     const totalBelowShopify = flagged.filter(r => r.direction === 'below_shopify').length;
     const totalOverpriced   = flagged.filter(r => r.direction === 'overpriced').length;
 
     console.log(
       `[walmart-price-audit] Flagged: ${flagged.length} (below_shopify=${totalBelowShopify}, overpriced=${totalOverpriced})` +
-      ` | Paged: ${pagedFlagged.length} | Corrected: ${pagedFlagged.filter(r => r.corrected).length} | dryRun: ${dryRun}`
+      ` | Paged: ${pagedFlagged.length} | READ-ONLY, no writes made`
     );
 
     return res.status(200).json({
-      dryRun,
+      readOnly: true,
+      note: 'This endpoint never writes. Corrections happen automatically via walmart-sync-cursor every 2 minutes using the same safeWalmartPrice() formula.',
       totalItems: walmartItems.length,
       totalFlagged: flagged.length,
       totalBelowShopify,
@@ -247,8 +175,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       limit,
       nextOffset: offset + limit < flagged.length ? offset + limit : null,
       pagedFlaggedCount: pagedFlagged.length,
-      corrected: pagedFlagged.filter(r => r.corrected).length,
-      skippedNoCost: pagedFlagged.filter(r => r.skippedNoCost).map(r => r.sku),
       cleanCount: clean.length,
       flagged: pagedFlagged,
     });

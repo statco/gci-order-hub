@@ -21,7 +21,7 @@ import {
   type WalmartInventoryItem,
 } from './walmart-client';
 import { fetchActiveCtSyncVariants } from './shopify';
-import { safeWalmartPrice, PRICE_FLOOR_MULTIPLIER } from './pricing';
+import { safeWalmartPrice } from './pricing';
 import type { TireType } from './pricing/landedCost';
 
 const WALMART_CHUNK = 1_000;
@@ -124,16 +124,38 @@ export async function runListedSyncChunk(opts: {
 
   console.log(`[listed-sync] built ${items.length} items; zeroedNoActiveMatch=${zeroedNoActiveMatch}`);
 
-  const isExposed = (i: SyncItem): boolean => {
-    if (i.ctCost == null || i.ctCost <= 0) return false;
-    const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize });
-    return safe != null && safe < i.ctCost * PRICE_FLOOR_MULTIPLIER;
-  };
+  // ── Price resolution — THE single canonical pricing decision ───────────
+  // CHANGED 2026-08-30: previously pushed the raw Shopify price directly and
+  // used safeWalmartPrice() only as a binary exposure-hold gate (skip the
+  // whole write if the computed safe price looked suspect vs ctCost). That
+  // meant the price actually sent to Walmart was NEVER the floor-aware safe
+  // value — it was always Shopify's raw price, or nothing at all. This is
+  // what let 261/318 live SKUs drift to being 15-50%+ overpriced on Walmart
+  // (stale prices frozen during the Aug 26-28 outage, never corrected by
+  // the normal sync because "not exposed" just meant "push the stale raw
+  // price again unchanged").
+  //
+  // Fixed: safeWalmartPrice() - max(real Shopify price, real landed-cost
+  // floor), using real tireType/rimSize - is now the ONLY value ever pushed
+  // to Walmart. This is the same formula api/walmart-price-audit.ts used
+  // for its one-off corrections; that tool's write capability has been
+  // removed (see that file) now that this path computes the identical,
+  // correct price automatically every 2 minutes via the cursor. There is
+  // now exactly one place in this codebase that decides a Walmart price.
+  //
+  // Hold (skip the price write, inventory still pushes) ONLY when cost is
+  // genuinely unknown - safeWalmartPrice() returns null and there is no
+  // safe price to compute, not "the price looked suspiciously low."
+  const resolved = items.map(i => {
+    const finalPrice = safeWalmartPrice({
+      shopifyPrice: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize,
+    });
+    return { item: i, finalPrice };
+  });
 
-  // heldExposed: price write skipped (suspect cost); inventory IS still pushed.
-  const heldExposed: string[] = items.filter(isExposed).map(i => i.sku);
-  if (heldExposed.length) {
-    console.log(`⏸️  [listed-sync] Exposure-held (price skipped, suspect cost): ${heldExposed.length} SKUs`);
+  const heldNoCost: string[] = resolved.filter(r => r.finalPrice == null).map(r => r.item.sku);
+  if (heldNoCost.length) {
+    console.log(`⏸️  [listed-sync] Held (cost unknown, cannot compute a safe price): ${heldNoCost.length} SKUs`);
   }
 
   if (dry) {
@@ -146,7 +168,7 @@ export async function runListedSyncChunk(opts: {
       nextOffset,
       done,
       zeroedNoActiveMatch,
-      heldExposed,
+      heldExposed:    heldNoCost,
       skippedNoCost:  [],
       priceResult:    null,
       inventoryResult: null,
@@ -156,7 +178,9 @@ export async function runListedSyncChunk(opts: {
   }
 
   // ── Push to Walmart ───────────────────────────────────────────────────────
-  const priceItems:     WalmartPriceItem[]     = items.filter(i => !isExposed(i)).map(i => ({ sku: i.sku, price: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize }));
+  const priceItems:     WalmartPriceItem[]     = resolved
+    .filter((r): r is { item: SyncItem; finalPrice: number } => r.finalPrice != null)
+    .map(r => ({ sku: r.item.sku, price: r.finalPrice, cost: r.item.cost, tireType: r.item.tireType, rimSize: r.item.rimSize }));
   const inventoryItems: WalmartInventoryItem[] = items.map(i => ({ sku: i.sku, quantity: i.walmartQty }));
 
   let totalPriceSuccess     = 0;
@@ -204,7 +228,7 @@ export async function runListedSyncChunk(opts: {
     nextOffset,
     done,
     zeroedNoActiveMatch,
-    heldExposed,
+    heldExposed: heldNoCost,
     skippedNoCost,
     priceResult:     { success: totalPriceSuccess,     failed: totalPriceFailed     },
     inventoryResult: { success: totalInventorySuccess, failed: totalInventoryFailed },
