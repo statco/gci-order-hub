@@ -30,16 +30,8 @@
 // ─────────────────────────────────────────────────────────────
 
 import type { VercelRequest, VercelResponse }  from '@vercel/node';
-import {
-  bulkPriceFeed,
-  bulkInventoryFeed,
-  fetchListedSkus,
-  chunkArray,
-  type WalmartPriceItem,
-  type WalmartInventoryItem,
-} from './lib/walmart-client';
-import { fetchAllShopifyVariants } from './lib/shopify';
-import { safeWalmartPrice, PRICE_FLOOR_MULTIPLIER } from './lib/pricing';
+import { fetchListedSkus } from './lib/walmart-client';
+import { safeWalmartPrice } from './lib/pricing';
 import { runListedSyncChunk } from './lib/listed-sync';
 import type { TireType } from './lib/pricing/landedCost';
 
@@ -53,7 +45,6 @@ const API_VERSION    = '2024-01';
 const SHOPIFY_BASE   = `https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}`;
 
 const CT_SYNC_TAG      = 'ct-sync';
-const WALMART_CHUNK    = 1_000; // Walmart feed max items per call
 
 // ─── SHOPIFY HELPERS ────────────────────────────────────────────
 
@@ -139,7 +130,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const mode        = (req.query.mode as string) ?? '';
   const offsetParam = parseInt((req.query.offset as string) ?? '0', 10) || 0;
   const limitParam  = req.query.limit ? parseInt(req.query.limit as string, 10) : null;
-  const start       = Date.now();
 
   console.log(
     `🛒 Walmart sync starting${
@@ -206,11 +196,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   }
 
-  // ── All other modes: non-chunked fetch ────────────────────────────────────
+  // ── All other modes: read-only diagnostics only ────────────────────────
   let items: SyncItem[];
-  let listedSkuCount: number | undefined;
-  let totalListed = 0;
-  const zeroedNoActiveMatch = 0;
 
   try {
     const shopifyStart = Date.now();
@@ -267,180 +254,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   }
 
-  if (items.length === 0) {
-    return res.status(200).json({ ok: true, message: 'No variants found', synced: 0 });
-  }
-
-  // ── mode=listed (full scan): filter to only Walmart-listed SKUs ─────
-  if (mode === 'listed' && limitParam === null) {
-    try {
-      console.log('🔍 Fetching Walmart-listed SKUs…');
-      const listedSkus      = await fetchListedSkus();
-      const listedSkusArray = [...listedSkus];
-      totalListed           = listedSkusArray.length;
-      listedSkuCount        = totalListed;
-
-      const skusToProcess: Set<string> = limitParam !== null
-        ? new Set(listedSkusArray.slice(offsetParam, offsetParam + limitParam))
-        : listedSkus;
-
-      const before = items.length;
-      items = items.filter(i => skusToProcess.has(i.sku));
-      console.log(
-        `🔍 listed filter: ${items.length}/${before} Shopify variants matched` +
-        (limitParam !== null
-          ? ` (chunk [${offsetParam}–${offsetParam + limitParam}) of ${totalListed} Walmart listings)`
-          : ` ${totalListed} Walmart listings`)
-      );
-    } catch (err: any) {
-      console.error('❌ Walmart items fetch failed:', err.message);
-      return res.status(500).json({ error: 'Walmart items fetch failed', details: err.message });
-    }
-  }
-
-  // ── Enrich with cost (LAYER 1 floor needs it) ───────────────────────
-  // Cost lives on InventoryItem.unitCost in GraphQL. Enrichment runs for
-  // the full-scan (fetchTireVariants) path; the chunked listed path
-  // (now delegated to runListedSyncChunk) gets cost from fetchActiveCtSyncVariants().
-  try {
-    const variantMap = await fetchAllShopifyVariants();
-    for (const i of items) {
-      const v = variantMap.get(i.sku) ?? variantMap.get(i.sku.replace(/^TIRE-/, ''));
-      i.cost = v?.cost ?? null;
-      i.ctCost = v?.ctCost ?? null;
-      i.tireType = v?.tireType ?? null;
-      i.rimSize = v?.rimSize ?? null;
-    }
-    const withCost = items.filter(i => i.cost != null).length;
-    console.log(`💲 Cost enrichment: ${withCost}/${items.length} variants have a cost`);
-  } catch (err: any) {
-    console.error('❌ Cost enrichment failed (prices will be skipped without cost):', err.message);
-  }
-
-  // Suppression removed: an in-stock SKU is never zeroed. This stays as a
-  // backstop assertion — it must always be 0 now. `zeroStock` reports the
-  // SKUs sent 0 because Shopify genuinely shows 0.
-  const safetyZeroed = items.filter(i => i.shopifyQty > 0 && i.walmartQty === 0).length;
-  const zeroStock    = items.filter(i => i.shopifyQty === 0).length;
-  console.log(`📦 Inventory: ${zeroStock} at zero (Shopify shows 0); suppressed-in-stock=${safetyZeroed} (must be 0)`);
-
-  // ── Dry run ───────────────────────────────────────────────────
-  if (isDry) {
-    return res.status(200).json({
-      dryRun:       true,
-      total:        items.length,
-      safetyZeroed,
-      zeroStock,
-      zeroedNoActiveMatch,
-      ...(listedSkuCount !== undefined ? { listedSkuCount } : {}),
-      sample:       items.slice(0, 5).map(i => ({
-        sku:        i.sku,
-        price:      i.price,
-        cost:       i.cost,
-        safePrice:  safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost }),
-        shopifyQty: i.shopifyQty,
-        walmartQty: i.walmartQty,
-      })),
-    });
-  }
-
-  // ── Push to Walmart ──────────────────────────────────────────────
-  // Exposure hold: skip the price write for any SKU where the price we'd push
-  // is below (true CT cost × floor) — i.e. a halved/suspect stored cost would
-  // leave us under true cost. Inventory is still pushed. Mirrors reconcile's
-  // holdExposed; auto-releases once the stored Shopify cost is corrected.
-  const isExposed = (i: SyncItem): boolean => {
-    if (i.ctCost == null || i.ctCost <= 0) return false;
-    const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize });
-    return safe != null && safe < i.ctCost * PRICE_FLOOR_MULTIPLIER;
-  };
-  // heldExposed: stored Shopify price is below true CT cost × floor (suspect cost); price write
-  // skipped until the stored cost is corrected. Inventory IS still pushed for these SKUs —
-  // only the price write is held, never the quantity write.
-  const heldExposed: string[] = items.filter(isExposed).map(i => i.sku);
-  if (heldExposed.length) {
-    console.log(`⏸️  Exposure-held (price skipped, suspect cost): ${heldExposed.length} SKUs`);
-  }
-
-  const priceItems:     WalmartPriceItem[]     = items.filter(i => !isExposed(i)).map(i => ({ sku: i.sku, price: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize }));
-  const inventoryItems: WalmartInventoryItem[] = items.map(i => ({ sku: i.sku, quantity: i.walmartQty }));
-
-  let totalPriceSuccess     = 0;
-  let totalPriceFailed      = 0;
-  let totalInventorySuccess = 0;
-  let totalInventoryFailed  = 0;
-  const skippedNoCost: string[] = [];
-  const errors: string[]    = [];
-
-  const walmartStart = Date.now();
-
-  for (const chunk of chunkArray(priceItems, WALMART_CHUNK)) {
-    try {
-      const result = await bulkPriceFeed(chunk);
-      totalPriceSuccess += result.success;
-      totalPriceFailed  += result.failed;
-      if (result.skippedNoCost) skippedNoCost.push(...result.skippedNoCost);
-    } catch (err: any) {
-      errors.push(`price chunk: ${err.message}`);
-    }
-    await delay(500);
-  }
-
-  for (const chunk of chunkArray(inventoryItems, WALMART_CHUNK)) {
-    try {
-      const result = await bulkInventoryFeed(chunk);
-      totalInventorySuccess += result.success;
-      totalInventoryFailed  += result.failed;
-    } catch (err: any) {
-      errors.push(`inventory chunk: ${err.message}`);
-    }
-    await delay(500);
-  }
-
-  const walmartSecs = ((Date.now() - walmartStart) / 1000).toFixed(1);
-  console.log(`Walmart calls complete: ${totalPriceSuccess + totalInventorySuccess} succeeded, ${totalPriceFailed + totalInventoryFailed} failed in ${walmartSecs}s`);
-
-  const durationMs      = Date.now() - start;
-  const priceResult     = { success: totalPriceSuccess,     failed: totalPriceFailed };
-  const inventoryResult = { success: totalInventorySuccess, failed: totalInventoryFailed };
-  console.log(`✅ Walmart sync done in ${durationMs}ms`);
-
-  // ── Chunked response ───────────────────────────────────────────────
-  if (limitParam !== null) {
-    const nextOffset = offsetParam + limitParam < totalListed ? offsetParam + limitParam : null;
-    return res.status(errors.length > 0 ? 207 : 200).json({
-      ok:             errors.length === 0,
-      processed:      items.length,
-      offset:         offsetParam,
-      limit:          limitParam,
-      nextOffset,
-      done:           nextOffset === null,
-      zeroedNoActiveMatch,
-      priceResult,
-      inventoryResult,
-      skippedNoCostCount: skippedNoCost.length,
-      skippedNoCost:      skippedNoCost.slice(0, 100),
-      heldExposedCount:   heldExposed.length,
-      heldExposed:        heldExposed.slice(0, 100),
-      durationMs,
-      ...(errors.length ? { errors } : {}),
-    });
-  }
-
-  // ── Full-catalogue response ──────────────────────────────────────────
-  return res.status(errors.length > 0 ? 207 : 200).json({
-    ok:              errors.length === 0,
-    totalVariants:   items.length,
-    safetyZeroed,
-    zeroStock,
-    ...(listedSkuCount !== undefined ? { listedSkuCount } : {}),
-    priceResult,
-    inventoryResult,
-    skippedNoCostCount: skippedNoCost.length,
-    skippedNoCost:      skippedNoCost.slice(0, 100),
-    heldExposedCount:   heldExposed.length,
-    heldExposed:        heldExposed.slice(0, 100),
-    durationMs,
-    ...(errors.length ? { errors } : {}),
+  // ── Anything else (no mode, or mode=listed without offset/limit): this
+  // used to fall through to a full-catalog write path. That path is gone —
+  // see api/lib/listed-sync.ts header comment for why. Use the chunked
+  // ?mode=listed&offset=&limit= form above (delegates to runListedSyncChunk,
+  // the same function the scheduled cursor uses), or one of the read-only
+  // diagnostics above (sku-sample, audit).
+  return res.status(410).json({
+    error: 'This write path has been removed.',
+    reason: 'Duplicated pricing logic that could diverge from the live cursor - see api/lib/listed-sync.ts header comment.',
+    useInstead: '?mode=listed&offset=0&limit=50 (delegates to the same runListedSyncChunk the cursor uses)',
   });
 }

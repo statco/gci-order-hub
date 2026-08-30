@@ -124,17 +124,51 @@ export async function runListedSyncChunk(opts: {
 
   console.log(`[listed-sync] built ${items.length} items; zeroedNoActiveMatch=${zeroedNoActiveMatch}`);
 
-  const isExposed = (i: SyncItem): boolean => {
-    if (i.ctCost == null || i.ctCost <= 0) return false;
-    const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize });
-    return safe != null && safe < i.ctCost * PRICE_FLOOR_MULTIPLIER;
-  };
+  // ── Price resolution — THE single canonical pricing decision ───────────
+  // CHANGED 2026-08-30: previously pushed the raw Shopify price directly;
+  // safeWalmartPrice()'s return value was computed but never actually sent
+  // — bulkPriceFeed() recomputes and writes its own safe price internally
+  // regardless of what's passed as `price`, so the real write path was
+  // already floor-aware even before this change. What WAS missing upstream
+  // (fixed in gci-order-hub#82, merged) was real tireType/rimSize on that
+  // computation — every caller defaulted to the most conservative (LT,
+  // rim 22) fallback, inflating floors well above real Shopify prices.
+  // That's what let 261/318 live SKUs drift to being 15-50%+ overpriced.
+  //
+  // This pass makes the resolved price explicit here too (still the same
+  // value bulkPriceFeed() would compute) so this file's own hold logic can
+  // reason about it directly, and so api/walmart-price-audit.ts's write
+  // capability — a second, independent place that could compute and push a
+  // price — could be removed entirely (see that file) now that this is
+  // unambiguously the one place that decides a Walmart price.
+  //
+  // Hold (skip the price write, inventory still pushes) when EITHER:
+  //   - cost is genuinely unknown — safeWalmartPrice() returns null, or
+  //   - cost is known but looks corrupted: the computed price sits below
+  //     (true CT dealer cost × floor) per the *independent* ctCost
+  //     metafield. This catches a stored Shopify unitCost that's wrong
+  //     (halved, bad sync, wrong decimal) even when tireType/rimSize are
+  //     both correct — a different failure mode than the one above, and
+  //     the only real-time guard against it (cost-integrity-audit.ts is a
+  //     daily REPORT, not a write-blocking gate — see its own header).
+  const resolved = items.map(i => {
+    const finalPrice = safeWalmartPrice({
+      shopifyPrice: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize,
+    });
+    const suspectCost = finalPrice != null && i.ctCost != null && i.ctCost > 0
+      && finalPrice < i.ctCost * PRICE_FLOOR_MULTIPLIER;
+    return { item: i, finalPrice: suspectCost ? null : finalPrice, suspectCost };
+  });
 
-  // heldExposed: price write skipped (suspect cost); inventory IS still pushed.
-  const heldExposed: string[] = items.filter(isExposed).map(i => i.sku);
-  if (heldExposed.length) {
-    console.log(`⏸️  [listed-sync] Exposure-held (price skipped, suspect cost): ${heldExposed.length} SKUs`);
+  const heldNoCost: string[] = resolved.filter(r => r.finalPrice == null && !r.suspectCost).map(r => r.item.sku);
+  const heldSuspectCost: string[] = resolved.filter(r => r.suspectCost).map(r => r.item.sku);
+  if (heldNoCost.length) {
+    console.log(`⏸️  [listed-sync] Held (cost unknown, cannot compute a safe price): ${heldNoCost.length} SKUs`);
   }
+  if (heldSuspectCost.length) {
+    console.log(`⏸️  [listed-sync] Held (suspect cost — computed price below true CT cost × floor): ${heldSuspectCost.length} SKUs`);
+  }
+  const heldExposed = [...heldNoCost, ...heldSuspectCost];
 
   if (dry) {
     return {
@@ -146,7 +180,7 @@ export async function runListedSyncChunk(opts: {
       nextOffset,
       done,
       zeroedNoActiveMatch,
-      heldExposed,
+      heldExposed:    heldExposed,
       skippedNoCost:  [],
       priceResult:    null,
       inventoryResult: null,
@@ -156,7 +190,9 @@ export async function runListedSyncChunk(opts: {
   }
 
   // ── Push to Walmart ───────────────────────────────────────────────────────
-  const priceItems:     WalmartPriceItem[]     = items.filter(i => !isExposed(i)).map(i => ({ sku: i.sku, price: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize }));
+  const priceItems:     WalmartPriceItem[]     = resolved
+    .filter((r): r is { item: SyncItem; finalPrice: number; suspectCost: boolean } => r.finalPrice != null)
+    .map(r => ({ sku: r.item.sku, price: r.finalPrice, cost: r.item.cost, tireType: r.item.tireType, rimSize: r.item.rimSize }));
   const inventoryItems: WalmartInventoryItem[] = items.map(i => ({ sku: i.sku, quantity: i.walmartQty }));
 
   let totalPriceSuccess     = 0;
@@ -204,7 +240,7 @@ export async function runListedSyncChunk(opts: {
     nextOffset,
     done,
     zeroedNoActiveMatch,
-    heldExposed,
+    heldExposed: heldExposed,
     skippedNoCost,
     priceResult:     { success: totalPriceSuccess,     failed: totalPriceFailed     },
     inventoryResult: { success: totalInventorySuccess, failed: totalInventoryFailed },
