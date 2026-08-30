@@ -1108,3 +1108,64 @@ already fulfilled/delivered independently before any of this testing
 existed — but this system genuinely cannot see CT's side directly, so a
 human-to-human confirmation is worthwhile insurance the `indeterminate`
 ledger state can't provide by itself.
+
+---
+
+## 2026-08-30 — Walmart pricing: three independent writers consolidated to one (PR #83, MERGED)
+
+**Context**: continuation of the same `300E3009` price-gap thread as
+`gci-brain/GCI_WORKFLOW_CONTEXT.md`'s 2026-08-30 entries #2 (`#82`, tireType/
+rimSize wiring) and #3 (this PR). See that doc for the full narrative;
+this entry is the code-focused summary for this repo specifically.
+
+**What #82 fixed**: `safeWalmartPrice()`'s *inputs* — every call site was
+silently omitting real `tireType`/`rimSize`, so the floor calculation
+always fell back to the most conservative (LT, rim 22) freight class,
+inflating the computed floor well above the real price for smaller tires.
+
+**What this PR (#83) fixed, found immediately after #82 merged while
+verifying it against live data**: `safeWalmartPrice()`'s *output* was
+being used inconsistently across three separate places:
+
+- `api/lib/listed-sync.ts` (`runListedSyncChunk`, the only actually-
+  scheduled pricing path — `walmart-sync-cursor` cron, every 2 min) —
+  called `safeWalmartPrice()` only as a binary exposure-hold gate. Its
+  return value was never the price actually pushed; the raw Shopify price
+  was pushed instead, meaning the live cursor had **no mechanism to ever
+  correct price drift** — "not exposed" just meant "push the same stale
+  price again unchanged."
+- `api/walmart-sync.ts` default (no `?mode=`) mode — a full duplicate of
+  the same raw-price+binary-hold logic. Unscheduled, still callable.
+- `api/walmart-price-audit.ts` — used the value correctly, but
+  auto-corrected by default independently of the other two, creating a
+  real risk of the three paths fighting each other over time.
+
+**Fix**: `listed-sync.ts` now pushes `safeWalmartPrice()`'s value directly
+as the real price (holds only when cost is genuinely unknown). The
+duplicate write path in `walmart-sync.ts` was deleted (~200 lines, not
+patched) — unmatched modes now return `410` pointing at the chunked
+`?mode=listed&offset=&limit=` form, which delegates to the same
+`runListedSyncChunk` the cursor uses. `walmart-price-audit.ts` had all
+write capability removed — pure read-only report now, no `dryRun` param
+needed since it can no longer write under any circumstance.
+
+**Net result: exactly one function in this codebase (`runListedSyncChunk`)
+ever decides and writes a Walmart price.** Everything else delegates to it
+or is read-only.
+
+**Verified live post-merge**: Vercel runtime logs for `walmart-sync-cursor`
+checked across a full hour — `0 fail` on every price PUT, every chunk,
+across multiple complete 318-SKU cycles (~13-14 min/cycle). Pipeline
+confirmed healthy: correct price computed, Walmart accepting every write.
+
+**Open item, not yet resolved**: 4 SKUs (`166159006`, `AP21550017WHYPA02`,
+`16092NXK`, `AP25545019YHYPA02`) still read a stale price via `/v3/items`
+despite confirmed-successful writes in the logs. Cost fields and
+Shopify active/`ct-sync` status ruled out as causes for all 4. Leading
+theory: a Walmart-side read/cache quirk specific to these listings, not a
+bug here — unconfirmed. Next step: check these 4 directly in Walmart
+Seller Center's UI; if also stale there, open a Walmart support ticket
+citing the timestamped `200 OK` write logs as evidence.
+
+**Credential note**: same GitHub PAT used across the #82/#83 thread and
+this doc update — rotate it.
