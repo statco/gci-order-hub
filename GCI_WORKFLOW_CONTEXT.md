@@ -5,7 +5,9 @@
 > identically across all 6 repos below so it's available no matter which one you
 > land in first. If you update it, update all 6 copies.
 >
-> **2026-08-30**: Walmart CA bulk retire endpoint shipped (gci-order-hub#80, #81, MERGED) — pivoted from an infeasible reversible-unpublish ask (confirmed no publish/unpublish toggle exists for this Walmart GMP account) to a general retire endpoint; real cleanup executed live (2056 SKUs retired, 0 failures). Also found and fixed the tireType/rimSize wiring gap flagged as "Known gap #2" in the 2026-08-22 entry below — every safeWalmartPrice() caller was silently defaulting to the most conservative (LT, rim 22) fallback, discovered via a real reported price gap on Walmart SKU 300E3009 ($261.99 vs. a real $174.99 Shopify price). Fix verified live at scale: 265 of 318 currently-listed Walmart SKUs (83%) were mispriced by this bug, now corrected — gci-order-hub#82, **not yet merged as of this doc update**. See "Session update — 2026-08-30" at the end of this doc.
+> **2026-08-30 (later same day)**: gci-order-hub#82 (tireType/rimSize wiring fix, below) MERGED. A parallel session then consolidated the three places that could write a Walmart price down to one (gci-order-hub#83, MERGED) — but its "raw price passthrough" premise didn't match the code (verified: the write path has always computed+written the real safeWalmartPrice() value); acting on that wrong premise, it also deleted a *different*, real safety check (the ctCost divergence/cost-corruption guard) which was restored same-PR before merge. Live-verified after deploy: overpriced count dropped 261→0 as intended; 4 SKUs still show stale prices despite the write pipeline logging 0 failures across multiple full cursor cycles — traced to a likely Walmart-side (not code-side) issue, pending a Seller Center check. See "Session update — 2026-08-30 (continued)" at the end of this doc.
+>
+> **2026-08-30**: Walmart CA bulk retire endpoint shipped (gci-order-hub#80, #81, MERGED) — pivoted from an infeasible reversible-unpublish ask (confirmed no publish/unpublish toggle exists for this Walmart GMP account) to a general retire endpoint; real cleanup executed live (2056 SKUs retired, 0 failures). Also found and fixed the tireType/rimSize wiring gap flagged as "Known gap #2" in the 2026-08-22 entry below — every safeWalmartPrice() caller was silently defaulting to the most conservative (LT, rim 22) fallback, discovered via a real reported price gap on Walmart SKU 300E3009 ($261.99 vs. a real $174.99 Shopify price). Fix verified live at scale: 265 of 318 currently-listed Walmart SKUs (83%) were mispriced by this bug, now corrected — gci-order-hub#82, MERGED. See "Session update — 2026-08-30" at the end of this doc.
 >
 > **2026-08-23/24**: gci-brain found a 4th unfixed consumer of the old (pre-Aug-22-fix) pricing formula — `shopifySync.ts` itself — and unified it onto the shared landed-cost formula (gci-brain#147), then repriced the full catalog (1,513/1,970 products updated, net +$27,491). Also: clearance/final-sale detection (39 SKUs), a stale "Canada Tire Inc." distributor mention removed from 1,352 products, and the review-request email flow automated. See "Session update — 2026-08-23" at the end of this doc.
 >
@@ -18,11 +20,13 @@
 > **2026-08-13**: `inventory-reconcile` (gci-brain) fixed a real oversell gap — was reporting national-summed CT stock instead of the max any single CT warehouse holds, since CT can't split-ship. Closes the bug behind a real customer oversell (Ovation Vi-682 155/80R12, SKU 200E2108). First fix (#139) was incomplete — 3 other write paths had the same bug, caught by Codex review and closed in #140. See "Session update — 2026-08-13" at the end of this doc, and the correction added to `gci-order-hub/CT-INTEGRATION-CONTEXT.md` § 5a.
 >
 > Last written: 2026-07-01, last updated: 2026-08-30 end-of-session (see the
-> 2026-08-30 bullet above). The 2026-08-23/24 entry had only reached
-> gci-brain until this session's propagation pass caught the other 3 repos
-> this session has access to (gci-order-hub, gci-price-monitor,
-> gcitires-chatbot) up to date — **gci-command-center and gci-walmart-sync
-> still need this same catch-up**, this session had no access to either.
+> two 2026-08-30 bullets above — the second/later one supersedes nothing in
+> the first, it's a same-day follow-up). The 2026-08-23/24 entry had only
+> reached gci-brain until earlier this same session's propagation pass
+> caught the other 3 repos this session has access to (gci-order-hub,
+> gci-price-monitor, gcitires-chatbot) up to date — **gci-command-center and
+> gci-walmart-sync still need this same catch-up**, this session had no
+> access to either.
 > Status markers:
 > ✅ verified working · 🟡 built but not fully live-verified · ⛔ known broken/blocked ·
 > 🔲 not yet built.
@@ -1510,3 +1514,45 @@ rotate it, alongside the other rotations already queued in this doc.
   gcitires-chatbot** this session (the 4 repos in scope) — **not** yet in
   **gci-command-center** or **gci-walmart-sync**, which this session had no
   access to; propagate there next time either is touched.
+
+---
+
+## Session update — 2026-08-30 (continued): pricing-path consolidation, a parallel session's wrong premise, and a real regression caught before merge
+
+**Context**: a parallel session (also working `gci-order-hub`, same day) picked up the `300E3009`/tireType-rimSize thread above and investigated further, opening `gci-order-hub#83` — MERGED. Bringing this doc up to date on that PR, because reviewing it surfaced both a factual correction worth preserving and a genuine bug that would otherwise have shipped.
+
+### The parallel session's premise didn't match the code
+
+PR #83 was framed as: three independent places compute/write a Walmart price, and `api/lib/listed-sync.ts` (the live 2-minute `walmart-sync-cursor` cron) was one of them — pushing Shopify's **raw** price directly, with `safeWalmartPrice()` used only as a binary hold/skip gate, its actual return value never reaching Walmart.
+
+**Verified against the actual code before accepting this**: `bulkPriceFeed()`/`updatePrice()` in `api/lib/walmart-client.ts` — the shared function both `listed-sync.ts` and `walmart-sync.ts`'s (now-removed) duplicate path call — have **always** computed `safeWalmartPrice()`'s real value internally and written *that*, never the raw candidate price. Checked this byte-identical at the pre-session baseline commit (`fe15d2d`, before any of this session's changes): the "compute the floor, write the floor" architecture predates this session entirely. What was actually missing (the real bug, already fixed above in `gci-order-hub#82`) was `tireType`/`rimSize` on that computation — every caller omitted them, so the floor itself was wrong, not bypassed.
+
+This matters beyond pedantry: acting on the wrong premise is what produced the regression below.
+
+### The real regression: `isExposed()`'s removal deleted a *different* safety check
+
+Believing the raw-price story, PR #83 removed `listed-sync.ts`'s `isExposed()` gate as "now redundant" and replaced its hold condition with "only when cost is genuinely unknown." That gate did much more than gate a raw price: it compared the computed price against `ctCost` (the `canada_tire.cost` metafield) — the actual CT dealer cost, sourced independently from the `unitCost` value the floor formula reads. `ShopifyVariantData.ctCost` is documented in `api/lib/shopify.ts` as existing specifically **"for divergence checks."** `assertAboveCost()` cannot substitute for this — it only compares a computed price against the *same* (possibly-corrupted) `cost` value, so it structurally cannot catch that value itself being wrong. `api/cost-integrity-audit.ts` is the only other place that compares `unitCost` against `ctCost`, and its own header says explicitly: *"Output is a report only. It does NOT write prices and does NOT block reconcile"* — a **daily** Telegram heads-up, not a real-time gate. Confirmed the removal wasn't a deliberate call: `ctCost` was still being fetched onto every `SyncItem` in the diff but never read again anywhere in the file.
+
+Concretely, without this check: if Shopify's stored `unitCost` ever gets corrupted (bad sync, wrong decimal, halved value — exactly what `ctCost` exists to catch), the live cron would compute and push a confidently-wrong price to Walmart every 2 minutes with nothing stopping it, for up to ~24h until the next daily report merely *mentions* it.
+
+**Fixed before merging** (same PR branch, `fix/consolidate-walmart-pricing-paths`): restored the `ctCost`-divergence check as an *additional* hold condition alongside "cost unknown" — hold when the computed price sits below `ctCost × 1.15` (the existing, if `@deprecated`-named, `PRICE_FLOOR_MULTIPLIER`), a different failure mode than the tireType/rimSize gap and not made redundant by fixing that gap. Verified against both a simulated corrupted-cost case (correctly held) and a healthy case (correctly not held), plus the full existing test suite (12 pricing tests + 5 shopify-parser tests, unaffected and still passing). `tsc --noEmit` clean. Merged.
+
+### What PR #83 got right (no issues found)
+
+- `api/walmart-sync.ts`: deleted its ~200-line duplicate full-catalog write path entirely (dead code — never in `vercel.json`'s crons, only manually callable). Returns `410` pointing at the chunked `?mode=listed&offset=&limit=` form that delegates to the same `runListedSyncChunk()` the cron uses. Verified `mode=audit`/`mode=sku-sample` (both genuinely read-only) and the `?dry=true` chunked preview are untouched and still correctly thread `tireType`/`rimSize`.
+- `api/walmart-price-audit.ts`: all write capability (`correctWalmartPrice()`, the `dryRun=false` auto-correct path) removed — it's now pure read-only, which is the right call given `listed-sync.ts` already computes and writes the identical price automatically every 2 minutes. Fixes a real inconsistency with this repo's own convention elsewhere (`walmart-delist.ts`/`walmart-retire.ts` both default `dryRun=true`; this file used to write by default).
+
+**Net result, now actually true**: `runListedSyncChunk()` is the one place in this codebase that decides and writes a Walmart price. Everything else delegates to it or is read-only.
+
+### Live-verified after merge, not just code-reviewed
+
+Ran `GET /api/walmart-price-audit` against production after deploy: `totalOverpriced` dropped from **261 (pre-fix) to 0**, confirming the `tireType`/`rimSize` fix is correcting the live catalog at scale as intended. `totalBelowShopify` stayed at the same 4 SKUs seen throughout this session (`166159006`, `AP21550017WHYPA02`, `AP25545019YHYPA02`, `16092NXK`).
+
+**Investigated those 4 specifically, since "same 4, unchanged for hours" looked like a real gap** — checked Vercel runtime logs for `walmart-sync-cursor` directly (not just re-running the audit): every chunk, every ~14-minute full cycle, across multiple confirmed complete wraps in the checked window, reports **0 failed** price writes — `price 50ok/0fail` repeated identically chunk after chunk, cycle after cycle. Since the 318-SKU catalog is covered exactly once per cycle with no gaps, this means all 4 of these SKUs *are* receiving a successful `200` PUT from Walmart on every single cycle (Walmart's own response: *"Thank you. Your price has been updated. Please allow up to five minutes..."*), yet their displayed price hasn't moved in hours — well past that stated window.
+
+**Conclusion: this is a Walmart-side issue with these 4 specific SKUs (a stuck read-side cache/index, or something particular to these listings), not a bug in this codebase.** The write pipeline is provably healthy — confirmed by direct log inspection, not inferred. Recommended next step (not yet done, needs a human in Walmart Seller Center): check these 4 SKUs directly in Seller Center's own UI — if it also shows the stale price, that's grounds for a support ticket to Walmart, with the logged `200` responses as evidence the writes are landing; if Seller Center shows the correct price, it's a lower-urgency read-API-only quirk.
+
+### Session PRs
+`gci-order-hub#83` "Consolidate three independent Walmart pricing writers into one" (MERGED, includes the restored `ctCost` check as a same-branch follow-up commit).
+
+- This doc was updated in **gci-order-hub, gci-brain, gci-price-monitor, and gcitires-chatbot** this session (the 4 repos in scope) — same gap as the entry above: **gci-command-center** and **gci-walmart-sync** still need this catch-up.
