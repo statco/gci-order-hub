@@ -134,8 +134,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     console.log('[walmart-delist] Fetching Walmart-listed SKUs…');
     const listedSkus = await fetchListedSkus();
 
-    const willRetire: string[] = [];
-    const skippedNotListed: string[] = [];
+    // candidateSkus is the STABLE universe to page through — built once per
+    // request from data that doesn't shrink as SKUs get retired (either the
+    // caller's own explicit list, or a keep-diff snapshot). Offset/limit
+    // slice THIS array, not a "still listed" filtered one — otherwise, as
+    // earlier chunks get retired between separate paged calls, a
+    // recomputed "still listed" list shrinks and reindexes, so offset=N no
+    // longer means the same items call to call and later chunks silently
+    // skip ahead over unprocessed SKUs (confirmed live: this caused a real
+    // run to report done:true with ~850 SKUs never actually retired).
+    // "Still listed" is only checked per-SKU within the already-sliced
+    // chunk, purely to decide skip-vs-retire for that item.
+    let candidateSkus: string[];
     let totalInputSkus: number;
     let keepSkusCount: number | undefined;
 
@@ -155,7 +165,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       keepSkusCount  = keepBareSet.size;
       totalInputSkus = keepSkusCount;
-      willRetire.push(...[...listedSkus].filter(sku => !keepSet.has(sku)));
+      candidateSkus  = [...listedSkus].filter(sku => !keepSet.has(sku));
     } else {
       let inputSkus: string[];
       if (hasTag) {
@@ -171,47 +181,47 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(400).json({ error: 'No SKUs resolved (empty skus array or tag matched nothing)' });
       }
       totalInputSkus = inputSkus.length;
-
-      // Confirm each SKU is actually listed on Walmart before retiring it
-      // (bare or TIRE- form — same twin-matching convention as walmart-zero.ts)
-      for (const sku of new Set(inputSkus)) {
-        const bare = sku.startsWith('TIRE-') ? sku.slice(5) : sku;
-        if (listedSkus.has(bare)) willRetire.push(bare);
-        else if (listedSkus.has(`TIRE-${bare}`)) willRetire.push(`TIRE-${bare}`);
-        else skippedNotListed.push(sku);
-      }
+      candidateSkus  = [...new Set(inputSkus)];
     }
 
-    // ── Pagination ──────────────────────────────────────────────────
+    // ── Pagination (slices the STABLE candidateSkus, per the note above) ──
     const dryRun = (req.query.dryRun as string | undefined ?? 'true') !== 'false';
 
-    const totalWillRetire = willRetire.length;
+    const totalCandidates = candidateSkus.length;
     const rawOffset = parseInt(String(req.query.offset ?? '0'), 10);
     const offset    = Number.isNaN(rawOffset) ? 0 : Math.max(0, rawOffset);
 
-    // Real writes always cap at CHUNK_SIZE per call (rate-limit safety).
-    // A dry run with no explicit limit returns the FULL computed list
-    // uncapped — useful for keepSkus mode, where willRetire is recomputed
-    // from live "currently listed" data on every call. Paging a live write
-    // with increasing offset across several separate calls would be unsafe
-    // there (retirement propagation lags, so the underlying set can shift
-    // between calls, skipping or re-targeting SKUs). Snapshot the full list
-    // once via an uncapped dry run, then pass that exact list back as an
-    // explicit { skus: [...] } for the real paged run — immune to drift
-    // since it's now a fixed list, not recomputed each call.
+    // Real writes always cap at CHUNK_SIZE per call (rate-limit + Vercel
+    // maxDuration safety — a chunk of 300 was tried live and timed out
+    // mid-response). A dry run with no explicit limit returns the FULL
+    // candidate list uncapped, e.g. to snapshot a keepSkus-mode result as an
+    // explicit { skus: [...] } for a later real run.
     const rawLimitParam = req.query.limit;
     const rawLimit       = rawLimitParam != null ? parseInt(String(rawLimitParam), 10) : NaN;
     const limit = !dryRun
       ? (Number.isNaN(rawLimit) ? CHUNK_SIZE : Math.max(1, Math.min(CHUNK_SIZE, rawLimit)))
-      : (Number.isNaN(rawLimit) ? Math.max(totalWillRetire, 1) : Math.max(1, rawLimit));
+      : (Number.isNaN(rawLimit) ? Math.max(totalCandidates, 1) : Math.max(1, rawLimit));
 
-    const chunk      = willRetire.slice(offset, offset + limit);
-    const nextOffset = offset + limit < totalWillRetire ? offset + limit : null;
-    const done       = nextOffset === null;
+    const candidateChunk = candidateSkus.slice(offset, offset + limit);
+    const nextOffset     = offset + limit < totalCandidates ? offset + limit : null;
+    const done           = nextOffset === null;
+
+    // Now, and only now, check "still listed" — for the already-fixed
+    // chunk only, to resolve each SKU's real bare/TIRE- listed form and
+    // decide skip-vs-retire. This never affects what's "in range" for
+    // pagination purposes.
+    const chunk: string[] = [];
+    const skippedNotListed: string[] = [];
+    for (const sku of candidateChunk) {
+      const bare = sku.startsWith('TIRE-') ? sku.slice(5) : sku;
+      if (listedSkus.has(bare)) chunk.push(bare);
+      else if (listedSkus.has(`TIRE-${bare}`)) chunk.push(`TIRE-${bare}`);
+      else skippedNotListed.push(sku);
+    }
 
     console.log(
       `[walmart-delist] dryRun=${dryRun} totalInput=${totalInputSkus} currentlyListed=${listedSkus.size} ` +
-      `willRetire=${totalWillRetire} skippedNotListed=${skippedNotListed.length} ` +
+      `totalCandidates=${totalCandidates} skippedNotListed=${skippedNotListed.length} ` +
       `chunk=${chunk.length} offset=${offset} limit=${limit}`,
     );
 
@@ -222,7 +232,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         totalInputSkus,
         ...(keepSkusCount !== undefined ? { keepSkusCount } : {}),
         currentlyListedCount: listedSkus.size,
-        willRetireCount: totalWillRetire,
+        willRetireCount: totalCandidates,
         willRetire: chunk,
         skippedNotListed,
         offset, limit, nextOffset, done,
@@ -236,7 +246,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         totalInputSkus,
         ...(keepSkusCount !== undefined ? { keepSkusCount } : {}),
         currentlyListedCount: listedSkus.size,
-        willRetireCount: totalWillRetire,
+        willRetireCount: totalCandidates,
         skippedNotListed,
         offset, limit, nextOffset, done,
         retired: [],
@@ -291,7 +301,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       totalInputSkus,
       ...(keepSkusCount !== undefined ? { keepSkusCount } : {}),
       currentlyListedCount: listedSkus.size,
-      willRetireCount: totalWillRetire,
+      willRetireCount: totalCandidates,
       skippedNotListed,
       offset, limit, nextOffset, done,
       acceptedCount:           accepted.length,
