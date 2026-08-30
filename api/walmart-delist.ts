@@ -23,10 +23,25 @@
 // (non-existent) reversible toggle. Retire is near-permanent — there is no
 // "republish"; a retired item must be re-created via the item feed.
 //
-//   POST /api/walmart-delist?dryRun=false[&offset=N&limit=300]
-//     Body: { skus: string[] }  OR  { tag: string }  (exactly one)
+//   POST /api/walmart-delist?dryRun=false[&offset=N&limit=100]
+//     Body: exactly one of:
+//       { skus: string[] }     — retire these specific SKUs
+//       { tag: string }        — retire everything under this Shopify tag
+//       { keepSkus: string[] } — retire everything CURRENTLY LISTED except
+//                                these (inverted selection, for "here's my
+//                                keep-list, retire the rest" cleanups)
 //     Auth: Bearer token matching WALMART_UNPUBLISH_SECRET.
 //     dryRun defaults to TRUE — must pass dryRun=false explicitly to write.
+//     Real writes page via offset/limit (100/call, repeat with increasing
+//     offset until done:true — same convention as walmart-retire.ts; a
+//     chunk of 300 was tried and timed out mid-response against Vercel's
+//     300s maxDuration). For
+//     keepSkus mode specifically: don't page a real (dryRun=false) run
+//     directly, since willRetire is recomputed from live data every call and
+//     retirement propagation lag can shift the underlying set between calls.
+//     Instead run a dry run with no &limit first (returns the FULL list,
+//     uncapped) to snapshot it, then feed that exact list back as an
+//     explicit { skus: [...] } for the real paged run.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -39,7 +54,12 @@ import {
 export const config = { maxDuration: 300 };
 
 const SECRET     = process.env.WALMART_UNPUBLISH_SECRET ?? '';
-const CHUNK_SIZE = 300; // matches the repo-wide convention (walmart-retire.ts)
+// 100, not 300: walmart-retire.ts's own chunk size for this exact
+// retire-then-verify-lifecycle pattern, precisely because a chunk of 300
+// (retireItem + a per-SKU lifecycle re-check afterward) doesn't reliably
+// finish inside Vercel's 300s maxDuration — confirmed live: a real
+// dryRun=false call at 300 timed out mid-response.
+const CHUNK_SIZE = 100;
 
 function delay(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -98,60 +118,110 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // ── Parse body: exactly one of skus / tag ───────────────────────
-    const body = req.body as { skus?: unknown; tag?: unknown } | undefined;
-    const hasSkus = Array.isArray(body?.skus) && (body!.skus as unknown[]).length > 0;
-    const hasTag  = typeof body?.tag === 'string' && body!.tag.trim().length > 0;
+    // ── Parse body: exactly one of skus / tag / keepSkus ────────────
+    // keepSkus inverts the selection: "retire everything currently listed
+    // EXCEPT these" — for bulk catalogue cleanups driven by a keep-list
+    // rather than an explicit retire-list.
+    const body = req.body as { skus?: unknown; tag?: unknown; keepSkus?: unknown } | undefined;
+    const hasSkus     = Array.isArray(body?.skus) && (body!.skus as unknown[]).length > 0;
+    const hasTag      = typeof body?.tag === 'string' && body!.tag.trim().length > 0;
+    const hasKeepSkus = Array.isArray(body?.keepSkus) && (body!.keepSkus as unknown[]).length > 0;
 
-    if (hasSkus === hasTag) {
-      return res.status(400).json({ error: 'Body must contain exactly one of { skus: string[] } or { tag: string }' });
+    if ([hasSkus, hasTag, hasKeepSkus].filter(Boolean).length !== 1) {
+      return res.status(400).json({ error: 'Body must contain exactly one of { skus: string[] }, { tag: string }, or { keepSkus: string[] }' });
     }
 
-    let inputSkus: string[];
-    if (hasTag) {
-      const tag = (body!.tag as string).trim();
-      console.log(`[walmart-delist] Resolving SKUs from Shopify tag "${tag}"…`);
-      inputSkus = await fetchSkusByShopifyTag(tag);
-      console.log(`[walmart-delist] Tag "${tag}" resolved to ${inputSkus.length} SKUs`);
-    } else {
-      inputSkus = (body!.skus as unknown[]).map(s => String(s).toUpperCase().trim());
-    }
-
-    if (inputSkus.length === 0) {
-      return res.status(400).json({ error: 'No SKUs resolved (empty skus array or tag matched nothing)' });
-    }
-
-    // ── Confirm each SKU is actually listed on Walmart before retiring it ──
-    // (bare or TIRE- form — same twin-matching convention as walmart-zero.ts)
-    console.log('[walmart-delist] Fetching Walmart-listed SKUs to validate input…');
+    console.log('[walmart-delist] Fetching Walmart-listed SKUs…');
     const listedSkus = await fetchListedSkus();
 
-    const willRetire: string[] = [];
-    const skippedNotListed: string[] = [];
+    // candidateSkus is the STABLE universe to page through — built once per
+    // request from data that doesn't shrink as SKUs get retired (either the
+    // caller's own explicit list, or a keep-diff snapshot). Offset/limit
+    // slice THIS array, not a "still listed" filtered one — otherwise, as
+    // earlier chunks get retired between separate paged calls, a
+    // recomputed "still listed" list shrinks and reindexes, so offset=N no
+    // longer means the same items call to call and later chunks silently
+    // skip ahead over unprocessed SKUs (confirmed live: this caused a real
+    // run to report done:true with ~850 SKUs never actually retired).
+    // "Still listed" is only checked per-SKU within the already-sliced
+    // chunk, purely to decide skip-vs-retire for that item.
+    let candidateSkus: string[];
+    let totalInputSkus: number;
+    let keepSkusCount: number | undefined;
 
-    for (const sku of new Set(inputSkus)) {
+    if (hasKeepSkus) {
+      // Normalise each keep entry to both bare and TIRE- forms so a keep
+      // entry protects whichever form the item actually happens to be
+      // listed under on Walmart.
+      const keepBareSet = new Set<string>();
+      const keepSet     = new Set<string>();
+      for (const raw of body!.keepSkus as unknown[]) {
+        const sku = String(raw).toUpperCase().trim();
+        if (!sku) continue;
+        const bare = sku.startsWith('TIRE-') ? sku.slice(5) : sku;
+        keepBareSet.add(bare);
+        keepSet.add(bare);
+        keepSet.add(`TIRE-${bare}`);
+      }
+      keepSkusCount  = keepBareSet.size;
+      totalInputSkus = keepSkusCount;
+      candidateSkus  = [...listedSkus].filter(sku => !keepSet.has(sku));
+    } else {
+      let inputSkus: string[];
+      if (hasTag) {
+        const tag = (body!.tag as string).trim();
+        console.log(`[walmart-delist] Resolving SKUs from Shopify tag "${tag}"…`);
+        inputSkus = await fetchSkusByShopifyTag(tag);
+        console.log(`[walmart-delist] Tag "${tag}" resolved to ${inputSkus.length} SKUs`);
+      } else {
+        inputSkus = (body!.skus as unknown[]).map(s => String(s).toUpperCase().trim());
+      }
+
+      if (inputSkus.length === 0) {
+        return res.status(400).json({ error: 'No SKUs resolved (empty skus array or tag matched nothing)' });
+      }
+      totalInputSkus = inputSkus.length;
+      candidateSkus  = [...new Set(inputSkus)];
+    }
+
+    // ── Pagination (slices the STABLE candidateSkus, per the note above) ──
+    const dryRun = (req.query.dryRun as string | undefined ?? 'true') !== 'false';
+
+    const totalCandidates = candidateSkus.length;
+    const rawOffset = parseInt(String(req.query.offset ?? '0'), 10);
+    const offset    = Number.isNaN(rawOffset) ? 0 : Math.max(0, rawOffset);
+
+    // Real writes always cap at CHUNK_SIZE per call (rate-limit + Vercel
+    // maxDuration safety — a chunk of 300 was tried live and timed out
+    // mid-response). A dry run with no explicit limit returns the FULL
+    // candidate list uncapped, e.g. to snapshot a keepSkus-mode result as an
+    // explicit { skus: [...] } for a later real run.
+    const rawLimitParam = req.query.limit;
+    const rawLimit       = rawLimitParam != null ? parseInt(String(rawLimitParam), 10) : NaN;
+    const limit = !dryRun
+      ? (Number.isNaN(rawLimit) ? CHUNK_SIZE : Math.max(1, Math.min(CHUNK_SIZE, rawLimit)))
+      : (Number.isNaN(rawLimit) ? Math.max(totalCandidates, 1) : Math.max(1, rawLimit));
+
+    const candidateChunk = candidateSkus.slice(offset, offset + limit);
+    const nextOffset     = offset + limit < totalCandidates ? offset + limit : null;
+    const done           = nextOffset === null;
+
+    // Now, and only now, check "still listed" — for the already-fixed
+    // chunk only, to resolve each SKU's real bare/TIRE- listed form and
+    // decide skip-vs-retire. This never affects what's "in range" for
+    // pagination purposes.
+    const chunk: string[] = [];
+    const skippedNotListed: string[] = [];
+    for (const sku of candidateChunk) {
       const bare = sku.startsWith('TIRE-') ? sku.slice(5) : sku;
-      if (listedSkus.has(bare)) willRetire.push(bare);
-      else if (listedSkus.has(`TIRE-${bare}`)) willRetire.push(`TIRE-${bare}`);
+      if (listedSkus.has(bare)) chunk.push(bare);
+      else if (listedSkus.has(`TIRE-${bare}`)) chunk.push(`TIRE-${bare}`);
       else skippedNotListed.push(sku);
     }
 
-    // ── Pagination ──────────────────────────────────────────────────
-    const rawOffset = parseInt(String(req.query.offset ?? '0'), 10);
-    const offset    = Number.isNaN(rawOffset) ? 0 : Math.max(0, rawOffset);
-    const rawLimit  = parseInt(String(req.query.limit ?? String(CHUNK_SIZE)), 10);
-    const limit     = Number.isNaN(rawLimit) ? CHUNK_SIZE : Math.max(1, Math.min(CHUNK_SIZE, rawLimit));
-
-    const totalWillRetire = willRetire.length;
-    const chunk           = willRetire.slice(offset, offset + limit);
-    const nextOffset      = offset + limit < totalWillRetire ? offset + limit : null;
-    const done            = nextOffset === null;
-
-    const dryRun = (req.query.dryRun as string | undefined ?? 'true') !== 'false';
-
     console.log(
-      `[walmart-delist] dryRun=${dryRun} totalInput=${inputSkus.length} ` +
-      `willRetire=${totalWillRetire} skippedNotListed=${skippedNotListed.length} ` +
+      `[walmart-delist] dryRun=${dryRun} totalInput=${totalInputSkus} currentlyListed=${listedSkus.size} ` +
+      `totalCandidates=${totalCandidates} skippedNotListed=${skippedNotListed.length} ` +
       `chunk=${chunk.length} offset=${offset} limit=${limit}`,
     );
 
@@ -159,8 +229,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({
         ok: true,
         dryRun: true,
-        totalInputSkus: inputSkus.length,
-        willRetireCount: totalWillRetire,
+        totalInputSkus,
+        ...(keepSkusCount !== undefined ? { keepSkusCount } : {}),
+        currentlyListedCount: listedSkus.size,
+        willRetireCount: totalCandidates,
         willRetire: chunk,
         skippedNotListed,
         offset, limit, nextOffset, done,
@@ -171,8 +243,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({
         ok: true,
         dryRun: false,
-        totalInputSkus: inputSkus.length,
-        willRetireCount: totalWillRetire,
+        totalInputSkus,
+        ...(keepSkusCount !== undefined ? { keepSkusCount } : {}),
+        currentlyListedCount: listedSkus.size,
+        willRetireCount: totalCandidates,
         skippedNotListed,
         offset, limit, nextOffset, done,
         retired: [],
@@ -224,8 +298,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).json({
       ok: failed.length === 0,
       dryRun: false,
-      totalInputSkus: inputSkus.length,
-      willRetireCount: totalWillRetire,
+      totalInputSkus,
+      ...(keepSkusCount !== undefined ? { keepSkusCount } : {}),
+      currentlyListedCount: listedSkus.size,
+      willRetireCount: totalCandidates,
       skippedNotListed,
       offset, limit, nextOffset, done,
       acceptedCount:           accepted.length,
