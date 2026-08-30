@@ -9,6 +9,8 @@
 // `cost` lives on InventoryItem.unitCost.amount in GraphQL.
 // ─────────────────────────────────────────────────────────────
 
+import type { TireType } from './pricing/landedCost';
+
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE_DOMAIN ?? '';
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN ?? '';
 const API_VERSION   = '2024-01';
@@ -19,6 +21,57 @@ export interface ShopifyVariantData {
   cost: number | null;              // InventoryItem.unitCost.amount — what the floor reads
   ctCost: number | null;            // canada_tire.cost metafield — raw CT dealer cost (for divergence checks)
   inventoryQuantity: number | null;
+  tireType: TireType | null;        // parsed from product tags — real class for the freight floor
+  rimSize: number | null;           // parsed from variant title (tags are inconsistently formatted)
+}
+
+/**
+ * Parses a product's real tire class + rim size, so safeWalmartPrice() can
+ * use the actual freight class instead of silently falling back to its most
+ * conservative default (LT, rim 22) — the gap that caused SKU 300E3009
+ * (Ovation W-686, Passenger 185/65R15) to sit at a $261.99 Walmart floor
+ * when the correct floor is ~$176, nowhere near the true $174.99 Shopify
+ * price.
+ *
+ * Tag conventions for tire class are NOT consistent across import batches —
+ * seen in the wild: "vehicle_type:Passenger" / "vehicle_type:Light Truck"
+ * (Cooper/Nexen-style imports) AND "tire-type-passenger" (Ovation/Vredestein-
+ * style imports, including 300E3009 itself). Matched by substring, not exact
+ * equality, so both (and "light-truck"/"passenger" bare tags) resolve.
+ *
+ * Size tags are even less reliable — some batches emit a malformed
+ * "1856515/R" instead of "185/65R15". The variant TITLE is consistently
+ * formatted as "185/65R15" across every batch observed, so rim size is
+ * parsed from there, not from tags.
+ */
+export function parseTireSpecFromTags(
+  tags: string[],
+  variantTitle?: string | null,
+): { tireType: TireType | null; rimSize: number | null } {
+  let tireType: TireType | null = null;
+
+  for (const tag of tags) {
+    const lower = tag.toLowerCase();
+    if (lower.includes('light truck') || lower.includes('light-truck') || lower.includes('tire-type-lt')) {
+      tireType = 'LT';
+      break; // LT is the more specific/conservative signal — don't let a stray "passenger" tag override it
+    }
+    if (lower.includes('passenger')) tireType = 'Passenger';
+  }
+
+  let rimSize: number | null = null;
+  const sizeMatch = (variantTitle ?? '').match(/(\d{3})\/(\d{2})R(\d{2})/i);
+  if (sizeMatch) {
+    rimSize = parseInt(sizeMatch[3], 10);
+  } else {
+    // Fall back to tags only if the title didn't carry a parseable size.
+    for (const tag of tags) {
+      const m = tag.match(/(\d{3})\/(\d{2})R(\d{2})/i);
+      if (m) { rimSize = parseInt(m[3], 10); break; }
+    }
+  }
+
+  return { tireType, rimSize };
 }
 
 export interface ShopifyOrderLookup {
@@ -151,10 +204,12 @@ export async function fetchAllShopifyVariants(): Promise<Map<string, ShopifyVari
         edges {
           node {
             sku
+            title
             price
             inventoryQuantity
             inventoryItem { unitCost { amount } }
             product {
+              tags
               ctCost: metafield(namespace: "canada_tire", key: "cost") { value }
             }
           }
@@ -193,12 +248,15 @@ export async function fetchAllShopifyVariants(): Promise<Map<string, ShopifyVari
 
       const rawCost = node.inventoryItem?.unitCost?.amount;
       const rawCt   = node.product?.ctCost?.value;
+      const { tireType, rimSize } = parseTireSpecFromTags((node.product?.tags ?? []) as string[], node.title);
       map.set(sku, {
         sku,
         price: node.price != null ? parseFloat(node.price) : null,
         cost: rawCost != null ? parseFloat(rawCost) : null,
         ctCost: rawCt != null ? parseFloat(rawCt) : null,
         inventoryQuantity: node.inventoryQuantity != null ? Number(node.inventoryQuantity) : null,
+        tireType,
+        rimSize,
       });
     }
 
@@ -239,11 +297,13 @@ export async function fetchActiveCtSyncVariants(): Promise<Map<string, ShopifyVa
         edges {
           node {
             id
+            tags
             variants(first: 100) {
               pageInfo { hasNextPage }
               edges {
                 node {
                   sku
+                  title
                   price
                   inventoryQuantity
                   inventoryItem { unitCost { amount } }
@@ -283,6 +343,7 @@ export async function fetchActiveCtSyncVariants(): Promise<Map<string, ShopifyVa
     for (const productEdge of products.edges) {
       const product = productEdge.node;
       const rawCt   = product.ctCost?.value;
+      const tags    = (product.tags ?? []) as string[];
 
       // Tire listings are one-variant-per-product; guard in case that changes.
       if (product.variants.pageInfo.hasNextPage) {
@@ -298,12 +359,15 @@ export async function fetchActiveCtSyncVariants(): Promise<Map<string, ShopifyVa
         const sku = rawSku.startsWith('TIRE-') ? rawSku.slice(5) : rawSku;
 
         const rawCost = node.inventoryItem?.unitCost?.amount;
+        const { tireType, rimSize } = parseTireSpecFromTags(tags, node.title);
         map.set(sku, {
           sku,
           price:             node.price != null ? parseFloat(node.price) : null,
           cost:              rawCost != null ? parseFloat(rawCost) : null,
           ctCost:            rawCt   != null ? parseFloat(rawCt)   : null,
           inventoryQuantity: node.inventoryQuantity != null ? Number(node.inventoryQuantity) : null,
+          tireType,
+          rimSize,
         });
       }
     }

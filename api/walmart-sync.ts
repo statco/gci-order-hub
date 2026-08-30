@@ -41,6 +41,7 @@ import {
 import { fetchAllShopifyVariants } from './lib/shopify';
 import { safeWalmartPrice, PRICE_FLOOR_MULTIPLIER } from './lib/pricing';
 import { runListedSyncChunk } from './lib/listed-sync';
+import type { TireType } from './lib/pricing/landedCost';
 
 export const config = { maxDuration: 300 };
 
@@ -77,6 +78,8 @@ interface SyncItem {
   ctCost:       number | null;   // canada_tire.cost metafield — for the exposure hold
   shopifyQty:   number;
   walmartQty:   number;
+  tireType:     TireType | null; // attached from the GraphQL variant map (real freight class)
+  rimSize:      number | null;   // attached from the GraphQL variant map (real rim size)
 }
 
 async function fetchTireVariants(): Promise<SyncItem[]> {
@@ -100,6 +103,8 @@ async function fetchTireVariants(): Promise<SyncItem[]> {
           ctCost:     null as number | null,  // enriched post-fetch (canada_tire.cost)
           shopifyQty,
           walmartQty: shopifyQty, // send real qty; 0 only when Shopify is 0
+          tireType:   null as TireType | null, // enriched post-fetch from the GraphQL variant map
+          rimSize:    null as number | null,   // enriched post-fetch from the GraphQL variant map
         };
 
         // Push bare SKU + TIRE- prefixed version so the listed filter matches
@@ -175,7 +180,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           sku:        i.sku,
           price:      i.price,
           cost:       i.cost,
-          safePrice:  safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost }),
+          safePrice:  safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize }),
           shopifyQty: i.shopifyQty,
           walmartQty: i.walmartQty,
         })),
@@ -303,6 +308,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const v = variantMap.get(i.sku) ?? variantMap.get(i.sku.replace(/^TIRE-/, ''));
       i.cost = v?.cost ?? null;
       i.ctCost = v?.ctCost ?? null;
+      i.tireType = v?.tireType ?? null;
+      i.rimSize = v?.rimSize ?? null;
     }
     const withCost = items.filter(i => i.cost != null).length;
     console.log(`💲 Cost enrichment: ${withCost}/${items.length} variants have a cost`);
@@ -344,7 +351,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // holdExposed; auto-releases once the stored Shopify cost is corrected.
   const isExposed = (i: SyncItem): boolean => {
     if (i.ctCost == null || i.ctCost <= 0) return false;
-    const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost });
+    const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize });
     return safe != null && safe < i.ctCost * PRICE_FLOOR_MULTIPLIER;
   };
   // heldExposed: stored Shopify price is below true CT cost × floor (suspect cost); price write
@@ -355,7 +362,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     console.log(`⏸️  Exposure-held (price skipped, suspect cost): ${heldExposed.length} SKUs`);
   }
 
-  const priceItems:     WalmartPriceItem[]     = items.filter(i => !isExposed(i)).map(i => ({ sku: i.sku, price: i.price, cost: i.cost }));
+  const priceItems:     WalmartPriceItem[]     = items.filter(i => !isExposed(i)).map(i => ({ sku: i.sku, price: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize }));
   const inventoryItems: WalmartInventoryItem[] = items.map(i => ({ sku: i.sku, quantity: i.walmartQty }));
 
   let totalPriceSuccess     = 0;

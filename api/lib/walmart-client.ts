@@ -15,6 +15,7 @@
 // ─────────────────────────────────────────────────────────────
 
 import { safeWalmartPrice, assertAboveCost } from './pricing.js';
+import type { TireType } from './pricing/landedCost.js';
 
 const WALMART_BASE = (
   process.env.WALMART_BASE_URL ?? 'https://marketplace.walmartapis.com'
@@ -146,6 +147,11 @@ export interface WalmartPriceItem {
   sku:   string;
   price: number;          // CAD — candidate Shopify price (pre-floor)
   cost?: number | null;   // unit cost; required for the floor to apply. Missing → SKIP.
+  // Real tire class + rim size, when known — passed through to safeWalmartPrice()
+  // so the freight component of the floor isn't padded to the worst-case
+  // default (LT, rim 22) for every SKU. Omit only when genuinely unknown.
+  tireType?: TireType | null;
+  rimSize?:  number | null;
 }
 
 export interface WalmartInventoryItem {
@@ -171,7 +177,12 @@ export interface BulkFeedResult {
  * @returns true if the price was written, false if it was skipped.
  */
 export async function updatePrice(item: WalmartPriceItem): Promise<boolean> {
-  const safe = safeWalmartPrice({ shopifyPrice: item.price, cost: item.cost ?? null });
+  const safe = safeWalmartPrice({
+    shopifyPrice: item.price,
+    cost: item.cost ?? null,
+    tireType: item.tireType ?? undefined,
+    rimSize: item.rimSize ?? undefined,
+  });
   if (safe == null) {
     console.warn(`[price] SKIP ${item.sku}: no valid cost — cannot guarantee safe price`);
     return false;
@@ -222,7 +233,12 @@ export async function bulkPriceFeed(
 
   for (const i of items) {
     // LAYER 1: the floor is the only way a price is computed.
-    const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost ?? null });
+    const safe = safeWalmartPrice({
+      shopifyPrice: i.price,
+      cost: i.cost ?? null,
+      tireType: i.tireType ?? undefined,
+      rimSize: i.rimSize ?? undefined,
+    });
     if (safe == null) {
       skippedNoCost.push(i.sku);
       continue;

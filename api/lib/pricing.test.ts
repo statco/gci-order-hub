@@ -74,6 +74,24 @@ check('missing tireType/rimSize falls back to the conservative default, never sk
   assert.ok(p > 100, `expected fallback floor to exceed raw cost, got ${p}`);
 });
 
+// Regression anchor: SKU 300E3009 (Ovation W-686 Ecovision 185/65R15,
+// Passenger/rim 15, cost $72.54). Every safeWalmartPrice() caller in the repo
+// omitted tireType/rimSize, so this SKU silently got the LT/rim-22 fallback
+// freight class ($103 typical-zone) instead of its real Passenger/15 class
+// ($43) — inflating its floor to $261.99 versus a real Shopify price of
+// $174.99, an $87 gap Walmart's own pricing algorithm read as "listed too
+// high" (the same failure mode that produced the account's "Unpublished —
+// due to its high price" listings). With the real tireType/rimSize now
+// threaded through, the floor must land close to the real Shopify price,
+// not the wildly-padded LT/22 figure.
+check('SKU 300E3009 no longer inflated to the LT/rim-22 fallback floor', () => {
+  const wrongFallback = safeWalmartPrice({ shopifyPrice: 174.99, cost: 72.54 })!;
+  assert.strictEqual(wrongFallback, 261.99, `sanity check on the bug itself: expected the old $261.99, got ${wrongFallback}`);
+
+  const fixed = safeWalmartPrice({ shopifyPrice: 174.99, cost: 72.54, tireType: 'Passenger', rimSize: 15 })!;
+  assert.ok(fixed < 180, `expected a floor near the real $174.99 Shopify price, got ${fixed}`);
+});
+
 // Assertion backstop throws on a deliberate below-cost amount.
 check('assertAboveCost throws on below-cost amount', () => {
   assert.throws(() => assertAboveCost('TIRE-X', 285, 330), /BLOCKED/);

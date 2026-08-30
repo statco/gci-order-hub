@@ -5,6 +5,10 @@
 > identically across all 6 repos below so it's available no matter which one you
 > land in first. If you update it, update all 6 copies.
 >
+> **2026-08-30**: Walmart CA bulk retire endpoint shipped (gci-order-hub#80, #81, MERGED) — pivoted from an infeasible reversible-unpublish ask (confirmed no publish/unpublish toggle exists for this Walmart GMP account) to a general retire endpoint; real cleanup executed live (2056 SKUs retired, 0 failures). Also found and fixed the tireType/rimSize wiring gap flagged as "Known gap #2" in the 2026-08-22 entry below — every safeWalmartPrice() caller was silently defaulting to the most conservative (LT, rim 22) fallback, discovered via a real reported price gap on Walmart SKU 300E3009 ($261.99 vs. a real $174.99 Shopify price). Fix verified live at scale: 265 of 318 currently-listed Walmart SKUs (83%) were mispriced by this bug, now corrected — gci-order-hub#82, **not yet merged as of this doc update**. See "Session update — 2026-08-30" at the end of this doc.
+>
+> **2026-08-23/24**: gci-brain found a 4th unfixed consumer of the old (pre-Aug-22-fix) pricing formula — `shopifySync.ts` itself — and unified it onto the shared landed-cost formula (gci-brain#147), then repriced the full catalog (1,513/1,970 products updated, net +$27,491). Also: clearance/final-sale detection (39 SKUs), a stale "Canada Tire Inc." distributor mention removed from 1,352 products, and the review-request email flow automated. See "Session update — 2026-08-23" at the end of this doc.
+>
 > **2026-08-22**: Landed-cost price floor fix, shipped as PRs to all 3 pricing-relevant repos and MERGED — gci-order-hub#74, gci-walmart-sync#26, gci-brain#146. Replaces three DIFFERENT, all-wrong price floor formulas (flat cost×1.15, flat cost×1.05, flat shippingBuffer+12% tax) with one shared, correct landed-cost formula using CT's real published freight rate table and GCI's confirmed tax-registration status (GST/HST registered, PST/QST not). Confirmed root cause of ≥4 historical below-cost orders. See "Session update — 2026-08-22" at the end of this doc — **this is the first session-update entry propagated to all 6 repos at once**, closing the propagation gap called out in every entry below.
 >
 > **2026-08-08**: gcitires-chatbot chat-timeout fix + first-ever monitoring build-out — see "Session update — 2026-08-08" at the end of this doc.
@@ -13,11 +17,12 @@
 >
 > **2026-08-13**: `inventory-reconcile` (gci-brain) fixed a real oversell gap — was reporting national-summed CT stock instead of the max any single CT warehouse holds, since CT can't split-ship. Closes the bug behind a real customer oversell (Ovation Vi-682 155/80R12, SKU 200E2108). First fix (#139) was incomplete — 3 other write paths had the same bug, caught by Codex review and closed in #140. See "Session update — 2026-08-13" at the end of this doc, and the correction added to `gci-order-hub/CT-INTEGRATION-CONTEXT.md` § 5a.
 >
-> Last written: 2026-07-01, last updated: 2026-08-22 end-of-session (see
-> the 2026-08-22 bullet above — first fully-propagated update since
-> 2026-07-29; the 2026-08-08, 2026-08-11, and 2026-08-13 entries below had
-> each only reached the repo(s) noted in their own bullet until now, but
-> ARE now present in all 6 copies as of this session's propagation pass).
+> Last written: 2026-07-01, last updated: 2026-08-30 end-of-session (see the
+> 2026-08-30 bullet above). The 2026-08-23/24 entry had only reached
+> gci-brain until this session's propagation pass caught the other 3 repos
+> this session has access to (gci-order-hub, gci-price-monitor,
+> gcitires-chatbot) up to date — **gci-command-center and gci-walmart-sync
+> still need this same catch-up**, this session had no access to either.
 > Status markers:
 > ✅ verified working · 🟡 built but not fully live-verified · ⛔ known broken/blocked ·
 > 🔲 not yet built.
@@ -1020,3 +1025,488 @@ GitHub PAT scoped to the `statco` org was shared directly in chat this session,
 used to clone all 6 repos, push the 3 fix branches, open/verify all 3 PRs via the
 GitHub API, and (after merge) push this doc-sync commit. **Rotate it** — flagged
 to Pat at both the start and end of the session.
+
+## Session update — 2026-08-23
+
+### 1. CTSync handle-collision/duplicate investigation → 4 new products created
+
+Started from a review of `shopifySync.ts`'s handle-collision defense (catch-and-retry
+on Shopify's "handle already taken" error, timestamp-suffix retry) and duplicate
+prevention (title-normalization guard checks all statuses, not just active — a
+deliberate earlier fix). Found a real gap: the guard only catches *exact* title
+matches, so "Cooper Endeavor 225/50R17" vs. "...225/50R17 All-Season Tire" sail past
+it as separate products — confirmed live on 19 SKU-duplicate pairs (`duplicateSkuAudit.ts`
+scan), all already archived on the higher-`productId` side, so `remove-tag` was the
+only live action needed (no `archive-duplicate` changes required).
+
+Also built a `stock-report` action (min-qty CT stock query, gci-brain#142) to find
+import candidates, which led to creating 4 new products this session:
+**HF-ST44SR, HF-ST42SR** (Ovation UN203 — ST/trailer tires), **16005081, 16005392**
+(Itaro IT203/IT101). Along the way:
+
+- Fixed the store's `.myshopify.com` handle everywhere it was documented wrong
+  (`gcitires.myshopify.com` → **`gcitires-ca.myshopify.com`**, live store name
+  "GCI Tires Canada") — this was stale in `.env.local.example` and this doc.
+- Closed an image gap: Ovation/Itaro weren't in the static `IMAGE_MAP`, so these 4
+  products got created with no image (gci-brain#143 — sourced real product photos,
+  verified against sidewall text on the CT-provided names).
+- Found and fixed `src/services/addTireImages.ts` silently drifted from the `api/`
+  copy `shopifySync.ts` actually imports (missing Cooper Procontrol, Vredestein
+  entries) — the AI Match tool's image lookups were affected (gci-brain#144).
+- Found and fixed a real gap between the documented Aug-17 description convention
+  (paragraph + spec list) and what `updateSeo.ts`'s `generateAiCopy()` actually
+  produced (paragraph only, spec list silently dropped for every product this path
+  touches) — gci-brain#145. **Also fixes a latent bug**: an Anthropic API failure
+  previously caused `productDescriptionFallback()`'s empty-string return to blank
+  out `body_html` entirely instead of leaving it untouched as intended.
+  **Known gap, not fixed this session**: `buildPayload()` in `shopifySync.ts` (used
+  at product *creation* via `retry-create`/`full-import`) still generates the old
+  spec-dump-style `body_html` directly — `updateSeo.ts`'s fix only applies on a
+  subsequent SEO-backfill pass, not at creation time. New products will need that
+  backfill run manually (or scheduled) until `buildPayload()` itself is aligned.
+
+### 2. Pricing formula: found a 4th unfixed consumer, unified it, repriced the catalog
+
+The 2026-08-22 landed-cost fix (gci-order-hub#74, gci-walmart-sync#26, gci-brain#146)
+fixed three repos' price-setting code — but **missed a fourth**: `shopifySync.ts`
+itself (the file that actually sets live Shopify prices via the daily 3am cron and
+`retry-create`/`update-chunk`) was still running the pre-fix flat-12%-tax +
+flat-per-tire-class-shipping formula. Any correct price `bulkPriceUpdate.ts` set was
+being silently reverted by the next cron run.
+
+**Audited before touching anything** (gci-brain#148, `cost-ratio-report` +
+`price-diff-report` actions, both read-only): CT cost/MSRP ratio is bimodal by
+brand (Nexen/Ovation/Itaro ~78%, Cooper/Minerva ~44-47%) — not a data error, and
+not (per Pat, correcting an initial hypothesis) a "some brands don't pay freight"
+pattern — CT charges real freight on everything, calculated by origin warehouse ×
+destination × size × weight, per the same rate table `landedCost.ts` already uses.
+
+**Fixed** (gci-brain#147): unified `calculatePrice()`/`shopifyFloor`/`walmartFloor`
+onto the same `lib/pricing/landedCost.ts` module as `bulkPriceUpdate.ts`. Also fixed
+two more latent bugs found while making this change:
+- The `light_truck` → `lt_large` rim-≥19" shipping upgrade used
+  `ct.size.match(/R(\d{2})/i)` — but CT's raw `size` field is plain numeric
+  (`"2456020"`, never contains `R`), so this regex **never matched in production**.
+  Replaced with correct `WWWAARR`-format parsing; the shared rate table already
+  varies freight by rim size within `LT` (13-22), so the separate `lt_large` bucket
+  isn't needed anymore.
+- `shopifyFloor`/`walmartFloor` previously had **no tax applied at all** (inconsistent
+  with `calculatePrice()`'s own formula) — both metafields now go through
+  `computePriceFloor()` directly.
+
+Verified independently (Python re-derivation against the real rate table for a known
+live SKU) before merging: `18732NXK` (Nexen Roadian ATX 245/60R20) → $421.99 vs. old
+$405.99 (+3.9%), matching the average Nexen movement the audit predicted.
+
+**Executed full-catalog repricing** after merge (all-at-once, per Pat's explicit
+call — considered and rejected a staged rollout given the numbers below): looped
+`daily-sync` across all 40 chunks (offset 0→1950, 50/chunk) rather than waiting on
+the natural ~40-day cron rotation. **1,513 of 1,970 products updated, 0 errors.**
+Net catalog-wide movement: **+$27,491** (1,614 increases, only 5 real decreases —
+the old formula was under-charging most of the country, since real freight often
+exceeds what the flat per-tire-class guess assumed, outweighing QC's 9.975% tax
+being higher than the old blended 12%).
+
+**Known gap**: `landedCost.ts`/`freightRates.ts` is now a **4th independent copy**
+(one per repo: `gci-order-hub`, `gci-walmart-sync`, `gci-brain/bulkPriceUpdate.ts`,
+and now `gci-brain/shopifySync.ts` too) — the shared-package recommendation from the
+Aug-22 entry is more pressing now, not less.
+
+### 3. Clearance/final-sale detection — 39 SKUs, storefront + policy updated
+
+The price-diff audit's biggest "decreases" turned out to be genuine CT clearance
+stock (confirmed via a screenshot of CT's dealer portal — cost $49.97/MSRP $210,
+qty 3, tagged "Clearance"/"Final Sale"/"No returns accepted" in their UI), not a
+script bug. CT's RESTlet API doesn't expose a clearance flag directly
+(`raw-ct-sample` confirmed), so it's inferred: **cost/MSRP < 25% AND max
+single-location qty ≤ 4** (CT's own "1-4 tires" pricing tier) — a judgment call from
+observed examples, not a CT-documented rule; revisit if it over/under-flags.
+
+Applied end-to-end, live:
+- 39 products tagged `clearance-final-sale` (Shopify Admin API, direct)
+- New theme snippet `gci-clearance-badge.liquid` — visible orange/red badge,
+  mirrors CT's own convention, gated on the tag
+- `product-shipping-badge.liquid` made conditional: normal products keep
+  "Easy Returns," tagged products show "Final Sale — no returns accepted" instead
+  (previously showed "Easy Returns" unconditionally on **every** product, including
+  these 39 — a real customer-facing conflict, now fixed)
+- Refund policy (`/policies/refund-policy`) updated: added clearance/final-sale to
+  the non-returnable-items list
+
+**While in the policy pages**: found and cleaned leftover `font-claude-response-body`
+/ Tailwind-utility CSS classes across **all 6** shop policies (Contact, Legal
+Notice, Privacy, Refund, Shipping, Terms) — content had clearly been pasted in from
+a Claude chat response at some point, carrying Claude.ai's own UI classes into live
+policy HTML. Preserved the legitimate Dawn theme structural wrappers
+(`page`/`page-body`/`policy`, only present on the Shipping policy) while stripping
+everything else. Purely cosmetic, no content change beyond the clearance line above.
+
+### 4. Product page: tire-specs metafield display + dead-code cleanup
+
+**Correction to this session's own work, below — read this before touching
+`custom.utqg`/`custom.speed_rating`/`custom.load_range`/`custom.tread_depth`
+display again.** Built a new snippet (`gci-tire-specs.liquid`) rendering these 4
+metafields under the price — **without first checking whether this already
+existed**. It did: `templates/product.json`'s `main` section already had 4
+`custom_liquid` blocks (`custom_liquid_kQCADk`/`F3f6H3`/`eeaVT6`/`UpHqxQ`, sitting
+between `price` and `buy_buttons`) doing the exact same thing, one block per field,
+predating this session. Result: **duplicate spec rows on every product page**, and
+the new one visually collided with the theme's shipping/tax note directly below
+it (screenshotted by Pat — text overlapping, underline cutting through content).
+**Removed same-session**: render call in `sections/main-product.liquid` reverted,
+`snippets/gci-tire-specs.liquid` deleted. The pre-existing `custom_liquid` blocks
+are the only version live now, unchanged, still working as they were before this
+session touched anything.
+
+**Known gap, not fixed**: unlike the (now-deleted) new snippet, the pre-existing
+`custom_liquid` blocks don't filter placeholder-string values (`"-"`, `"N/A"`,
+etc.) — a product with `custom.load_range` literally set to `"-"` shows
+`Load Range: -` verbatim (visible in Pat's screenshot). Offered to fix this on the
+existing blocks; awaiting a decision as of this doc-sync.
+
+**Correction to an earlier claim in this same doc-sync pass**: previously stated
+here that only 5 products (draft, unpublished) had any of these 4 metafields
+populated, based on a 100-product GraphQL sample. **Wrong** — Pat's own
+screenshot (Ovation Vi-386HP 235/60R18, live at $225.99) shows a published
+product with real values for all 4 fields. The 100-product sample was incomplete,
+not representative — don't trust that "only 5, all draft" figure; the actual
+number of live, populated products is unknown as of this doc-sync and would need
+a full-catalog check, not a sample, to state accurately.
+
+**Takeaway for future sessions**: before adding *any* new product-page display
+element, check `templates/product.json`'s block list first — this theme has
+several one-off `custom_liquid`/`ai_gen_block` blocks with real, working logic
+that won't show up in a search of `.liquid` snippet files alone, since their
+content lives in the template JSON's block settings, not a separate file.
+
+Separately (this part unaffected by the above), investigating the product
+template surfaced a disabled, hardcoded-fake-data "AI-generated" spec block
+(`ai_gen_block_9cff040` — bilingual spec table, postal-code shipping estimator,
+installer-finder button, all with placeholder values like `"225/65R17"`, never
+wired to real data) sitting inert in `templates/product.json`. Removed it (section
++ orphaned block file) since it wasn't live and had no real data behind it — but
+it represents a genuinely bigger feature concept (3PMSF cert, noise level,
+warranty display, shipping estimator) than either spec-row implementation above,
+worth a real future build if wanted, not silently lost.
+
+
+Found **12 more `ai_gen_block_*.liquid` files** in the theme (from Shopify's AI
+section generator, presumably iterative drafts). Investigated all: **8 were
+completely unreferenced** anywhere in any of the 22 template/section-group JSON
+files (confirmed via brute-force content scan, not just template.json spot-checks)
+— deleted, safe. **4 are live**, all in `header-group.json` (renders on **every**
+page, not just homepage) except one (homepage only):
+
+| Block | Purpose |
+|---|---|
+| `ai_gen_block_799c80a` | Hero banner — "Buy your tires online in Canada" CTA |
+| `ai_gen_block_7ddd389` | Value-prop icon strip (3PMSF, delivery, **installer network**, AI assistant) |
+| `ai_gen_block_6b10f66` | "AI Assistant" CTA → opens Tidio chat |
+| `ai_gen_block_6ac5ca5` | Google Customer Reviews opt-in script (thank-you page) |
+
+Initially flagged the installer-network claim as possibly inaccurate (this session's
+Blackcircles comparison assumed ship-to-door was the only model) — **corrected**:
+confirmed via this doc's own §3/§6 that GCI has a real, built installer-dispatch
+system (Airtable "GCI Installer Portal" base, `/api/nearby-installers` +
+`/api/submit-installer-application` in `gci-brain`, `gci-order-hub` dispatches paid
+`TIRE-`-prefixed orders to installers). The copy is accurate; no change made.
+
+Also flagged, then resolved as a non-issue: `ai_gen_block_6ac5ca5`'s hardcoded GMC
+merchant ID (`5823993728`) looked like it might not match the suspended ID
+(`5729993911`) mentioned in `theme.liquid`'s own historical cleanup comment.
+**Confirmed with Pat**: `5823993728` ("GCI Tires Canada") is the correct, currently
+active Merchant Center account. Brute-force scanned all 229 theme text files plus
+the entire `gci-brain` codebase for the old ID or any other `merchant_id`
+reference — found only 3 references total, all three already correct. Nothing to
+remove; the old suspended ID really was fully cleaned out previously, not just
+hidden in a comment.
+
+### 5. Competitor analysis (informational, no code)
+
+Delivered a standalone comparison vs. `blackcircles.ca` (Pat's designated
+follow-competitor). Key finding: catalog overlap is only 2 brands (Cooper, Nexen)
+— Blackcircles doesn't carry Ovation/Itaro/Minerva/Kenda/Transeagle at all, so the
+landed-cost formula (not their pricing) is the right anchor for 7 of GCI's 9
+brands. Blackcircles' own per-tire pricing isn't scrapable (JS-rendered,
+booking/garage-dependent, not a flat number) — flagged as a real limitation, not
+guessed around. Biggest concrete gap found: GCI's homepage claims "100+ years
+experience, 1,000+ tires installed" directly next to a **0-review Trustpilot
+page**, vs. Blackcircles' 4.7/5 across 3,500+ reviews — recommended as the fastest,
+cheapest fix available, ahead of anything requiring engineering work.
+
+### 6. "Canada Tire Inc. (est. 1928)" distributor mention removed (gci-brain#151, MERGED)
+
+Pat flagged (screenshot) this adds no value on product pages. Traced to
+`scripts/generateSeoDescriptions.ts` — a standalone script (not part of the live
+serverless app) whose AI prompt hardcoded `<li>Part of the Canada Tire Inc.
+catalog (est. 1928)</li>` into every description it generated.
+
+**Scope audited before touching anything live**: 1,352 of 2,648 products (51%)
+had this text live, in two structural variants — most (1,206) had it folded into
+flowing AI-paraphrased prose with varied wording (`catalog established in 1928`,
+`catalog (est. 1928)`, etc. — the AI didn't consistently follow the script's
+intended `<ul><li>` structure), the rest (146) had the script's literal `<li>`
+tag. Fixed via sentence-boundary filtering for the first group, direct `<li>`
+removal for the second — both dry-run tested against the full affected set
+before any live write. **Verified 0 remaining** across a full 2,648-product
+re-scan after applying.
+
+Also fixed `blog-publisher.ts`'s EN/FR system prompts, which instructed every
+*future* blog post to include the same distributor mention — left unfixed, this
+would have reintroduced the issue in blog content going forward even with the
+script and live data both cleaned up.
+
+### 7. Review system: root cause found, automated (gci-brain#152, MERGED)
+
+Pat flagged (screenshot) that "Be the first to review this product" does
+nothing when clicked. Investigation found GCI already has a **complete,
+well-built verified-purchase review system** — `api/reviews/{request,submit,
+moderate,list,export}.ts`, a real submission form (`snippets/review-form.liquid`,
+token-gated via `?review=<token>` in the URL), a moderation admin UI
+(`ReviewsModeration.jsx`), and a branded review-request email template
+(Resend, dark theme, matches the site). **None of it was broken.**
+
+**Root cause**: `/api/reviews/request` — the endpoint that emails a customer
+their personal tokenized review link — was never called by anything. No cron,
+no order webhook, no admin trigger button anywhere in either codebase. Zero
+customers have ever received a review-request email since launch, so the
+token-gated write-review path has been unreachable by design (not by bug)
+since day one. Meanwhile a separate, purely-decorative read-only widget
+(`gci-reviews-section`, injected directly in `body_html`) still shows "Be the
+first to review this product" with no click handler at all — implying an
+action nobody could actually take.
+
+Presented Pat two honest paths: (1) automate the existing verified-purchase
+flow, or (2) open review submission to any visitor (requires loosening
+`submit.ts`'s token requirement, changes the trust model). **Pat chose (1)** —
+verified-only stays, automate the trigger.
+
+**Built**: `api/reviews/auto-request-cron.ts` — finds orders fulfilled exactly
+5 days prior via Shopify GraphQL, dedups against the same `Review_Requests`
+Airtable table `request.ts` itself already writes to (so a customer never gets
+two request emails for one order even across overlapping cron windows), then
+calls the *existing* `/api/reviews/request` endpoint per qualifying order — no
+duplicated email/token logic. Cron: daily, 14:00 UTC (10am ET), `dryRun=false`
+explicit in `vercel.json`; the handler itself defaults to `dryRun=true` when
+called without the param, as a safety default for manual/ad-hoc testing.
+
+**Blocked mid-build, then resolved**: Shopify's Protected Customer Data
+restriction — the custom app wasn't approved to read `orders.email` (returns
+`null` silently on REST, a hard GraphQL error on the same field) until Pat (a)
+upgraded the Shopify plan and (b) separately approved the `customers`
+scope (`read_customers`/`write_customers`) in the app's own configuration
+screen — **two distinct steps**, the plan upgrade alone did not fix it.
+Confirmed via Pat's screenshots which scope was actually needed (not
+`customer_merge`, which is a different, unrelated scope with a similar-looking
+PII warning).
+
+**Tested against real order data on a preview deployment before merge, not
+just "doesn't crash"**: confirmed the precise date-matching logic correctly
+*excluded* the one order in the search window because its real fulfillment
+date (Aug 18) didn't exactly match the 5-day target (Aug 19) — validates the
+matching precision, not just successful execution. Also separately confirmed
+2 of the 4 most recent real orders have no email on file at all (likely
+guest/alternate checkout) — the cron already handles this via
+`skippedNoEmail`, no error, no bad send.
+
+**What to expect**: starting the day after merge, any order fulfilled exactly
+5 days prior gets an automatic review-request email. Order volume is low
+(~3/week per gci-order-hub's own notes), so reviews will trickle in gradually,
+not arrive all at once.
+
+### Also investigated this session, no fix needed
+
+A `walmart-order-sync ERROR` Telegram alert (Pat screenshot, gci-order-hub) was
+traced to a single transient Google Sheets 503 (not a Walmart problem, despite
+the alert name) during the PO#→order-ID lookup `/api/walmart-order-sync`
+depends on. Confirmed via Vercel logs: the failing run was immediately followed
+15 minutes later by a clean successful run picking up exactly where the failed
+one left off — **zero data loss**, by design (rolling 48h lookback window, not
+a forward-only cursor — see the 2026-08-06 entry above for why that distinction
+matters). Hasn't recurred in 7 days. Pat's call: leave as-is. The one real
+improvement available — clarifying the alert text so it doesn't read as a
+Walmart-side outage — was offered and explicitly declined for now.
+
+### Session PRs (all gci-brain, all MERGED)
+`#142` stock-report · `#143` Ovation/Itaro images · `#144` addTireImages sync ·
+`#145` description spec-list fix · `#147` pricing formula unification ·
+`#148` cost-ratio-report + price-diff-report + clearance detection ·
+`#150` parseCTSizeCode variant-option fix ·
+`#151` Canada Tire Inc. mention removal ·
+`#152` automated review-request cron
+
+### Session credential note (same convention as prior entries)
+
+A GitHub PAT and a Shopify Admin API token were shared directly in chat this
+session (the PAT was rotated once mid-session after the first one stopped working —
+likely rotated on Pat's end independently, not a leak). Used to clone/push/PR
+`gci-brain`, and to read/write Shopify directly (products, theme assets, policies,
+metafields) for everything in §3/§4 above that a `gci-brain` API endpoint didn't
+already cover. **Rotate both** — flagged to Pat multiple times through the session.
+
+---
+
+## Session update — 2026-08-30
+
+### 1. Walmart CA bulk retire endpoint (`gci-order-hub#80`, `#81` — both MERGED)
+
+**Started from**: a request to build a *reversible* unpublish/republish endpoint
+for Walmart CA SKUs via the `MP_MAINTENANCE` feed — hide specific SKUs from
+Walmart.ca temporarily, without permanently retiring/recreating the listing.
+
+**Investigated live against the real account, found this doesn't exist for this
+Walmart Global Marketplace Partner (GMP) account** — three independent signals,
+not a guess:
+1. The Get Spec API (`POST /v3/items/spec`) and the item-taxonomy utility
+   (`GET /v3/utilities/taxonomy`) both error out for this account/market
+   (`GMP_ITEM_QUERY_API`/`MARKET_NOT_SUPPORTED`) — these are US-domestic-only
+   utilities, not available to GMP accounts.
+2. Live feed-submission trial-and-error against the real `MP_MAINTENANCE`
+   feed (spec version confirmed as literally `1.0`, not the mainstream 4.x/5.x
+   Item Spec lineage) tested **22 candidate field names** for a
+   publish/orderable toggle (`Visible`, `publishedStatus`, `orderable`,
+   `isPublished`, `active`, `status`, `enabled`, `hidden`, etc.) — every one
+   rejected as an unrecognized field.
+3. Seller Center's own UI (Catalog → item row → "..." menu) has **no
+   Pause/Deactivate/Unpublish action at all** — only Edit / Retire / Delete /
+   Update lag time, identical on both Published and already-Unpublished items.
+   Confirmed directly via the UI's own tooltip that "Unpublished" is
+   **Walmart's own automated judgment** ("We've removed your item from
+   Marketplace due to its high price"), not a seller-settable flag — this
+   turned out to be directly relevant to the pricing bug found later this same
+   session, see §2 below.
+
+**Pivoted per explicit instruction** ("instead of unpublishing we move to
+retire or delete the item") — built `api/walmart-delist.ts` instead: a
+general-purpose bulk retire endpoint using the already-proven `retireItem()`/
+`DELETE /v3/items/{sku}` mechanism (same one `walmart-retire.ts` already used),
+generalized beyond that file's `TIRE-`-prefix-only scope. Three input modes:
+`{ skus }`, `{ tag }` (Shopify-tag-driven), and `{ keepSkus }` (inverted
+selection — "retire everything currently listed except this keep list", built
+for a real cleanup request: a spreadsheet of 322 SKUs with 4+ units of healthy
+stock, retire everything else).
+
+**Two real bugs found and fixed during live testing against the real
+account** (not caught by review alone):
+- **Chunk size 300 timed out** — a real `dryRun=false` run retiring 300 SKUs
+  (each needing a retire call + a lifecycle-verification re-check) didn't
+  reliably finish inside Vercel's 300s `maxDuration`; dropped to 100, matching
+  `walmart-retire.ts`'s own proven value.
+- **Pagination drift silently skipped ~850 of ~1756 target SKUs** — the
+  endpoint filtered the input list down to "currently listed" (a live check)
+  *before* slicing by `offset`/`limit`; as earlier chunks got retired between
+  separate paged calls, the filtered array shrank and reindexed, so
+  `offset=N` stopped mapping to the same items call to call. Fixed by building
+  a **stable candidate list once per request**, slicing offset/limit from
+  that first, and only resolving "still listed" within the already-sliced
+  chunk.
+
+**Executed the real cleanup after both fixes**: retired **2056 SKUs, 0
+failures**, verified complete by summing `acceptedCount` (855) +
+`skippedNotListed` (1201) across all paginated batches = exactly 2056, the
+full candidate count. One test SKU (`MV861`) was retired for real via Seller
+Center's own UI during the investigation — confirmed acceptable, no cleanup
+needed.
+
+### 2. Walmart price-floor bug: `tireType`/`rimSize` never wired through, closing a known Aug-22 gap (`gci-order-hub#82` — OPEN, not yet merged)
+
+**Trigger**: a real reported price gap — Walmart SKU `300E3009` (Ovation
+W-686 Ecovision 185/65R15) listed at **$261.99** vs. its real live Shopify
+price of **$174.99** — with the explicit business constraint that Walmart
+auto-delists/unpublishes listings its own algorithm reads as priced too high
+(see §1's Seller Center tooltip finding above — same mechanism).
+
+**Root cause — this exact gap was already flagged and waiting**: the
+2026-08-22 landed-cost session (this doc, that entry) explicitly listed as
+"Known gap #2": *"Callers don't pass real tireType/rimSize yet in most call
+sites... they get the safe-but-maximally-conservative fallback (LT, rim 22)
+for now."* Confirmed **every single caller** of `safeWalmartPrice()` across
+the repo still omitted these params — `walmart-sync.ts`, `api/lib/listed-sync.ts`
+(the live 2-minute cron path via `walmart-sync-cursor.ts`), `walmart-price-audit.ts`,
+`walmart-price-correct.ts`, `walmart-oversell-monitor.ts`, and
+`walmart-client.ts`'s `updatePrice()`/`bulkPriceFeed()`. Verified by hand and
+by direct computation that the LT/rim-22 fallback reproduces the live
+$261.99 exactly; the real class (Passenger, rim 15) computes ~$175.99,
+matching the real Shopify price.
+
+**Fixed**: added `parseTireSpecFromTags()` to `api/lib/shopify.ts` (parses
+real tire type + rim size from Shopify product tags/variant title), added
+`tireType`/`rimSize` to `ShopifyVariantData`/`WalmartPriceItem`, threaded
+through every call site above. Also extended `walmart-price-audit.ts` — it
+previously only flagged Walmart prices sitting too far *below* Shopify
+(dumping risk); added a symmetric "overpriced" direction (Walmart price
+sitting >5% above the *correct* floor) which is what actually catches the
+300E3009-shaped bug, since that SKU was priced too HIGH, not too low.
+
+**A second, real bug surfaced live, mid-fix — caught before it could do more
+damage, not before it did some**: the first parser version only matched
+`vehicle_type:Passenger`/`vehicle_type:Light Truck` tags and a
+cleanly-formatted `"185/65R15"`-style size tag. Real store data uses a
+**second, inconsistent tag convention** — `tire-type-passenger` (no
+`vehicle_type:` prefix) plus a malformed size tag like `"1856515/R"` — used
+by a large slice of the catalog, including 300E3009 itself. A live dry-run
+correction pass using the first parser version pushed **two real SKUs**
+(`AP21550017WHYPA02`, `AP25545019YHYPA02`) to a still-wrong, LT/22-inflated
+price ($433.99/$576.99) before this was caught by cross-checking `safePrice`
+against the real Shopify price for every corrected row. Fixed by matching
+tire type via substring across both tag conventions, and parsing rim size
+from the variant **title** (consistently formatted across every batch
+checked) instead of the unreliable tags. Re-ran live: both SKUs self-corrected
+on the next pass ($348.99/$490.99).
+
+**Verified at scale, live, after the fix**: a full live correction pass found
+**265 of 318 currently-listed Walmart SKUs (83%) mispriced** by this bug,
+all corrected. Cross-checked every corrected row's `safePrice` against its
+real Shopify price to confirm no residual fallback inflation — found 26 rows
+(`NXK`-suffixed Nexen SKUs) where the corrected price legitimately sits
+8-11% above the Shopify price; confirmed via direct tag lookup these
+products carry a genuine `light-truck` tag (alongside a leftover,
+inconsistent `tire-type-passenger` tag from the same import) — real LT
+freight cost, not a bug; hand-verified the exact computed floor for one
+(`17970NXK`: cost $154.40, LT, rim 17 → $338.99, matches exactly).
+
+**Added regression tests**: `api/lib/pricing.test.ts` gained a case anchoring
+the exact $261.99-vs-$174.99 numbers; new `api/lib/shopify.test.ts` anchors
+the tag-parsing fix against the real tag/title shapes for every SKU involved
+plus the original `vehicle_type:` convention, so this specific class of bug
+(assumed tag format vs. real, inconsistent tag format across import
+batches) can't silently regress.
+
+**Not yet merged as of this doc update** — PR #82 is open, all above
+verified live against the real account (not just tested in isolation).
+
+**Cross-reference / known-gaps note**: this closes Known gap #2 from the
+2026-08-22 entry above, for `gci-order-hub` only. `landedCost.ts`/
+`freightRates.ts` is unchanged by this fix and remains duplicated across
+repos (`gci-order-hub`, `gci-walmart-sync`, `gci-brain/bulkPriceUpdate.ts`,
+`gci-brain/shopifySync.ts` — see the 2026-08-23 entry above) — this session's
+fix only touches `gci-order-hub`'s copy and callers; the other repos' copies
+were not touched and may have the same tireType/rimSize gap independently if
+`gci-walmart-sync` is ever activated for real (see its repo-map row — still
+not installed on any real store as of this doc).
+
+**Also found while reading this doc for context this session, not fixed,
+flagged for whoever touches `gci-brain/api/shopifySync.ts` next**:
+`gci-brain`'s own `CLAUDE.md` (checked into that repo, read as project
+instructions) describes a "tiered `calculatePrice()`" formula (2.10x/1.72x/
+1.58x flat multipliers by cost bracket) as the intended fix for that file's
+pricing — but the actual merged code (`gci-brain#147`, per the 2026-08-23
+entry above) already replaced that exact function with the shared
+`landedCost.ts` formula instead, before `CLAUDE.md`'s version ever shipped as
+written. This is the same "documented plan ≠ what's actually live" shape as
+the deprecated-model incident (§6.4, earlier in this doc) — if a future
+session applies that `CLAUDE.md` literally, it would regress a fix that's
+already live. Worth a deliberate look (fix the file or delete it) next time
+someone is in that repo; out of scope for this session (different repo, not
+what was asked).
+
+**Session credential note** (same convention as prior entries in this doc):
+a GitHub PAT scoped to the `statco` org was used this session for
+`gci-order-hub`'s clone/branch/commit/PR work and this doc-sync commit
+(propagated to all 4 repos this session has access to). Standard hygiene:
+rotate it, alongside the other rotations already queued in this doc.
+
+- This doc was updated in **gci-order-hub, gci-brain, gci-price-monitor, and
+  gcitires-chatbot** this session (the 4 repos in scope) — **not** yet in
+  **gci-command-center** or **gci-walmart-sync**, which this session had no
+  access to; propagate there next time either is touched.
