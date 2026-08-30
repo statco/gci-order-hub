@@ -1158,14 +1158,22 @@ checked across a full hour — `0 fail` on every price PUT, every chunk,
 across multiple complete 318-SKU cycles (~13-14 min/cycle). Pipeline
 confirmed healthy: correct price computed, Walmart accepting every write.
 
-**Open item, not yet resolved**: 4 SKUs (`166159006`, `AP21550017WHYPA02`,
-`16092NXK`, `AP25545019YHYPA02`) still read a stale price via `/v3/items`
-despite confirmed-successful writes in the logs. Cost fields and
-Shopify active/`ct-sync` status ruled out as causes for all 4. Leading
-theory: a Walmart-side read/cache quirk specific to these listings, not a
-bug here — unconfirmed. Next step: check these 4 directly in Walmart
-Seller Center's UI; if also stale there, open a Walmart support ticket
-citing the timestamped `200 OK` write logs as evidence.
+**RESOLVED same day, by manual correction, not confirmed diagnosis**: Pat
+set all 4 SKUs (`166159006`, `AP21550017WHYPA02`, `16092NXK`,
+`AP25545019YHYPA02`) to their live Shopify price directly in Walmart
+Seller Center. The leading theory (a Walmart-side `/v3/items` read/cache
+quirk) was never independently confirmed against Seller Center before the
+manual fix made it moot — cost fields and Shopify active/`ct-sync` status
+were ruled out as causes, but the actual root cause on Walmart's side
+remains unknown. Worth checking Seller Center directly (not just the API)
+first if this pattern recurs on other SKUs, rather than assuming a
+codebase bug.
+
+**One expected follow-on, not a bug**: `safeWalmartPrice()` computes $1
+above raw Shopify price for `AP21550017WHYPA02` specifically ($348.99 vs.
+$347.99 — an intentional buffer, not a floor/cost issue). Since the manual
+correction matched Shopify exactly, the next cursor cycle will bump this
+one SKU by $1 automatically. Expected behavior, flagged in advance.
 
 **Credential note**: same GitHub PAT used across the #82/#83 thread and
 this doc update — rotate it.
