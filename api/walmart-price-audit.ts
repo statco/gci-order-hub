@@ -1,8 +1,24 @@
 /**
  * api/walmart-price-audit.ts
  *
- * Compares Walmart listed prices against current Shopify prices.
- * Flags and auto-corrects any SKU where Walmart price is more than 5% below Shopify price.
+ * Compares Walmart listed prices against current Shopify prices, in BOTH
+ * directions:
+ *
+ *   - 'below_shopify': Walmart price is more than 5% below Shopify price —
+ *     the original dumping/undercut-risk check.
+ *   - 'overpriced': Walmart price sits more than 5% above the CORRECT
+ *     landed-cost floor (real tireType/rimSize, not the conservative
+ *     LT/rim-22 fallback every caller used to omit). This is what Walmart's
+ *     own price-fairness algorithm reads as "listed too high" and can
+ *     auto-unpublish for — confirmed live on SKU 300E3009 (Ovation W-686
+ *     Ecovision 185/65R15): Walmart at $261.99 vs a real $174.99 Shopify
+ *     price, because every past correction used the LT/22 fallback floor
+ *     instead of this tire's real Passenger/15 class.
+ *
+ * Both directions correct to the same safeWalmartPrice() value — the higher
+ * of the real Shopify price and the real landed-cost floor — so a corrected
+ * 'overpriced' SKU settles back down near its actual Shopify price, never
+ * below cost.
  *
  * GET /api/walmart-price-audit?dryRun=true   — report only, no corrections
  * GET /api/walmart-price-audit               — report + auto-correct flagged SKUs
@@ -22,11 +38,13 @@ const PRICE_THRESHOLD = 0.05; // flag if Walmart price < Shopify price × (1 - 0
 
 interface AuditRow {
   sku: string;
+  direction: 'below_shopify' | 'overpriced';
   walmartPrice: number;
   shopifyPrice: number;
   cost: number | null;
   safePrice: number | null;
-  pctBelow: number;
+  /** % below Shopify price (below_shopify rows) or % above the correct floor (overpriced rows). */
+  pctDiff: number;
   corrected: boolean;
   skippedNoCost?: boolean;
   error?: string;
@@ -154,29 +172,42 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const sv = shopify.get(sku);
       if (!sv || sv.price == null) continue; // no Shopify match — skip
       const shopifyPrice = sv.price;
+      const safePrice = safeWalmartPrice({ shopifyPrice, cost: sv.cost, tireType: sv.tireType, rimSize: sv.rimSize });
 
-      const threshold = shopifyPrice * (1 - PRICE_THRESHOLD);
-      if (walmartPrice < threshold) {
-        const pctBelow = ((shopifyPrice - walmartPrice) / shopifyPrice) * 100;
-        const safePrice = safeWalmartPrice({ shopifyPrice, cost: sv.cost, tireType: sv.tireType, rimSize: sv.rimSize });
-        const row: AuditRow = {
+      const belowThreshold = shopifyPrice * (1 - PRICE_THRESHOLD);
+      const aboveThreshold = safePrice != null ? safePrice * (1 + PRICE_THRESHOLD) : null;
+
+      if (walmartPrice < belowThreshold) {
+        const pctDiff = ((shopifyPrice - walmartPrice) / shopifyPrice) * 100;
+        flagged.push({
           sku,
+          direction: 'below_shopify',
           walmartPrice,
           shopifyPrice,
           cost: sv.cost,
           safePrice,
-          pctBelow: parseFloat(pctBelow.toFixed(1)),
+          pctDiff: parseFloat(pctDiff.toFixed(1)),
           corrected: false,
-        };
-
-        flagged.push(row);
+        });
+      } else if (aboveThreshold != null && walmartPrice > aboveThreshold) {
+        const pctDiff = ((walmartPrice - safePrice!) / safePrice!) * 100;
+        flagged.push({
+          sku,
+          direction: 'overpriced',
+          walmartPrice,
+          shopifyPrice,
+          cost: sv.cost,
+          safePrice,
+          pctDiff: parseFloat(pctDiff.toFixed(1)),
+          corrected: false,
+        });
       } else {
         clean.push(walmartPrice);
       }
     }
 
     // Sort worst discrepancy first
-    flagged.sort((a, b) => b.pctBelow - a.pctBelow);
+    flagged.sort((a, b) => b.pctDiff - a.pctDiff);
 
     // Paginate corrections on the flagged array, not walmartItems
     const pagedFlagged = flagged.slice(offset, offset + limit);
@@ -198,12 +229,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    console.log(`[walmart-price-audit] Flagged: ${flagged.length} | Paged: ${pagedFlagged.length} | Corrected: ${pagedFlagged.filter(r => r.corrected).length} | dryRun: ${dryRun}`);
+    const totalBelowShopify = flagged.filter(r => r.direction === 'below_shopify').length;
+    const totalOverpriced   = flagged.filter(r => r.direction === 'overpriced').length;
+
+    console.log(
+      `[walmart-price-audit] Flagged: ${flagged.length} (below_shopify=${totalBelowShopify}, overpriced=${totalOverpriced})` +
+      ` | Paged: ${pagedFlagged.length} | Corrected: ${pagedFlagged.filter(r => r.corrected).length} | dryRun: ${dryRun}`
+    );
 
     return res.status(200).json({
       dryRun,
       totalItems: walmartItems.length,
       totalFlagged: flagged.length,
+      totalBelowShopify,
+      totalOverpriced,
       offset,
       limit,
       nextOffset: offset + limit < flagged.length ? offset + limit : null,
