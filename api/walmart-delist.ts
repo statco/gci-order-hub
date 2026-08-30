@@ -23,7 +23,7 @@
 // (non-existent) reversible toggle. Retire is near-permanent — there is no
 // "republish"; a retired item must be re-created via the item feed.
 //
-//   POST /api/walmart-delist?dryRun=false[&offset=N&limit=300]
+//   POST /api/walmart-delist?dryRun=false[&offset=N&limit=100]
 //     Body: exactly one of:
 //       { skus: string[] }     — retire these specific SKUs
 //       { tag: string }        — retire everything under this Shopify tag
@@ -32,8 +32,10 @@
 //                                keep-list, retire the rest" cleanups)
 //     Auth: Bearer token matching WALMART_UNPUBLISH_SECRET.
 //     dryRun defaults to TRUE — must pass dryRun=false explicitly to write.
-//     Real writes page via offset/limit (300/call, repeat with increasing
-//     offset until done:true — same convention as walmart-retire.ts). For
+//     Real writes page via offset/limit (100/call, repeat with increasing
+//     offset until done:true — same convention as walmart-retire.ts; a
+//     chunk of 300 was tried and timed out mid-response against Vercel's
+//     300s maxDuration). For
 //     keepSkus mode specifically: don't page a real (dryRun=false) run
 //     directly, since willRetire is recomputed from live data every call and
 //     retirement propagation lag can shift the underlying set between calls.
@@ -52,7 +54,12 @@ import {
 export const config = { maxDuration: 300 };
 
 const SECRET     = process.env.WALMART_UNPUBLISH_SECRET ?? '';
-const CHUNK_SIZE = 300; // matches the repo-wide convention (walmart-retire.ts)
+// 100, not 300: walmart-retire.ts's own chunk size for this exact
+// retire-then-verify-lifecycle pattern, precisely because a chunk of 300
+// (retireItem + a per-SKU lifecycle re-check afterward) doesn't reliably
+// finish inside Vercel's 300s maxDuration — confirmed live: a real
+// dryRun=false call at 300 timed out mid-response.
+const CHUNK_SIZE = 100;
 
 function delay(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
