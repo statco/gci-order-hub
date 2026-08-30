@@ -9,6 +9,8 @@
 // `cost` lives on InventoryItem.unitCost.amount in GraphQL.
 // ─────────────────────────────────────────────────────────────
 
+import type { TireType } from './pricing/landedCost';
+
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE_DOMAIN ?? '';
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN ?? '';
 const API_VERSION   = '2024-01';
@@ -19,6 +21,36 @@ export interface ShopifyVariantData {
   cost: number | null;              // InventoryItem.unitCost.amount — what the floor reads
   ctCost: number | null;            // canada_tire.cost metafield — raw CT dealer cost (for divergence checks)
   inventoryQuantity: number | null;
+  tireType: TireType | null;        // parsed from product tags — real class for the freight floor
+  rimSize: number | null;           // parsed from product tags — real rim size for the freight floor
+}
+
+/**
+ * Parses a product's real tire class + rim size out of its Shopify tags, so
+ * safeWalmartPrice() can use the actual freight class instead of silently
+ * falling back to its most conservative default (LT, rim 22) — the gap that
+ * caused SKU 300E3009 (Ovation W-686, Passenger 185/65R15) to sit at a
+ * $261.99 Walmart floor when the correct floor is ~$176, nowhere near the
+ * true $174.99 Shopify price. See tags like "vehicle_type:Passenger" /
+ * "vehicle_type:Light Truck" and a size tag such as "185/65R15".
+ */
+export function parseTireSpecFromTags(tags: string[]): { tireType: TireType | null; rimSize: number | null } {
+  let tireType: TireType | null = null;
+  let rimSize: number | null = null;
+
+  for (const tag of tags) {
+    const lower = tag.toLowerCase();
+    if (tireType == null) {
+      if (lower === 'vehicle_type:light truck' || lower === 'light-truck') tireType = 'LT';
+      else if (lower === 'vehicle_type:passenger' || lower === 'passenger') tireType = 'Passenger';
+    }
+    if (rimSize == null) {
+      const m = tag.match(/^\d{3}\/\d{2}R(\d{2})$/i);
+      if (m) rimSize = parseInt(m[1], 10);
+    }
+  }
+
+  return { tireType, rimSize };
 }
 
 export interface ShopifyOrderLookup {
@@ -155,6 +187,7 @@ export async function fetchAllShopifyVariants(): Promise<Map<string, ShopifyVari
             inventoryQuantity
             inventoryItem { unitCost { amount } }
             product {
+              tags
               ctCost: metafield(namespace: "canada_tire", key: "cost") { value }
             }
           }
@@ -193,12 +226,15 @@ export async function fetchAllShopifyVariants(): Promise<Map<string, ShopifyVari
 
       const rawCost = node.inventoryItem?.unitCost?.amount;
       const rawCt   = node.product?.ctCost?.value;
+      const { tireType, rimSize } = parseTireSpecFromTags((node.product?.tags ?? []) as string[]);
       map.set(sku, {
         sku,
         price: node.price != null ? parseFloat(node.price) : null,
         cost: rawCost != null ? parseFloat(rawCost) : null,
         ctCost: rawCt != null ? parseFloat(rawCt) : null,
         inventoryQuantity: node.inventoryQuantity != null ? Number(node.inventoryQuantity) : null,
+        tireType,
+        rimSize,
       });
     }
 
@@ -239,6 +275,7 @@ export async function fetchActiveCtSyncVariants(): Promise<Map<string, ShopifyVa
         edges {
           node {
             id
+            tags
             variants(first: 100) {
               pageInfo { hasNextPage }
               edges {
@@ -283,6 +320,7 @@ export async function fetchActiveCtSyncVariants(): Promise<Map<string, ShopifyVa
     for (const productEdge of products.edges) {
       const product = productEdge.node;
       const rawCt   = product.ctCost?.value;
+      const { tireType, rimSize } = parseTireSpecFromTags((product.tags ?? []) as string[]);
 
       // Tire listings are one-variant-per-product; guard in case that changes.
       if (product.variants.pageInfo.hasNextPage) {
@@ -304,6 +342,8 @@ export async function fetchActiveCtSyncVariants(): Promise<Map<string, ShopifyVa
           cost:              rawCost != null ? parseFloat(rawCost) : null,
           ctCost:            rawCt   != null ? parseFloat(rawCt)   : null,
           inventoryQuantity: node.inventoryQuantity != null ? Number(node.inventoryQuantity) : null,
+          tireType,
+          rimSize,
         });
       }
     }

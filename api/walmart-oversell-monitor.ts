@@ -130,7 +130,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       } else {
         const ctCost = activeVariant.ctCost;
         if (ctCost != null && ctCost > 0) {
-          const safe = safeWalmartPrice({ shopifyPrice: activeVariant.price ?? 0, cost: activeVariant.cost });
+          const safe = safeWalmartPrice({
+            shopifyPrice: activeVariant.price ?? 0,
+            cost: activeVariant.cost,
+            tireType: activeVariant.tireType,
+            rimSize: activeVariant.rimSize,
+          });
           if (safe != null && safe < ctCost * PRICE_FLOOR_MULTIPLIER) {
             heldExposed.push(walmartSku);
           }

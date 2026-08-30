@@ -43,9 +43,9 @@ export interface SafeWalmartPriceOpts {
   /** 'Passenger' | 'LT' - omit to fall back to the most conservative class,
    *  which guarantees the floor never UNDER-protects but may over-pad SKUs
    *  we don't have real tire specs for yet. */
-  tireType?: TireType;
+  tireType?: TireType | null;
   /** Rim diameter in inches - omit to fall back to the most conservative class. */
-  rimSize?: number;
+  rimSize?: number | null;
   freightStrategy?: 'worst-case' | 'typical-zone';
 }
 

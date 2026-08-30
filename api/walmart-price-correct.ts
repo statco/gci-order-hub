@@ -157,7 +157,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       // safeWalmartPrice() is the ONLY sanctioned price computation. Missing
       // cost → null → skip (never guess, never default).
-      const safe = safeWalmartPrice({ shopifyPrice: match.variant.price, cost: match.variant.cost });
+      const safe = safeWalmartPrice({
+        shopifyPrice: match.variant.price,
+        cost: match.variant.cost,
+        tireType: match.variant.tireType,
+        rimSize: match.variant.rimSize,
+      });
       if (safe == null) {
         skippedNoCost.push(sku);
         continue;
@@ -178,6 +183,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           sku,
           price: match.variant.price ?? safe,
           cost: match.variant.cost,
+          tireType: match.variant.tireType,
+          rimSize: match.variant.rimSize,
         });
         if (written) corrected++;
         else skippedNoCost.push(sku);

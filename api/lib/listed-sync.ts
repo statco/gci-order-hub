@@ -22,6 +22,7 @@ import {
 } from './walmart-client';
 import { fetchActiveCtSyncVariants } from './shopify';
 import { safeWalmartPrice, PRICE_FLOOR_MULTIPLIER } from './pricing';
+import type { TireType } from './pricing/landedCost';
 
 const WALMART_CHUNK = 1_000;
 
@@ -34,6 +35,8 @@ export interface SyncItem {
   ctCost:     number | null;
   shopifyQty: number;
   walmartQty: number;
+  tireType:   TireType | null;   // real freight class — see parseTireSpecFromTags()
+  rimSize:    number | null;     // real rim size — see parseTireSpecFromTags()
 }
 
 export interface ChunkResult {
@@ -98,6 +101,8 @@ export async function runListedSyncChunk(opts: {
         ctCost:     activeVariant.ctCost,
         shopifyQty,
         walmartQty: shopifyQty,
+        tireType:   activeVariant.tireType,
+        rimSize:    activeVariant.rimSize,
       });
     } else {
       // No active ct-sync variant → zero Walmart qty (safe correction).
@@ -111,6 +116,8 @@ export async function runListedSyncChunk(opts: {
         ctCost:     null,
         shopifyQty: 0,
         walmartQty: 0,
+        tireType:   null,
+        rimSize:    null,
       });
     }
   }
@@ -119,7 +126,7 @@ export async function runListedSyncChunk(opts: {
 
   const isExposed = (i: SyncItem): boolean => {
     if (i.ctCost == null || i.ctCost <= 0) return false;
-    const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost });
+    const safe = safeWalmartPrice({ shopifyPrice: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize });
     return safe != null && safe < i.ctCost * PRICE_FLOOR_MULTIPLIER;
   };
 
@@ -149,7 +156,7 @@ export async function runListedSyncChunk(opts: {
   }
 
   // ── Push to Walmart ───────────────────────────────────────────────────────
-  const priceItems:     WalmartPriceItem[]     = items.filter(i => !isExposed(i)).map(i => ({ sku: i.sku, price: i.price, cost: i.cost }));
+  const priceItems:     WalmartPriceItem[]     = items.filter(i => !isExposed(i)).map(i => ({ sku: i.sku, price: i.price, cost: i.cost, tireType: i.tireType, rimSize: i.rimSize }));
   const inventoryItems: WalmartInventoryItem[] = items.map(i => ({ sku: i.sku, quantity: i.walmartQty }));
 
   let totalPriceSuccess     = 0;

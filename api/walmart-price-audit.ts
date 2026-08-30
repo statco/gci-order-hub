@@ -158,7 +158,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const threshold = shopifyPrice * (1 - PRICE_THRESHOLD);
       if (walmartPrice < threshold) {
         const pctBelow = ((shopifyPrice - walmartPrice) / shopifyPrice) * 100;
-        const safePrice = safeWalmartPrice({ shopifyPrice, cost: sv.cost });
+        const safePrice = safeWalmartPrice({ shopifyPrice, cost: sv.cost, tireType: sv.tireType, rimSize: sv.rimSize });
         const row: AuditRow = {
           sku,
           walmartPrice,
