@@ -298,6 +298,73 @@ export async function bulkInventoryFeed(
 }
 
 /**
+ * Fetch all published+active Walmart items WITH their current listed price
+ * (fetchListedSkus() above discards everything but the SKU — this captures
+ * price too, for the price-parity audit added 2026-08-29).
+ *
+ * Walmart's /v3/items response price field shape isn't documented anywhere
+ * in this codebase (nothing previously read it), so this extracts price
+ * defensively across a few plausible shapes and logs the raw shape of the
+ * first item once, so a wrong guess is immediately visible in logs rather
+ * than silently returning nulls for everything.
+ */
+export interface WalmartListedItem {
+  sku:   string;
+  price: number | null;
+}
+
+function extractWalmartPrice(item: any): number | null {
+  const candidates = [
+    item?.price?.amount,
+    item?.price,
+    item?.pricePerUnit?.amount,
+    item?.currentPrice?.amount,
+  ];
+  for (const c of candidates) {
+    const n = typeof c === 'string' ? parseFloat(c) : c;
+    if (typeof n === 'number' && Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+export async function fetchListedSkusWithPrices(): Promise<WalmartListedItem[]> {
+  const results: WalmartListedItem[] = [];
+  const PAGE_SIZE = 200;
+  let offset = 0;
+  let totalItems = Infinity;
+  let page = 0;
+  let loggedShape = false;
+
+  while (offset < totalItems) {
+    const url = `/v3/items?limit=${PAGE_SIZE}&offset=${offset}&publishedStatus=PUBLISHED&lifecycleStatus=ACTIVE`;
+    const data: any = await walmartFetch<any>(url);
+    const itemList: any[] = data?.ItemResponse ?? [];
+
+    if (page === 0) {
+      totalItems = (data?.totalItems as number) ?? itemList.length;
+      console.log(`[fetchListedSkusWithPrices] totalItems reported by Walmart: ${totalItems}`);
+    }
+    if (!loggedShape && itemList.length > 0) {
+      console.log('[fetchListedSkusWithPrices] raw first item shape:', JSON.stringify(itemList[0]).slice(0, 500));
+      loggedShape = true;
+    }
+
+    for (const item of itemList) {
+      const sku = (item.sku ?? '') as string;
+      if (!sku) continue;
+      results.push({ sku: sku.toUpperCase(), price: extractWalmartPrice(item) });
+    }
+
+    page++;
+    if (itemList.length === 0) break;
+    offset += PAGE_SIZE;
+  }
+
+  console.log(`[fetchListedSkusWithPrices] done: ${results.length} items, ${results.filter(r => r.price !== null).length} with parsed price`);
+  return results;
+}
+
+/**
  * Fetch all published+active SKUs listed on Walmart using offset-based
  * pagination. Page 1 provides totalItems; subsequent pages increment
  * offset by 200 until all SKUs are collected.

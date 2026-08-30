@@ -17,6 +17,9 @@
 //   ?mode=listed           — only sync SKUs currently listed on Walmart
 //                            (fetches /v3/items to build allowed-SKU set)
 //   ?mode=audit            — compare Walmart vs Shopify SKUs, no writes
+//   ?mode=price-audit      — compare live Walmart price vs Shopify price
+//                            per SKU, no writes. Flags shopifyCheaper (real
+//                            Walmart parity/delist risk) and walmartCheaper.
 //   ?offset=N&limit=M      — when mode=listed, slice the Walmart SKU list
 //                            to [offset, offset+limit) so large catalogues
 //                            can be processed in time-bounded chunks
@@ -34,6 +37,7 @@ import {
   bulkPriceFeed,
   bulkInventoryFeed,
   fetchListedSkus,
+  fetchListedSkusWithPrices,
   chunkArray,
   type WalmartPriceItem,
   type WalmartInventoryItem,
@@ -236,6 +240,58 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       matched,
       walmartSample: walmartArray.slice(0, 10),
       shopifySample: items.slice(0, 10).map(i => i.sku),
+    });
+  }
+
+  // ── mode=price-audit: compare live Walmart price vs live Shopify price
+  //    for every matched SKU, no writes. Added 2026-08-29 after a price
+  //    gap was spotted on 300E3009 (Ovation W-686 EcoVision 185/65R15).
+  //    Walmart delists sellers found pricing lower elsewhere (price
+  //    parity), so shopifyCheaper is the list that actually matters —
+  //    everything else is informational.
+  if (mode === 'price-audit') {
+    let walmartItems: Awaited<ReturnType<typeof fetchListedSkusWithPrices>>;
+    try {
+      console.log('🔍 Fetching Walmart-listed items with price for audit…');
+      walmartItems = await fetchListedSkusWithPrices();
+    } catch (err: any) {
+      console.error('❌ Walmart items fetch failed:', err.message);
+      return res.status(500).json({ error: 'Walmart items fetch failed', details: err.message });
+    }
+
+    const shopifyBySku = new Map(items.map(i => [i.sku, i.price]));
+    const walmartPriceMissing: string[] = [];
+
+    const compared = walmartItems
+      .filter(w => shopifyBySku.has(w.sku))
+      .map(w => {
+        const shopifyPrice = shopifyBySku.get(w.sku)!;
+        if (w.price === null) walmartPriceMissing.push(w.sku);
+        return {
+          sku: w.sku,
+          shopifyPrice,
+          walmartPrice: w.price,
+          gap: w.price !== null ? +(shopifyPrice - w.price).toFixed(2) : null,
+        };
+      });
+
+    const shopifyCheaper = compared
+      .filter(c => c.gap !== null && c.gap < -0.01)
+      .sort((a, b) => (a.gap as number) - (b.gap as number));
+
+    const walmartCheaper = compared
+      .filter(c => c.gap !== null && c.gap > 0.01)
+      .sort((a, b) => (b.gap as number) - (a.gap as number));
+
+    return res.status(200).json({
+      compared:            compared.length,
+      walmartPriceParseFailures: walmartPriceMissing.length,
+      exactMatch:           compared.filter(c => c.gap === 0).length,
+      shopifyCheaperCount:  shopifyCheaper.length,
+      walmartCheaperCount:  walmartCheaper.length,
+      shopifyCheaper,   // PARITY RISK — Walmart may delist for these
+      walmartCheaper:       walmartCheaper.slice(0, 50),
+      walmartPriceMissingSample: walmartPriceMissing.slice(0, 5),
     });
   }
 
