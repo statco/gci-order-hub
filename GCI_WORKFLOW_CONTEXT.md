@@ -1412,7 +1412,7 @@ full candidate count. One test SKU (`MV861`) was retired for real via Seller
 Center's own UI during the investigation — confirmed acceptable, no cleanup
 needed.
 
-### 2. Walmart price-floor bug: `tireType`/`rimSize` never wired through, closing a known Aug-22 gap (`gci-order-hub#82` — OPEN, not yet merged)
+### 2. Walmart price-floor bug: `tireType`/`rimSize` never wired through, closing a known Aug-22 gap (`gci-order-hub#82` — MERGED)
 
 **Trigger**: a real reported price gap — Walmart SKU `300E3009` (Ovation
 W-686 Ecovision 185/65R15) listed at **$261.99** vs. its real live Shopify
@@ -1476,7 +1476,7 @@ plus the original `vehicle_type:` convention, so this specific class of bug
 (assumed tag format vs. real, inconsistent tag format across import
 batches) can't silently regress.
 
-**Not yet merged as of this doc update** — PR #82 is open, all above
+**Merged** — PR #82 merged 2026-08-30 11:09 UTC, all above
 verified live against the real account (not just tested in isolation).
 
 **Cross-reference / known-gaps note**: this closes Known gap #2 from the
@@ -1550,7 +1550,9 @@ Ran `GET /api/walmart-price-audit` against production after deploy: `totalOverpr
 
 **Investigated those 4 specifically, since "same 4, unchanged for hours" looked like a real gap** — checked Vercel runtime logs for `walmart-sync-cursor` directly (not just re-running the audit): every chunk, every ~14-minute full cycle, across multiple confirmed complete wraps in the checked window, reports **0 failed** price writes — `price 50ok/0fail` repeated identically chunk after chunk, cycle after cycle. Since the 318-SKU catalog is covered exactly once per cycle with no gaps, this means all 4 of these SKUs *are* receiving a successful `200` PUT from Walmart on every single cycle (Walmart's own response: *"Thank you. Your price has been updated. Please allow up to five minutes..."*), yet their displayed price hasn't moved in hours — well past that stated window.
 
-**Conclusion: this is a Walmart-side issue with these 4 specific SKUs (a stuck read-side cache/index, or something particular to these listings), not a bug in this codebase.** The write pipeline is provably healthy — confirmed by direct log inspection, not inferred. Recommended next step (not yet done, needs a human in Walmart Seller Center): check these 4 SKUs directly in Seller Center's own UI — if it also shows the stale price, that's grounds for a support ticket to Walmart, with the logged `200` responses as evidence the writes are landing; if Seller Center shows the correct price, it's a lower-urgency read-API-only quirk.
+**Conclusion: this is a Walmart-side issue with these 4 specific SKUs (a stuck read-side cache/index, or something particular to these listings), not a bug in this codebase.** The write pipeline is provably healthy — confirmed by direct log inspection, not inferred.
+
+**RESOLVED same day, by manual correction — not by confirming the root cause.** Pat set all 4 SKUs (`166159006`, `AP21550017WHYPA02`, `16092NXK`, `AP25545019YHYPA02`) to their live Shopify price directly in Walmart Seller Center. The leading theory above (a Walmart-side `/v3/items` read/cache quirk) was never independently confirmed against Seller Center before the manual fix made it moot — worth being honest that the actual root cause on Walmart's side remains unknown, not treating this as a closed diagnosis. Full detail in `CT-INTEGRATION-CONTEXT.md`'s own 2026-08-30 entry, including one expected non-bug follow-on: `safeWalmartPrice()` computes $1 above raw Shopify price for `AP21550017WHYPA02` specifically (an intentional buffer), so the next cursor cycle will bump that one SKU by $1 automatically — not a recurrence if noticed.
 
 ### Session PRs
 `gci-order-hub#83` "Consolidate three independent Walmart pricing writers into one" (MERGED, includes the restored `ctCost` check as a same-branch follow-up commit).
